@@ -6,3 +6,9 @@ __pycache__/
 .vscode/
 .claude/
 zshrc_debug.txt
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx

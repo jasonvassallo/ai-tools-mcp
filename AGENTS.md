@@ -65,3 +65,4 @@ This registers the MCP server in Claude Desktop under `ai-tools-mcp` and removes
 - Do not add local-model features here.
 - Do not add email-triage code here.
 - Local-only AI projects belong in `local_llm_integration`, not this repo.
+- Never publish secrets, API keys, tokens, `.env` files, certificates, or private keys to GitHub from this repo.
