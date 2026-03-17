@@ -12,6 +12,7 @@ Designed to complement Claude's built-in WebSearch tool:
 """
 
 import subprocess
+import sys
 import asyncio
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -33,6 +34,21 @@ def get_api_key_from_keychain(service: str, account: str) -> str:
         )
     return result.stdout.strip()
 
+
+def run_check() -> None:
+    """Validate configuration and exit. Used by install.sh to verify setup."""
+    errors = 0
+    try:
+        get_api_key_from_keychain("api_tokens", "perplexity")
+        print("ok: perplexity key found in keychain")
+    except ValueError as e:
+        print(f"fail: {e}")
+        errors += 1
+    sys.exit(errors)
+
+
+if "--check" in sys.argv:
+    run_check()
 
 # Initialize Perplexity client
 perplexity_client = OpenAI(

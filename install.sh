@@ -242,25 +242,15 @@ else
     errors=1
 fi
 
-# Check uv can resolve deps
-echo -e "  ${DIM}Testing uv run (dependency resolution)...${NC}"
-if "$UV_PATH" run --quiet "$SCRIPT_PATH" --help >/dev/null 2>&1; then
-    print_ok "Dependencies resolve correctly"
-else
-    # The script doesn't have --help, so it will try to start the server.
-    # A quick timeout test: start it, wait briefly, kill it.
-    "$UV_PATH" run "$SCRIPT_PATH" &>/dev/null &
-    TEST_PID=$!
-    sleep 2
-    if kill -0 "$TEST_PID" 2>/dev/null; then
-        kill "$TEST_PID" 2>/dev/null
-        wait "$TEST_PID" 2>/dev/null || true
-        print_ok "Server starts successfully"
-    else
-        wait "$TEST_PID" 2>/dev/null || true
-        print_warn "Server exited quickly — check API token is set"
-    fi
-fi
+# Verify dependencies resolve and config is valid
+echo -e "  ${DIM}Running preflight check (uv run --check)...${NC}"
+CHECK_OUTPUT=$("$UV_PATH" run "$SCRIPT_PATH" --check 2>&1) && {
+    print_ok "Dependencies resolve and config valid"
+} || {
+    print_warn "Preflight check failed:"
+    echo "$CHECK_OUTPUT" | while IFS= read -r line; do echo "    $line"; done
+    errors=1
+}
 
 # ─── Done ────────────────────────────────────────────────────────
 

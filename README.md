@@ -41,9 +41,28 @@ There are no local model weights, no background service, and no embedded secrets
 ## Repository Layout
 
 - `mcp_server.py`: Self-contained MCP server with inline dependency metadata
+- `install.sh`: macOS installer (Keychain setup, Claude Code registration, preflight check)
 - `scripts/launch_ai_tools_mcp.sh`: Legacy launcher (virtualenv-based, for Claude Desktop)
 - `scripts/configure_claude_ai_tools_mcp.sh`: Claude Desktop registration helper
 - `scripts/uv_sync_projects.sh`: Separate local helper for syncing Python projects with `uv`
+
+## Installation
+
+The recommended way to install is via the included installer:
+
+```bash
+./install.sh
+```
+
+This will:
+
+1. Check prerequisites (`uv`, `jq`, macOS Keychain)
+2. Install `mcp_server.py` to `~/.local/share/ai-tools-mcp/`
+3. Prompt for API tokens and store them in the macOS Keychain
+4. Register the MCP server in `~/.claude/.mcp.json`
+5. Run a preflight check to verify dependencies and configuration
+
+Safe to run multiple times — updates existing config without clobbering.
 
 ## Requirements
 
@@ -51,6 +70,7 @@ There are no local model weights, no background service, and no embedded secrets
 
 - macOS
 - `uv` installed and on `PATH`
+- `jq` installed (for installer only)
 
 ### Keychain Entries
 
@@ -58,7 +78,7 @@ The server expects an API key in the macOS Keychain:
 
 - service `api_tokens`, account `perplexity`
 
-Example setup:
+The installer handles this automatically. For manual setup:
 
 ```bash
 security add-generic-password -s 'api_tokens' -a 'perplexity' -w 'YOUR_PERPLEXITY_API_KEY'
@@ -74,9 +94,17 @@ uv run mcp_server.py
 
 No virtualenv creation or dependency installation needed — `uv` handles it from its global cache.
 
+### Preflight Check
+
+Validate that dependencies resolve and the Keychain entry exists without starting the server:
+
+```bash
+uv run mcp_server.py --check
+```
+
 ## Claude Code Registration
 
-Add to `~/.claude/.mcp.json`:
+The installer handles this. For manual setup, add to `~/.claude/.mcp.json`:
 
 ```json
 {
