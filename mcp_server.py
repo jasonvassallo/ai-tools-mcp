@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["openai>=1.0.0", "mcp>=1.0.0"]
+# ///
 """
-MCP server providing two hosted-AI tools:
-1. kimi_think - Kimi K2 Thinking for extended reasoning
-2. web_search - Perplexity Sonar Pro for web search with citations
+MCP server providing deep research via Perplexity Sonar Pro.
+
+Designed to complement Claude's built-in WebSearch tool:
+- Built-in WebSearch: quick factual lookups, single-answer questions
+- deep_research: multi-source synthesis, comparisons, ambiguous queries
 """
 
 import subprocess
@@ -28,14 +34,9 @@ def get_api_key_from_keychain(service: str, account: str) -> str:
     return result.stdout.strip()
 
 
-# Initialize clients
-kimi_client = OpenAI(
-    api_key=get_api_key_from_keychain("moonshot-api", "kimi"),
-    base_url="https://api.moonshot.ai/v1"
-)
-
+# Initialize Perplexity client
 perplexity_client = OpenAI(
-    api_key=get_api_key_from_keychain("perplexity-api", "sonar"),
+    api_key=get_api_key_from_keychain("api_tokens", "perplexity"),
     base_url="https://api.perplexity.ai"
 )
 
@@ -48,48 +49,27 @@ async def list_tools() -> list[Tool]:
     """List available tools."""
     return [
         Tool(
-            name="kimi_think",
+            name="deep_research",
             description=(
-                "Use Kimi K2 Thinking for extended reasoning tasks. "
-                "Best for: complex problem solving, multi-step reasoning, "
-                "code analysis, mathematical proofs, strategic planning. "
-                "Returns both the reasoning process and final answer."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "The problem or question requiring deep reasoning"
-                    },
-                    "max_tokens": {
-                        "type": "integer",
-                        "description": "Maximum tokens for response (default: 4096)",
-                        "default": 4096
-                    }
-                },
-                "required": ["prompt"]
-            }
-        ),
-        Tool(
-            name="web_search",
-            description=(
-                "Use Perplexity Sonar Pro for web search with real-time data. "
-                "Best for: current events, recent information, fact-checking, "
-                "finding sources, research with citations. "
-                "Returns answer with source citations."
+                "Deep research using Perplexity Sonar Pro with multi-source "
+                "synthesis and citations. Use instead of built-in WebSearch when: "
+                "the answer spans multiple sources, requires cross-referencing, "
+                "involves comparing tradeoffs/architectures/approaches, "
+                "the query is ambiguous and benefits from AI-powered search reasoning, "
+                "or you need comprehensive coverage with source citations. "
+                "Do NOT use for simple factual lookups (use built-in WebSearch for those)."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query or question"
+                        "description": "The research question or topic requiring deep investigation"
                     },
                     "max_tokens": {
                         "type": "integer",
-                        "description": "Maximum tokens for response (default: 1024)",
-                        "default": 1024
+                        "description": "Maximum tokens for response (default: 2048)",
+                        "default": 2048
                     }
                 },
                 "required": ["query"]
@@ -102,46 +82,21 @@ async def list_tools() -> list[Tool]:
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool calls."""
 
-    if name == "kimi_think":
-        prompt = arguments.get("prompt")
-        max_tokens = arguments.get("max_tokens", 4096)
-
-        response = kimi_client.chat.completions.create(
-            model="kimi-k2-thinking",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are Kimi, an AI assistant created by Moonshot AI."
-                },
-                {
-                    "role": "user",
-                    "content": prompt
-                }
-            ],
-            temperature=1.0,
-            max_tokens=max_tokens
-        )
-
-        message = response.choices[0].message
-        reasoning = getattr(message, "reasoning_content", None)
-
-        result = ""
-        if reasoning:
-            result += f"## Reasoning Process\n\n{reasoning}\n\n---\n\n"
-        result += f"## Answer\n\n{message.content}"
-
-        return [TextContent(type="text", text=result)]
-
-    elif name == "web_search":
+    if name == "deep_research":
         query = arguments.get("query")
-        max_tokens = arguments.get("max_tokens", 1024)
+        max_tokens = arguments.get("max_tokens", 2048)
 
         response = perplexity_client.chat.completions.create(
             model="sonar-pro",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful search assistant. Provide accurate, well-sourced answers."
+                    "content": (
+                        "You are a thorough research assistant. Provide comprehensive, "
+                        "well-sourced answers that synthesize information across multiple "
+                        "sources. Include relevant details, comparisons, and caveats. "
+                        "Always cite your sources."
+                    )
                 },
                 {
                     "role": "user",
@@ -152,9 +107,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
 
         message = response.choices[0].message
-
-        # Perplexity includes citations in the response
-        result = f"## Search Results\n\n{message.content}"
+        result = f"## Research Results\n\n{message.content}"
 
         return [TextContent(type="text", text=result)]
 

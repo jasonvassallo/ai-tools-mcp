@@ -4,60 +4,48 @@ This repository contains a small MCP server for hosted AI APIs. It is not a loca
 
 ## Purpose
 
-- Expose `kimi_think` for Moonshot Kimi K2 extended reasoning.
-- Expose `web_search` for Perplexity Sonar Pro web search with citations.
-- Provide helper scripts to register the server with Claude Desktop.
+- Expose `deep_research` for Perplexity Sonar Pro deep research with multi-source synthesis and citations.
+- Complement Claude's built-in WebSearch (quick lookups) with thorough research capability.
 
 ## Stable Public Surface
 
 - MCP server key: `ai-tools-mcp`
 - Tool names:
-  - `kimi_think`
-  - `web_search`
+  - `deep_research`
 
 Keep those tool names stable unless a change is explicitly requested.
 
 ## Provider Mapping
 
-- `kimi_think`:
-  - Provider: Moonshot
-  - Model: `kimi-k2-thinking`
-- `web_search`:
+- `deep_research`:
   - Provider: Perplexity
   - Model: `sonar-pro`
 
 ## Dependencies
 
-- Python virtual environment with:
-  - `openai`
-  - `mcp`
+`mcp_server.py` uses PEP 723 inline script metadata — no virtualenv or project config needed. `uv run mcp_server.py` handles everything.
+
 - macOS Keychain items:
-  - service `moonshot-api`, account `kimi`
-  - service `perplexity-api`, account `sonar`
+  - service `api_tokens`, account `perplexity`
 
-## Local Run
-
-From the repo root:
+## Running
 
 ```bash
-./scripts/launch_ai_tools_mcp.sh
+uv run mcp_server.py
 ```
 
-Or directly:
+## Claude Code Registration
 
-```bash
-.venv/bin/python mcp_server.py
+Add to `~/.claude/.mcp.json`:
+
+```json
+{
+  "ai-tools-mcp": {
+    "command": "uv",
+    "args": ["run", "/path/to/mcp_server.py"]
+  }
+}
 ```
-
-## Claude Desktop Registration
-
-Use:
-
-```bash
-./scripts/configure_claude_ai_tools_mcp.sh
-```
-
-This registers the MCP server in Claude Desktop under `ai-tools-mcp` and removes the old `ai-tools` entry if present.
 
 ## Guardrails
 
