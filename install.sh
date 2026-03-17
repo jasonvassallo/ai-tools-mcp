@@ -8,7 +8,7 @@
 #   1. Checks prerequisites (uv, jq)
 #   2. Installs the MCP server script to ~/.local/share/<app-name>/
 #   3. Stores required API tokens in macOS Keychain
-#   4. Registers the MCP server in Claude Code (~/.claude/.mcp.json)
+#   4. Registers the MCP server in Claude Code and Claude Desktop
 #   5. Verifies everything works
 #
 # Safe to run multiple times — updates existing config without clobbering.
@@ -35,7 +35,8 @@ REQUIRED_TOKENS=(
 
 # ─── END CONFIG ──────────────────────────────────────────────────
 
-CLAUDE_MCP_CONFIG="$HOME/.claude/.mcp.json"
+CLAUDE_CODE_CONFIG="$HOME/.claude/.mcp.json"
+CLAUDE_DESKTOP_CONFIG="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
 BOLD='\033[1m'
 DIM='\033[2m'
 GREEN='\033[0;32m'
@@ -176,38 +177,50 @@ for token_spec in "${REQUIRED_TOKENS[@]}"; do
     print_ok "Stored ${display_name} in Keychain"
 done
 
-# ─── Step 4: Register with Claude Code ──────────────────────────
+# ─── Step 4: Register with Claude Code & Claude Desktop ─────────
 
-print_step "Registering MCP server with Claude Code"
+print_step "Registering MCP server"
 
 # Find uv's absolute path for the config
 UV_PATH="$(command -v uv)"
 SCRIPT_PATH="${INSTALL_DIR}/${SCRIPT_NAME}"
 
-# Build the server entry
+# Build the server entry (same format for both clients)
 SERVER_ENTRY=$(jq -n \
     --arg cmd "$UV_PATH" \
     --arg script "$SCRIPT_PATH" \
     '{command: $cmd, args: ["run", $script]}')
 
-# Create or update .mcp.json
-mkdir -p "$(dirname "$CLAUDE_MCP_CONFIG")"
+# --- Claude Code: ~/.claude/.mcp.json ---
+mkdir -p "$(dirname "$CLAUDE_CODE_CONFIG")"
 
-if [[ -f "$CLAUDE_MCP_CONFIG" ]]; then
-    # Merge into existing config
+if [[ -f "$CLAUDE_CODE_CONFIG" ]]; then
     UPDATED=$(jq --arg key "$MCP_SERVER_KEY" --argjson entry "$SERVER_ENTRY" \
-        '.mcpServers[$key] = $entry' "$CLAUDE_MCP_CONFIG")
-    echo "$UPDATED" > "$CLAUDE_MCP_CONFIG"
-    print_ok "Updated ${CLAUDE_MCP_CONFIG}"
+        '.mcpServers[$key] = $entry' "$CLAUDE_CODE_CONFIG")
+    echo "$UPDATED" > "$CLAUDE_CODE_CONFIG"
+    print_ok "Claude Code  — ${CLAUDE_CODE_CONFIG}"
 else
-    # Create new config
     jq -n --arg key "$MCP_SERVER_KEY" --argjson entry "$SERVER_ENTRY" \
-        '{mcpServers: {($key): $entry}}' > "$CLAUDE_MCP_CONFIG"
-    print_ok "Created ${CLAUDE_MCP_CONFIG}"
+        '{mcpServers: {($key): $entry}}' > "$CLAUDE_CODE_CONFIG"
+    print_ok "Claude Code  — created ${CLAUDE_CODE_CONFIG}"
 fi
 
-# Show the registered entry
-echo -e "  ${DIM}$(jq --arg key "$MCP_SERVER_KEY" '.mcpServers[$key]' "$CLAUDE_MCP_CONFIG")${NC}"
+# --- Claude Desktop: ~/Library/Application Support/Claude/claude_desktop_config.json ---
+mkdir -p "$(dirname "$CLAUDE_DESKTOP_CONFIG")"
+
+if [[ -f "$CLAUDE_DESKTOP_CONFIG" ]]; then
+    # Ensure mcpServers key exists, then merge
+    UPDATED=$(jq --arg key "$MCP_SERVER_KEY" --argjson entry "$SERVER_ENTRY" \
+        '.mcpServers //= {} | .mcpServers[$key] = $entry' "$CLAUDE_DESKTOP_CONFIG")
+    echo "$UPDATED" > "$CLAUDE_DESKTOP_CONFIG"
+    print_ok "Claude Desktop — ${CLAUDE_DESKTOP_CONFIG}"
+else
+    jq -n --arg key "$MCP_SERVER_KEY" --argjson entry "$SERVER_ENTRY" \
+        '{mcpServers: {($key): $entry}}' > "$CLAUDE_DESKTOP_CONFIG"
+    print_ok "Claude Desktop — created ${CLAUDE_DESKTOP_CONFIG}"
+fi
+
+echo -e "  ${DIM}$(jq -c --arg key "$MCP_SERVER_KEY" '.mcpServers[$key]' "$CLAUDE_CODE_CONFIG")${NC}"
 
 # ─── Step 5: Verify ─────────────────────────────────────────────
 
@@ -234,13 +247,16 @@ for token_spec in "${REQUIRED_TOKENS[@]}"; do
     fi
 done
 
-# Check Claude config
-if [[ -f "$CLAUDE_MCP_CONFIG" ]] && jq -e --arg key "$MCP_SERVER_KEY" '.mcpServers[$key]' "$CLAUDE_MCP_CONFIG" >/dev/null 2>&1; then
-    print_ok "Registered in Claude Code config"
-else
-    print_fail "Not found in ${CLAUDE_MCP_CONFIG}"
-    errors=1
-fi
+# Check both configs
+for config_label_path in "Claude Code|${CLAUDE_CODE_CONFIG}" "Claude Desktop|${CLAUDE_DESKTOP_CONFIG}"; do
+    IFS='|' read -r label config_path <<< "$config_label_path"
+    if [[ -f "$config_path" ]] && jq -e --arg key "$MCP_SERVER_KEY" '.mcpServers[$key]' "$config_path" >/dev/null 2>&1; then
+        print_ok "Registered in ${label}"
+    else
+        print_fail "Not found in ${label} (${config_path})"
+        errors=1
+    fi
+done
 
 # Verify dependencies resolve and config is valid
 echo -e "  ${DIM}Running preflight check (uv run --check)...${NC}"
@@ -261,5 +277,5 @@ else
     echo -e "${YELLOW}${BOLD}Installation complete with warnings.${NC}"
 fi
 echo ""
-echo -e "  ${BOLD}Next:${NC} Restart Claude Code to load the new MCP server."
+echo -e "  ${BOLD}Next:${NC} Restart Claude Code / Claude Desktop to load the new MCP server."
 echo ""
