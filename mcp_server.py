@@ -24,7 +24,7 @@ def get_api_key_from_keychain(service: str, account: str) -> str:
     result = subprocess.run(
         ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
         capture_output=True,
-        text=True
+        text=True,
     )
     if result.returncode != 0:
         raise ValueError(
@@ -37,7 +37,7 @@ def get_api_key_from_keychain(service: str, account: str) -> str:
 # Initialize Perplexity client
 perplexity_client = OpenAI(
     api_key=get_api_key_from_keychain("api_tokens", "perplexity"),
-    base_url="https://api.perplexity.ai"
+    base_url="https://api.perplexity.ai",
 )
 
 # Create MCP server
@@ -64,16 +64,16 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The research question or topic requiring deep investigation"
+                        "description": "The research question or topic requiring deep investigation",
                     },
                     "max_tokens": {
                         "type": "integer",
                         "description": "Maximum tokens for response (default: 2048)",
-                        "default": 2048
-                    }
+                        "default": 2048,
+                    },
                 },
-                "required": ["query"]
-            }
+                "required": ["query"],
+            },
         )
     ]
 
@@ -96,14 +96,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "well-sourced answers that synthesize information across multiple "
                         "sources. Include relevant details, comparisons, and caveats. "
                         "Always cite your sources."
-                    )
+                    ),
                 },
-                {
-                    "role": "user",
-                    "content": query
-                }
+                {"role": "user", "content": query},
             ],
-            max_tokens=max_tokens
+            max_tokens=max_tokens,
         )
 
         message = response.choices[0].message
@@ -119,9 +116,7 @@ async def main():
     """Run the MCP server."""
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options()
+            read_stream, write_stream, server.create_initialization_options()
         )
 
 
