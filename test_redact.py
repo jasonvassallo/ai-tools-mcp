@@ -138,24 +138,26 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertIn("[REDACTED_JWT]", out)
         self.assertNotIn(_JWT_HEADER[:4], out)
 
-    def test_apple_app_specific_password(self):
-        s = "pwd: abcd-efgh-ijkl-mnop done"
-        out = redact_secrets(s)
-        self.assertIn("[REDACTED_APPLE_APP_PWD]", out)
-        self.assertNotIn("abcd-efgh-ijkl-mnop", out)
-
-    def test_apple_pwd_does_not_match_uuid_or_hex(self):
-        # UUIDs and uppercase variants should not match the lowercase pattern.
+    def test_no_apple_asp_redaction_after_codex_review(self):
+        """PR #1 review (Codex P2): the Apple ASP regex was dropped because
+        it false-positived on ordinary 4-word lowercase hyphenated phrases
+        in research-prose output. None of these benign strings should be
+        mutated, and the [REDACTED_APPLE_APP_PWD] marker should never
+        appear.
+        """
         for s in [
-            "550e8400-e29b-41d4-a716-446655440000",
-            "deadbeef-cafe-1234-5678",
-            "AAAA-BBBB-CCCC-DDDD",
+            "real-time-data-flow",                    # Codex's first example
+            "zero-shot-text-only",                    # Codex's second example
+            "abcd-efgh-ijkl-mnop",                    # original ASP shape — now benign
+            "self-hosted-build-tools",                # ML/devops slug
+            "550e8400-e29b-41d4-a716-446655440000",   # UUID
+            "AAAA-BBBB-CCCC-DDDD",                    # uppercase 4x4 (always unmatched)
         ]:
-            self.assertNotIn(
-                "REDACTED_APPLE",
-                redact_secrets(s),
-                f"false positive on {s!r}",
+            out = redact_secrets(s)
+            self.assertEqual(
+                out, s, f"unexpected mutation of {s!r}: got {out!r}"
             )
+            self.assertNotIn("REDACTED_APPLE", out)
 
     def test_private_key_block(self):
         # Inline a non-Google-shape body so the block test stays focused.
@@ -233,6 +235,36 @@ class TestRedactSecrets(unittest.TestCase):
     def test_clean_string_unchanged(self):
         s = "The quick brown fox jumps over the lazy dog."
         self.assertEqual(redact_secrets(s), s)
+
+    def test_short_jwt_is_caught_after_gemini_review(self):
+        """PR #1 review (Gemini): JWT minimum lengths were relaxed from
+        {30,30,20} to {10,10,10}. Catches minimal real JWTs — e.g. a header
+        encoding `{"alg":"HS256"}` is 20 chars, which the original {30,}
+        requirement missed entirely.
+        """
+        # Build a minimal-shape JWT at runtime to dodge secret scanners.
+        header = "ey" + "J" + "hbGciOiJIUzI1NiJ9"  # 20 chars
+        payload = "ey" + "J" + "zdWIiOiIifQ"       # 14 chars
+        sig = "shortsigvalue123"                   # 16 chars (>10)
+        short_jwt = f"{header}.{payload}.{sig}"
+        out = redact_secrets(f"Bearer {short_jwt} after")
+        self.assertIn("[REDACTED_JWT]", out)
+        self.assertNotIn(header, out)
+
+    def test_secret_as_dict_key_is_redacted_after_gemini_review(self):
+        """PR #1 review (Gemini): redact_secrets() now walks dict KEYS
+        recursively, not just values. A secret appearing as a dict key
+        (e.g. an API key passed as a parameter name in synthesized JSON)
+        was previously left in plaintext.
+        """
+        d = {FAKE_GOOG_API_KEY: "value", "title": FAKE_GOOG_API_KEY}
+        out = redact_secrets(d)
+        # Raw key prefix should not appear anywhere in the output.
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", str(out))
+        # The key got redacted to the marker; both occurrences collapse
+        # into a single "[REDACTED_GOOGLE_API_KEY]" key.
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertEqual(out["title"], "[REDACTED_GOOGLE_API_KEY]")
 
 
 if __name__ == "__main__":

@@ -40,14 +40,20 @@ _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"ya29\.[A-Za-z0-9_-]+"), "[REDACTED_GOOGLE_OAUTH_ACCESS]"),
     (re.compile(r"1//0[A-Za-z0-9_-]{30,}"), "[REDACTED_GOOGLE_OAUTH_REFRESH]"),
     (re.compile(r"AIza[A-Za-z0-9_-]{20,}"), "[REDACTED_GOOGLE_API_KEY]"),
+    # JWT minimums relaxed from {30,30,20} to {10,10,10} per PR #1 review
+    # (Gemini): minimal valid header `{"alg":"HS256"}` encodes to 20 chars,
+    # which the original {30,} requirement missed.
     (
-        re.compile(r"eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{20,}"),
+        re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
         "[REDACTED_JWT]",
     ),
-    (
-        re.compile(r"\b[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}\b"),
-        "[REDACTED_APPLE_APP_PWD]",
-    ),
+    # Apple app-specific password format (xxxx-xxxx-xxxx-xxxx) was originally
+    # included but removed per PR #1 review (Codex P2): the regex
+    # \b[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}\b false-positives on ordinary
+    # research-prose phrases like "real-time-data-flow" or
+    # "zero-shot-text-only", silently mangling deep_research output. ASPs
+    # leak via local-config / IMAP-debug paths this MCP doesn't touch, so
+    # for prose-content redaction the safer trade is to drop the pattern.
 )
 
 
@@ -62,7 +68,9 @@ def redact_secrets(value: Any) -> Any:
             value = pattern.sub(replacement, value)
         return value
     if isinstance(value, dict):
-        return {k: redact_secrets(v) for k, v in value.items()}
+        # Walk both keys and values so secrets-as-dict-key are also masked
+        # (per PR #1 review, Gemini).
+        return {redact_secrets(k): redact_secrets(v) for k, v in value.items()}
     if isinstance(value, list):
         return [redact_secrets(v) for v in value]
     if isinstance(value, tuple):
