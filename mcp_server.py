@@ -11,13 +11,63 @@ Designed to complement Claude's built-in WebSearch tool:
 - deep_research: multi-source synthesis, comparisons, ambiguous queries
 """
 
+import re
 import subprocess
 import sys
 import asyncio
+from typing import Any
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 from openai import OpenAI
+
+
+# Patterns for secret-shape strings that may appear in scraped web content
+# returned by upstream search providers. Applied at the response boundary so
+# secrets do not get persisted in client transcripts.
+#
+# Order matters: the JWT pattern would otherwise eat substrings of nothing
+# else here, but private-key blocks are matched first because they may
+# contain other matchable substrings inside the body.
+_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+        "[REDACTED_PRIVATE_KEY_BLOCK]",
+    ),
+    (re.compile(r"ya29\.[A-Za-z0-9_-]+"), "[REDACTED_GOOGLE_OAUTH_ACCESS]"),
+    (re.compile(r"1//0[A-Za-z0-9_-]{30,}"), "[REDACTED_GOOGLE_OAUTH_REFRESH]"),
+    (re.compile(r"AIza[A-Za-z0-9_-]{20,}"), "[REDACTED_GOOGLE_API_KEY]"),
+    (
+        re.compile(r"eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{20,}"),
+        "[REDACTED_JWT]",
+    ),
+    (
+        re.compile(r"\b[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}\b"),
+        "[REDACTED_APPLE_APP_PWD]",
+    ),
+)
+
+
+def redact_secrets(value: Any) -> Any:
+    """Recursively mask secret-shape substrings in arbitrary nested data.
+
+    Walks strings, lists, tuples, and dicts; leaves other types untouched.
+    Pure-stdlib (uses ``re``); no new dependencies.
+    """
+    if isinstance(value, str):
+        for pattern, replacement in _REDACTION_PATTERNS:
+            value = pattern.sub(replacement, value)
+        return value
+    if isinstance(value, dict):
+        return {k: redact_secrets(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_secrets(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(redact_secrets(v) for v in value)
+    return value
 
 
 def get_api_key_from_keychain(service: str, account: str) -> str:
@@ -120,7 +170,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         )
 
         message = response.choices[0].message
-        result = f"## Research Results\n\n{message.content}"
+        # Redact secret-shape patterns from scraped web content before the
+        # response leaves this server. Perplexity's synthesis can include raw
+        # API keys / JWTs / private-key blocks lifted from indexed pages.
+        content = redact_secrets(message.content or "")
+        result = f"## Research Results\n\n{content}"
 
         return [TextContent(type="text", text=result)]
 
