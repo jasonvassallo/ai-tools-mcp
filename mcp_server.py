@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -128,7 +128,21 @@ SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_session_file(session_id: str) -> Path:
-    """Return the on-disk path for a session id."""
+    """Return the on-disk path for a session id.
+
+    Validates that ``session_id`` is a valid UUID to prevent path
+    traversal (per PR #3 review, Codex P1). Without this check, an
+    attacker-controlled session_id like ``"/tmp/victim"`` or
+    ``"../../../etc/passwd"`` would resolve to a .json file OUTSIDE
+    ``SESSIONS_DIR``, allowing the load/update/delete MCP tools to
+    read, overwrite, or unlink arbitrary local files.
+    """
+    try:
+        uuid.UUID(str(session_id))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(
+            f"Invalid session_id: must be a valid UUID, got {session_id!r}"
+        )
     return SESSIONS_DIR / f"{session_id}.json"
 
 
@@ -140,7 +154,7 @@ def list_sessions() -> list[dict[str, Any]]:
 
     for session_file in SESSIONS_DIR.glob("*.json"):
         try:
-            with open(session_file, "r") as f:
+            with open(session_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             sessions.append(
                 {
@@ -174,14 +188,19 @@ def save_session(
     read back into future conversations.
     """
     session_id = str(uuid.uuid4())
-    now = datetime.utcnow().isoformat() + "Z"
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
+    # Redact name too (per PR #3 review, Codex P2). User-typed names or
+    # AI-generated titles can contain secret-shape strings; without this
+    # they would land on disk in plaintext while messages/metadata are
+    # protected.
+    safe_name = redact_secrets(name)
     safe_messages = redact_secrets(messages or [])
     safe_metadata = redact_secrets(metadata or {})
 
     session_data = {
         "session_id": session_id,
-        "name": name,
+        "name": safe_name,
         "created_at": now,
         "last_modified": now,
         "messages": safe_messages,
@@ -189,13 +208,13 @@ def save_session(
     }
 
     session_file = get_session_file(session_id)
-    with open(session_file, "w") as f:
+    with open(session_file, "w", encoding="utf-8") as f:
         json.dump(session_data, f, indent=2)
 
     return {
         "success": True,
         "session_id": session_id,
-        "name": name,
+        "name": safe_name,
         "message_count": len(session_data["messages"]),
     }
 
@@ -206,7 +225,7 @@ def load_session(session_id: str) -> dict[str, Any]:
     if not session_file.exists():
         raise ValueError(f"Session not found: {session_id}")
 
-    with open(session_file, "r") as f:
+    with open(session_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     return {
@@ -225,14 +244,15 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
     if not session_file.exists():
         raise ValueError(f"Session not found: {session_id}")
 
-    with open(session_file, "r") as f:
+    with open(session_file, "r", encoding="utf-8") as f:
         data = json.load(f)
 
     if name:
-        data["name"] = name
-    data["last_modified"] = datetime.utcnow().isoformat() + "Z"
+        # Same name-redaction as save_session (per PR #3 review, Codex P2).
+        data["name"] = redact_secrets(name)
+    data["last_modified"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
-    with open(session_file, "w") as f:
+    with open(session_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
     return {

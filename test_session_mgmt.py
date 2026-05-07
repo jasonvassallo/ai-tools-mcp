@@ -220,7 +220,7 @@ class TestLoadSession(_SessionMgmtBase):
 
     def test_load_session_raises_for_missing_id(self):
         with self.assertRaises(ValueError):
-            mcp_server.load_session("nonexistent-uuid-xxxxxxxx")
+            mcp_server.load_session("00000000-0000-0000-0000-000000000000")
 
 
 class TestUpdateSession(_SessionMgmtBase):
@@ -257,7 +257,7 @@ class TestUpdateSession(_SessionMgmtBase):
 
     def test_update_session_raises_for_missing_id(self):
         with self.assertRaises(ValueError):
-            mcp_server.update_session("nonexistent-uuid-xxxxxxxx", name="x")
+            mcp_server.update_session("00000000-0000-0000-0000-000000000000", name="x")
 
 
 class TestDeleteSession(_SessionMgmtBase):
@@ -272,7 +272,7 @@ class TestDeleteSession(_SessionMgmtBase):
 
     def test_delete_session_raises_for_missing_id(self):
         with self.assertRaises(ValueError):
-            mcp_server.delete_session("nonexistent-uuid-xxxxxxxx")
+            mcp_server.delete_session("00000000-0000-0000-0000-000000000000")
 
 
 class TestListSessions(_SessionMgmtBase):
@@ -329,6 +329,84 @@ class TestListSessions(_SessionMgmtBase):
         listing = mcp_server.list_sessions()
         match = next(s for s in listing if s["session_id"] == result["session_id"])
         self.assertEqual(match["message_count"], 3)
+
+
+class TestSessionIdValidation(_SessionMgmtBase):
+    """PR #3 review (Codex P1): get_session_file must reject non-UUID
+    inputs. Without this, MCP-callable load/update/delete tools could be
+    pointed at arbitrary .json files on disk via a malicious session_id.
+    """
+
+    def test_rejects_path_traversal_attempts(self):
+        bad_ids = [
+            "/tmp/victim",
+            "../../../etc/passwd",
+            "..\\..\\windows\\config",
+            "; rm -rf /",
+            "../foo",
+            "name with spaces",
+            "",
+            "not-a-uuid",
+            "session-with-dot.in.the.middle",
+        ]
+        for bad_id in bad_ids:
+            with self.assertRaises(
+                ValueError, msg=f"should reject session_id {bad_id!r}"
+            ):
+                mcp_server.get_session_file(bad_id)
+
+    def test_accepts_valid_uuid(self):
+        """Sanity: a real uuid4 string should pass validation and yield
+        a path INSIDE SESSIONS_DIR."""
+        import uuid as _uuid
+
+        sid = str(_uuid.uuid4())
+        path = mcp_server.get_session_file(sid)
+        self.assertEqual(path.parent, mcp_server.SESSIONS_DIR)
+        self.assertEqual(path.name, f"{sid}.json")
+
+    def test_load_session_rejects_path_traversal(self):
+        """End-to-end: an MCP caller should not be able to drive
+        load_session into reading /tmp/victim.json or similar."""
+        with self.assertRaises(ValueError):
+            mcp_server.load_session("/tmp/victim")
+
+    def test_delete_session_rejects_path_traversal(self):
+        """End-to-end: delete_session must not unlink arbitrary files."""
+        with self.assertRaises(ValueError):
+            mcp_server.delete_session("../../../etc/passwd")
+
+    def test_update_session_rejects_path_traversal(self):
+        """End-to-end: update_session must not overwrite arbitrary files."""
+        with self.assertRaises(ValueError):
+            mcp_server.update_session("/etc/hosts", name="hijack")
+
+
+class TestNameRedaction(_SessionMgmtBase):
+    """PR #3 review (Codex P2): the ``name`` field must go through
+    redact_secrets before persisting, matching messages/metadata."""
+
+    def test_save_session_redacts_name(self):
+        name_with_secret = f"My API key is {FAKE_GOOG_API_KEY}"
+        result = mcp_server.save_session(
+            name=name_with_secret,
+            messages=[{"role": "user", "content": "x"}],
+        )
+        sid = result["session_id"]
+        on_disk = (self.tmp_path / f"{sid}.json").read_text()
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", on_disk)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", on_disk)
+        # Returned name reflects the redacted value too.
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", result["name"])
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", result["name"])
+
+    def test_update_session_redacts_name(self):
+        save = mcp_server.save_session(name="initial", messages=[])
+        sid = save["session_id"]
+        mcp_server.update_session(sid, name=f"new {FAKE_GOOG_API_KEY}")
+        on_disk = (self.tmp_path / f"{sid}.json").read_text()
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", on_disk)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", on_disk)
 
 
 if __name__ == "__main__":
