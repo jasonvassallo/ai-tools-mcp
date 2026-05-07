@@ -138,12 +138,17 @@ def get_session_file(session_id: str) -> Path:
     read, overwrite, or unlink arbitrary local files.
     """
     try:
-        uuid.UUID(str(session_id))
+        # Parse + canonicalize: uuid.UUID accepts braced and urn:uuid:
+        # forms, so we re-stringify the parsed object to get the
+        # canonical 36-char hyphenated lowercase form. The path then
+        # provably contains only [0-9a-f-] — no path separators or
+        # other shell-interesting characters can survive.
+        parsed = uuid.UUID(str(session_id))
     except (ValueError, AttributeError, TypeError):
         raise ValueError(
             f"Invalid session_id: must be a valid UUID, got {session_id!r}"
         )
-    return SESSIONS_DIR / f"{session_id}.json"
+    return SESSIONS_DIR / f"{parsed}.json"
 
 
 def list_sessions() -> list[dict[str, Any]]:
