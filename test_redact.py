@@ -146,17 +146,15 @@ class TestRedactSecrets(unittest.TestCase):
         appear.
         """
         for s in [
-            "real-time-data-flow",                    # Codex's first example
-            "zero-shot-text-only",                    # Codex's second example
-            "abcd-efgh-ijkl-mnop",                    # original ASP shape — now benign
-            "self-hosted-build-tools",                # ML/devops slug
-            "550e8400-e29b-41d4-a716-446655440000",   # UUID
-            "AAAA-BBBB-CCCC-DDDD",                    # uppercase 4x4 (always unmatched)
+            "real-time-data-flow",  # Codex's first example
+            "zero-shot-text-only",  # Codex's second example
+            "abcd-efgh-ijkl-mnop",  # original ASP shape — now benign
+            "self-hosted-build-tools",  # ML/devops slug
+            "550e8400-e29b-41d4-a716-446655440000",  # UUID
+            "AAAA-BBBB-CCCC-DDDD",  # uppercase 4x4 (always unmatched)
         ]:
             out = redact_secrets(s)
-            self.assertEqual(
-                out, s, f"unexpected mutation of {s!r}: got {out!r}"
-            )
+            self.assertEqual(out, s, f"unexpected mutation of {s!r}: got {out!r}")
             self.assertNotIn("REDACTED_APPLE", out)
 
     def test_private_key_block(self):
@@ -244,8 +242,8 @@ class TestRedactSecrets(unittest.TestCase):
         """
         # Build a minimal-shape JWT at runtime to dodge secret scanners.
         header = "ey" + "J" + "hbGciOiJIUzI1NiJ9"  # 20 chars
-        payload = "ey" + "J" + "zdWIiOiIifQ"       # 14 chars
-        sig = "shortsigvalue123"                   # 16 chars (>10)
+        payload = "ey" + "J" + "zdWIiOiIifQ"  # 14 chars
+        sig = "shortsigvalue123"  # 16 chars (>10)
         short_jwt = f"{header}.{payload}.{sig}"
         out = redact_secrets(f"Bearer {short_jwt} after")
         self.assertIn("[REDACTED_JWT]", out)
