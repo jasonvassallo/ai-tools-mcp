@@ -69,8 +69,22 @@ def redact_secrets(value: Any) -> Any:
         return value
     if isinstance(value, dict):
         # Walk both keys and values so secrets-as-dict-key are also masked
-        # (per PR #1 review, Gemini).
-        return {redact_secrets(k): redact_secrets(v) for k, v in value.items()}
+        # (per PR #1 review, Gemini). When two distinct secret-shape keys
+        # would collide on the same redacted marker, append a numeric
+        # suffix (#2, #3, ...) to preserve all entries — naive
+        # dict-comprehension would silently lose data (per PR #2 review,
+        # Codex P2 + Gemini medium).
+        out: dict[Any, Any] = {}
+        for k, v in value.items():
+            new_k = redact_secrets(k)
+            new_v = redact_secrets(v)
+            if new_k in out:
+                i = 2
+                while f"{new_k}#{i}" in out:
+                    i += 1
+                new_k = f"{new_k}#{i}"
+            out[new_k] = new_v
+        return out
     if isinstance(value, list):
         return [redact_secrets(v) for v in value]
     if isinstance(value, tuple):

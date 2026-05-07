@@ -264,6 +264,39 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
         self.assertEqual(out["title"], "[REDACTED_GOOGLE_API_KEY]")
 
+    def test_dict_keys_collision_preserves_all_values_after_pr2_review(self):
+        """PR #2 review (Codex P2 + Gemini medium): two DISTINCT secret-shape
+        keys that both redact to the same marker would collapse into one
+        dict entry under naive comprehension, silently losing values. Fix
+        appends a numeric suffix (#2, #3, ...) on collision so every entry
+        is preserved.
+        """
+        k1 = _GOOG_API_KEY_PREFIX + "SyDistinctKey1foobarbazquux1234567"
+        k2 = _GOOG_API_KEY_PREFIX + "SyDistinctKey2foobarbazquux1234567"
+        d = {k1: "value1", k2: "value2"}
+        out = redact_secrets(d)
+        # Both values must be preserved.
+        self.assertEqual(set(out.values()), {"value1", "value2"})
+        # Two distinct redacted keys: marker, then marker#2.
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]#2", out)
+        # No leakage of original prefixes.
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", str(out))
+
+    def test_dict_keys_collision_three_way(self):
+        """Three distinct secret-shape keys -> marker, marker#2, marker#3."""
+        keys = [
+            _GOOG_API_KEY_PREFIX + "SyAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            _GOOG_API_KEY_PREFIX + "SyBbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            _GOOG_API_KEY_PREFIX + "SyCcccccccccccccccccccccccccccccc",
+        ]
+        d = {k: f"v{i}" for i, k in enumerate(keys)}
+        out = redact_secrets(d)
+        self.assertEqual(set(out.values()), {"v0", "v1", "v2"})
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]#2", out)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]#3", out)
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
