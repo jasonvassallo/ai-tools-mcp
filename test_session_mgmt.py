@@ -246,9 +246,7 @@ class TestUpdateSession(_SessionMgmtBase):
         self.assertGreater(reloaded["last_modified"], original["last_modified"])
 
     def test_update_session_without_name_only_bumps_modified(self):
-        save_result = mcp_server.save_session(
-            name="keepme", messages=[]
-        )
+        save_result = mcp_server.save_session(name="keepme", messages=[])
         original = mcp_server.load_session(save_result["session_id"])
         time.sleep(0.01)
 

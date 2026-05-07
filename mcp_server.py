@@ -367,8 +367,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="update_session",
             description=(
-                "Update a saved session's name and bump its last_modified "
-                "timestamp."
+                "Update a saved session's name and bump its last_modified timestamp."
             ),
             inputSchema={
                 "type": "object",
@@ -387,9 +386,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="delete_session",
-            description=(
-                "Delete a saved session permanently. Use with caution."
-            ),
+            description=("Delete a saved session permanently. Use with caution."),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -441,7 +438,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name == "list_sessions":
         sessions = list_sessions()
         if not sessions:
-            return [TextContent(type="text", text="## Saved Sessions\n\nNo saved sessions found.\n")]
+            return [
+                TextContent(
+                    type="text", text="## Saved Sessions\n\nNo saved sessions found.\n"
+                )
+            ]
         lines = [
             "## Saved Sessions",
             "",
@@ -484,7 +485,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "",
         ]
         for msg in session["messages"]:
-            lines.append(f"**{msg.get('role', 'unknown').upper()}:** {msg.get('content', '')}")
+            lines.append(
+                f"**{msg.get('role', 'unknown').upper()}:** {msg.get('content', '')}"
+            )
             lines.append("")
         return [TextContent(type="text", text="\n".join(lines))]
 
