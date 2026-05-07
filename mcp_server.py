@@ -163,17 +163,29 @@ def save_session(
     messages: list[dict[str, Any]] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Save a conversation session to ``SESSIONS_DIR``."""
+    """Save a conversation session to ``SESSIONS_DIR``.
+
+    SECURITY: ``messages`` and ``metadata`` are passed through
+    ``redact_secrets`` before being persisted to disk. This is the same
+    exposure shape that motivated PR #1 (tool result persisted with
+    secrets) — session content may originate from upstream tool output
+    or user-pasted material that included secret-shape strings, and we
+    do not want those landing on disk in plaintext where they will be
+    read back into future conversations.
+    """
     session_id = str(uuid.uuid4())
     now = datetime.utcnow().isoformat() + "Z"
+
+    safe_messages = redact_secrets(messages or [])
+    safe_metadata = redact_secrets(metadata or {})
 
     session_data = {
         "session_id": session_id,
         "name": name,
         "created_at": now,
         "last_modified": now,
-        "messages": messages or [],
-        "metadata": metadata or {},
+        "messages": safe_messages,
+        "metadata": safe_metadata,
     }
 
     session_file = get_session_file(session_id)
@@ -303,7 +315,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Persist the current conversation context to a new session "
                 "file. Returns the new session id. Pass the full conversation "
-                "history as the 'messages' array."
+                "history as the 'messages' array. Secret-shape strings in "
+                "messages and metadata are redacted before write."
             ),
             inputSchema={
                 "type": "object",
