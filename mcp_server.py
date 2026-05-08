@@ -74,11 +74,16 @@ def redact_secrets(value: Any) -> Any:
         # suffix (#2, #3, ...) to preserve all entries — naive
         # dict-comprehension would silently lose data (per PR #2 review,
         # Codex P2 + Gemini medium).
+        # Collision-handling is gated on string keys only (per PR #2 follow-up
+        # review, Gemini medium): non-string keys (tuple, int, frozenset, ...)
+        # pass through redact_secrets unchanged and therefore cannot collide
+        # with redacted-string markers, so preserve their original type
+        # without the f-string conversion path.
         out: dict[Any, Any] = {}
         for k, v in value.items():
             new_k = redact_secrets(k)
             new_v = redact_secrets(v)
-            if new_k in out:
+            if isinstance(new_k, str) and new_k in out:
                 i = 2
                 while f"{new_k}#{i}" in out:
                     i += 1

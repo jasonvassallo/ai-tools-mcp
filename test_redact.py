@@ -297,6 +297,33 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertIn("[REDACTED_GOOGLE_API_KEY]#2", out)
         self.assertIn("[REDACTED_GOOGLE_API_KEY]#3", out)
 
+    def test_dict_non_string_keys_preserve_type_after_pr2_review_gemini(self):
+        """PR #2 follow-up review (Gemini medium): non-string dict keys
+        (tuples, ints, etc.) must pass through with original type preserved.
+        Collision-handling is gated on string keys only because non-string
+        keys cannot collide with redacted-string markers.
+        """
+        # Tuple keys (no secret-shape) — pass through unchanged with type intact
+        d_tuple = {(1, 2): "v1", (3, 4): "v2"}
+        out = redact_secrets(d_tuple)
+        self.assertEqual(out, d_tuple)
+        self.assertTrue(all(isinstance(k, tuple) for k in out.keys()))
+
+        # Integer keys
+        d_int = {42: "v1", 99: "v2"}
+        out = redact_secrets(d_int)
+        self.assertEqual(out, d_int)
+        self.assertTrue(all(isinstance(k, int) for k in out.keys()))
+
+        # Mixed: secret-shape string + non-string keys all in one dict
+        mixed = {FAKE_GOOG_API_KEY: "leaked", (1, 2): "tup", 42: "i"}
+        out = redact_secrets(mixed)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertIn((1, 2), out)
+        self.assertIn(42, out)
+        self.assertEqual(out[(1, 2)], "tup")
+        self.assertEqual(out[42], "i")
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
