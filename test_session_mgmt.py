@@ -534,6 +534,26 @@ class TestRobustness(_SessionMgmtBase):
             mcp_server.update_session(sid, name="x")
         self.assertIn("not a JSON object", str(ctx.exception))
 
+    def test_update_session_accepts_empty_string_name(self):
+        """PR #4 follow-up review (CodeRabbit nitpick L360): callers
+        can pass name='' to explicitly clear the name field; `if name:`
+        was rejecting that as falsy."""
+        save = mcp_server.save_session(name="initial", messages=[])
+        sid = save["session_id"]
+        result = mcp_server.update_session(sid, name="")
+        self.assertEqual(result["name"], "")
+
+    def test_delete_session_handles_concurrent_unlink(self):
+        """PR #4 follow-up review (CodeRabbit nitpick L377): try/except
+        FileNotFoundError on unlink() instead of exists()-then-unlink."""
+        save = mcp_server.save_session(name="doomed", messages=[])
+        sid = save["session_id"]
+        # Simulate concurrent deletion
+        (self.tmp_path / f"{sid}.json").unlink()
+        with self.assertRaises(ValueError) as ctx:
+            mcp_server.delete_session(sid)
+        self.assertIn("Session not found", str(ctx.exception))
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)

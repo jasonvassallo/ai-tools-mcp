@@ -345,8 +345,10 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Session file shape is not a JSON object: {session_id}")
 
-    if name:
-        # Same name-redaction as save_session (per PR #3 review, Codex P2).
+    if name is not None:
+        # `is not None` (not truthy check) so callers can pass name=""
+        # to explicitly clear the name (per PR #4 follow-up review,
+        # CodeRabbit nitpick L360).
         data["name"] = redact_secrets(name)
     data["last_modified"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
@@ -368,12 +370,17 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
 
 
 def delete_session(session_id: str) -> dict[str, Any]:
-    """Delete a session file by id."""
-    session_file = get_session_file(session_id)
-    if not session_file.exists():
-        raise ValueError(f"Session not found: {session_id}")
+    """Delete a session file by id.
 
-    session_file.unlink()
+    Catches FileNotFoundError from unlink() directly to avoid the
+    TOCTOU race window between exists() and unlink() (per PR #4
+    follow-up review, CodeRabbit nitpick L377).
+    """
+    session_file = get_session_file(session_id)
+    try:
+        session_file.unlink()
+    except FileNotFoundError:
+        raise ValueError(f"Session not found: {session_id}") from None
     return {"success": True, "session_id": session_id}
 
 
@@ -577,10 +584,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "|------------|------|----------|---------------|",
         ]
         for s in sessions:
-            # Escape pipe characters in session names so they don't break
-            # the Markdown table formatting (per PR #3 follow-up review,
-            # Gemini medium).
-            safe_name = s["name"].replace("|", "&#124;")
+            # Sanitize session names for the Markdown table:
+            # - escape pipe (|) so it doesn't break column boundaries
+            # - replace newlines with spaces so a multi-line name
+            #   doesn't collapse the table (per PR #4 follow-up review,
+            #   Gemini medium L583).
+            safe_name = s["name"].replace("|", "&#124;").replace("\n", " ")
             lines.append(
                 f"| `{s['session_id']}` | {safe_name} | {s['message_count']} | {s['last_modified']} |"
             )
@@ -623,7 +632,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if not isinstance(msg, dict):
                 continue
             role = str(msg.get("role") or "unknown").upper()
-            content = msg.get("content", "")
+            # str() coerce content too: handles null/numeric/non-string
+            # values (renders as empty rather than literal "None")
+            # (per PR #4 follow-up review, Gemini medium L626).
+            content = str(msg.get("content") or "")
             lines.append(f"**{role}:** {content}")
             lines.append("")
         return [TextContent(type="text", text="\n".join(lines))]
