@@ -184,23 +184,33 @@ def list_sessions() -> list[dict[str, Any]]:
         try:
             with open(session_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # Defensive: if a session file is valid JSON but not an object
-            # (e.g. "[]" or a string), data.get(...) would raise
-            # AttributeError; if "messages" exists but isn't a list, len()
-            # raises TypeError. Skip such files instead of failing the
-            # entire listing (per PR #3 follow-up review, Gemini medium +
-            # Codex P3).
-            sessions.append(
-                {
-                    "session_id": session_file.stem,
-                    "name": data.get("name", "Untitled"),
-                    "created_at": data.get("created_at"),
-                    "last_modified": data.get("last_modified"),
-                    "message_count": len(data.get("messages", [])),
-                }
-            )
-        except (json.JSONDecodeError, OSError, AttributeError, TypeError):
+        except (json.JSONDecodeError, OSError):
             continue
+        # Defensive: skip files where the parsed JSON is not a session
+        # object or where "messages" is present but not a list. Without
+        # these guards, a syntactically-valid JSON file shaped like
+        # ``[]`` or ``{"messages": "not-a-list"}`` would crash
+        # data.get() or len() and abort the entire listing instead of
+        # just skipping the bad file. Note: relying on the broad
+        # except (json.JSONDecodeError, OSError, AttributeError,
+        # TypeError) does NOT cover the "messages is a string" case
+        # because len("string") returns 10, not a TypeError. Explicit
+        # isinstance guards are clearer and correct
+        # (per PR #3 follow-up review, Gemini medium + Codex P3).
+        if not isinstance(data, dict):
+            continue
+        messages = data.get("messages", [])
+        if not isinstance(messages, list):
+            continue
+        sessions.append(
+            {
+                "session_id": session_file.stem,
+                "name": data.get("name", "Untitled"),
+                "created_at": data.get("created_at"),
+                "last_modified": data.get("last_modified"),
+                "message_count": len(messages),
+            }
+        )
 
     sessions.sort(key=lambda x: x.get("last_modified") or "", reverse=True)
     return sessions
