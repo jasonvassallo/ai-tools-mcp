@@ -40,14 +40,20 @@ _REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"ya29\.[A-Za-z0-9_-]+"), "[REDACTED_GOOGLE_OAUTH_ACCESS]"),
     (re.compile(r"1//0[A-Za-z0-9_-]{30,}"), "[REDACTED_GOOGLE_OAUTH_REFRESH]"),
     (re.compile(r"AIza[A-Za-z0-9_-]{20,}"), "[REDACTED_GOOGLE_API_KEY]"),
+    # JWT minimums relaxed from {30,30,20} to {10,10,10} per PR #1 review
+    # (Gemini): minimal valid header `{"alg":"HS256"}` encodes to 20 chars,
+    # which the original {30,} requirement missed.
     (
-        re.compile(r"eyJ[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{30,}\.[A-Za-z0-9_-]{20,}"),
+        re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
         "[REDACTED_JWT]",
     ),
-    (
-        re.compile(r"\b[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}\b"),
-        "[REDACTED_APPLE_APP_PWD]",
-    ),
+    # Apple app-specific password format (xxxx-xxxx-xxxx-xxxx) was originally
+    # included but removed per PR #1 review (Codex P2): the regex
+    # \b[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}\b false-positives on ordinary
+    # research-prose phrases like "real-time-data-flow" or
+    # "zero-shot-text-only", silently mangling deep_research output. ASPs
+    # leak via local-config / IMAP-debug paths this MCP doesn't touch, so
+    # for prose-content redaction the safer trade is to drop the pattern.
 )
 
 
@@ -62,7 +68,44 @@ def redact_secrets(value: Any) -> Any:
             value = pattern.sub(replacement, value)
         return value
     if isinstance(value, dict):
-        return {k: redact_secrets(v) for k, v in value.items()}
+        # Walk both keys and values so secrets-as-dict-key are also masked
+        # (per PR #1 review, Gemini). When two distinct secret-shape keys
+        # would collide on the same redacted marker, append a numeric
+        # suffix (#2, #3, ...) to preserve all entries — naive
+        # dict-comprehension would silently lose data (per PR #2 review,
+        # Codex P2 + Gemini medium).
+        # Collision-handling preserves all entries when two distinct
+        # original keys redact to the same value:
+        #   - String keys: append "#N" suffix.
+        #   - Tuple keys (including tuples whose elements were recursively
+        #     redacted into the same shape — e.g. (api_key_1, "x") and
+        #     (api_key_2, "x") both becoming ("[REDACTED_..]", "x")):
+        #     append a "#N" string element to the tuple. Per PR #2
+        #     follow-up review (Codex P2): without this, tuple-key
+        #     collisions silently drop entries, contradicting the
+        #     preservation guarantee added for string keys.
+        #   - Other hashable types (frozenset, custom __hash__): rare in
+        #     practice; fall through to last-write-wins (Python's default
+        #     dict-comprehension behavior). Document if needed.
+        out: dict[Any, Any] = {}
+        for k, v in value.items():
+            new_k = redact_secrets(k)
+            new_v = redact_secrets(v)
+            if new_k in out:
+                if isinstance(new_k, str):
+                    i = 2
+                    while f"{new_k}#{i}" in out:
+                        i += 1
+                    new_k = f"{new_k}#{i}"
+                elif isinstance(new_k, tuple):
+                    i = 2
+                    while (*new_k, f"#{i}") in out:
+                        i += 1
+                    new_k = (*new_k, f"#{i}")
+                # else: leave new_k unchanged → last-write-wins for the
+                # rare case of frozenset/custom-hash collisions.
+            out[new_k] = new_v
+        return out
     if isinstance(value, list):
         return [redact_secrets(v) for v in value]
     if isinstance(value, tuple):

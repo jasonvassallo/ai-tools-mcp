@@ -138,24 +138,24 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertIn("[REDACTED_JWT]", out)
         self.assertNotIn(_JWT_HEADER[:4], out)
 
-    def test_apple_app_specific_password(self):
-        s = "pwd: abcd-efgh-ijkl-mnop done"
-        out = redact_secrets(s)
-        self.assertIn("[REDACTED_APPLE_APP_PWD]", out)
-        self.assertNotIn("abcd-efgh-ijkl-mnop", out)
-
-    def test_apple_pwd_does_not_match_uuid_or_hex(self):
-        # UUIDs and uppercase variants should not match the lowercase pattern.
+    def test_no_apple_asp_redaction_after_codex_review(self):
+        """PR #1 review (Codex P2): the Apple ASP regex was dropped because
+        it false-positived on ordinary 4-word lowercase hyphenated phrases
+        in research-prose output. None of these benign strings should be
+        mutated, and the [REDACTED_APPLE_APP_PWD] marker should never
+        appear.
+        """
         for s in [
-            "550e8400-e29b-41d4-a716-446655440000",
-            "deadbeef-cafe-1234-5678",
-            "AAAA-BBBB-CCCC-DDDD",
+            "real-time-data-flow",  # Codex's first example
+            "zero-shot-text-only",  # Codex's second example
+            "abcd-efgh-ijkl-mnop",  # original ASP shape — now benign
+            "self-hosted-build-tools",  # ML/devops slug
+            "550e8400-e29b-41d4-a716-446655440000",  # UUID
+            "AAAA-BBBB-CCCC-DDDD",  # uppercase 4x4 (always unmatched)
         ]:
-            self.assertNotIn(
-                "REDACTED_APPLE",
-                redact_secrets(s),
-                f"false positive on {s!r}",
-            )
+            out = redact_secrets(s)
+            self.assertEqual(out, s, f"unexpected mutation of {s!r}: got {out!r}")
+            self.assertNotIn("REDACTED_APPLE", out)
 
     def test_private_key_block(self):
         # Inline a non-Google-shape body so the block test stays focused.
@@ -233,6 +233,114 @@ class TestRedactSecrets(unittest.TestCase):
     def test_clean_string_unchanged(self):
         s = "The quick brown fox jumps over the lazy dog."
         self.assertEqual(redact_secrets(s), s)
+
+    def test_short_jwt_is_caught_after_gemini_review(self):
+        """PR #1 review (Gemini): JWT minimum lengths were relaxed from
+        {30,30,20} to {10,10,10}. Catches minimal real JWTs — e.g. a header
+        encoding `{"alg":"HS256"}` is 20 chars, which the original {30,}
+        requirement missed entirely.
+        """
+        # Build a minimal-shape JWT at runtime to dodge secret scanners.
+        header = "ey" + "J" + "hbGciOiJIUzI1NiJ9"  # 20 chars
+        payload = "ey" + "J" + "zdWIiOiIifQ"  # 14 chars
+        sig = "shortsigvalue123"  # 16 chars (>10)
+        short_jwt = f"{header}.{payload}.{sig}"
+        out = redact_secrets(f"Bearer {short_jwt} after")
+        self.assertIn("[REDACTED_JWT]", out)
+        self.assertNotIn(header, out)
+
+    def test_secret_as_dict_key_is_redacted_after_gemini_review(self):
+        """PR #1 review (Gemini): redact_secrets() now walks dict KEYS
+        recursively, not just values. A secret appearing as a dict key
+        (e.g. an API key passed as a parameter name in synthesized JSON)
+        was previously left in plaintext.
+        """
+        d = {FAKE_GOOG_API_KEY: "value", "title": FAKE_GOOG_API_KEY}
+        out = redact_secrets(d)
+        # Raw key prefix should not appear anywhere in the output.
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", str(out))
+        # The key got redacted to the marker; both occurrences collapse
+        # into a single "[REDACTED_GOOGLE_API_KEY]" key.
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertEqual(out["title"], "[REDACTED_GOOGLE_API_KEY]")
+
+    def test_dict_keys_collision_preserves_all_values_after_pr2_review(self):
+        """PR #2 review (Codex P2 + Gemini medium): two DISTINCT secret-shape
+        keys that both redact to the same marker would collapse into one
+        dict entry under naive comprehension, silently losing values. Fix
+        appends a numeric suffix (#2, #3, ...) on collision so every entry
+        is preserved.
+        """
+        k1 = _GOOG_API_KEY_PREFIX + "SyDistinctKey1foobarbazquux1234567"
+        k2 = _GOOG_API_KEY_PREFIX + "SyDistinctKey2foobarbazquux1234567"
+        d = {k1: "value1", k2: "value2"}
+        out = redact_secrets(d)
+        # Both values must be preserved.
+        self.assertEqual(set(out.values()), {"value1", "value2"})
+        # Two distinct redacted keys: marker, then marker#2.
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]#2", out)
+        # No leakage of original prefixes.
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", str(out))
+
+    def test_dict_keys_collision_three_way(self):
+        """Three distinct secret-shape keys -> marker, marker#2, marker#3."""
+        keys = [
+            _GOOG_API_KEY_PREFIX + "SyAaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            _GOOG_API_KEY_PREFIX + "SyBbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            _GOOG_API_KEY_PREFIX + "SyCcccccccccccccccccccccccccccccc",
+        ]
+        d = {k: f"v{i}" for i, k in enumerate(keys)}
+        out = redact_secrets(d)
+        self.assertEqual(set(out.values()), {"v0", "v1", "v2"})
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]#2", out)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]#3", out)
+
+    def test_dict_non_string_keys_preserve_type_after_pr2_review_gemini(self):
+        """PR #2 follow-up review (Gemini medium): non-string dict keys
+        (tuples, ints, etc.) must pass through with original type preserved.
+        Collision-handling is gated on string keys only because non-string
+        keys cannot collide with redacted-string markers.
+        """
+        # Tuple keys (no secret-shape) — pass through unchanged with type intact
+        d_tuple = {(1, 2): "v1", (3, 4): "v2"}
+        out = redact_secrets(d_tuple)
+        self.assertEqual(out, d_tuple)
+        self.assertTrue(all(isinstance(k, tuple) for k in out))
+
+        # Integer keys
+        d_int = {42: "v1", 99: "v2"}
+        out = redact_secrets(d_int)
+        self.assertEqual(out, d_int)
+        self.assertTrue(all(isinstance(k, int) for k in out))
+
+        # Mixed: secret-shape string + non-string keys all in one dict
+        mixed = {FAKE_GOOG_API_KEY: "leaked", (1, 2): "tup", 42: "i"}
+        out = redact_secrets(mixed)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertIn((1, 2), out)
+        self.assertIn(42, out)
+        self.assertEqual(out[(1, 2)], "tup")
+        self.assertEqual(out[42], "i")
+
+    def test_tuple_keys_collision_preserves_all_values(self):
+        """PR #2 follow-up review (Codex P2): tuple keys whose elements get
+        recursively redacted into the same shape would collide and silently
+        drop data. Fix: extend collision-handling to tuples by appending a
+        '#N' string element.
+        """
+        k1 = (FAKE_GOOG_API_KEY + "_one", "x")
+        k2 = (FAKE_GOOG_API_KEY + "_two", "x")
+        d = {k1: "v1", k2: "v2"}
+        out = redact_secrets(d)
+        # Both values must be preserved.
+        self.assertEqual(set(out.values()), {"v1", "v2"})
+        # First collides as the bare redacted tuple; second gets "#2" suffix.
+        bare = ("[REDACTED_GOOGLE_API_KEY]", "x")
+        suffixed = ("[REDACTED_GOOGLE_API_KEY]", "x", "#2")
+        self.assertIn(bare, out)
+        self.assertIn(suffixed, out)
 
 
 if __name__ == "__main__":
