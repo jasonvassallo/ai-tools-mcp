@@ -555,6 +555,90 @@ class TestRobustness(_SessionMgmtBase):
         self.assertIn("Session not found", str(ctx.exception))
 
 
+class TestAtomicWrites(_SessionMgmtBase):
+    """PR #4 follow-up review (Codex P2 L360 + Gemini med L270/L362):
+    save/update must use temp-file + os.replace so a crash mid-write
+    can't truncate or corrupt the session file."""
+
+    def test_save_session_no_tmp_leak_on_success(self):
+        """Successful save leaves no .tmp file behind."""
+        result = mcp_server.save_session(
+            name="clean", messages=[{"role": "user", "content": "hi"}]
+        )
+        sid = result["session_id"]
+        self.assertTrue((self.tmp_path / f"{sid}.json").exists())
+        leftover = list(self.tmp_path.glob("*.tmp"))
+        self.assertEqual(leftover, [], f"Leftover temp files: {leftover}")
+
+    def test_save_session_no_tmp_leak_on_write_failure(self):
+        """If json.dump raises, the temp file must be cleaned up so
+        SESSIONS_DIR doesn't accumulate .tmp litter on disk-full or
+        permission errors."""
+        with mock.patch.object(
+            mcp_server.json, "dump", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                mcp_server.save_session(name="fail", messages=[])
+        leftover = list(self.tmp_path.glob("*.tmp"))
+        self.assertEqual(leftover, [], f"Leftover temp files: {leftover}")
+
+    def test_update_session_preserves_file_on_write_failure(self):
+        """If update_session's write fails, the original session file
+        is unchanged (the whole point of the atomic temp+os.replace
+        pattern). A non-atomic ``O_TRUNC`` write would have left a
+        zero-length or partial JSON file here."""
+        original = mcp_server.save_session(
+            name="original",
+            messages=[{"role": "user", "content": "important data"}],
+        )
+        sid = original["session_id"]
+        sess_path = self.tmp_path / f"{sid}.json"
+        with open(sess_path, "r", encoding="utf-8") as f:
+            before = json.load(f)
+
+        with mock.patch.object(
+            mcp_server.json, "dump", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                mcp_server.update_session(sid, name="should-not-stick")
+
+        with open(sess_path, "r", encoding="utf-8") as f:
+            after = json.load(f)
+        self.assertEqual(after, before)
+        leftover = list(self.tmp_path.glob("*.tmp"))
+        self.assertEqual(leftover, [])
+
+    def test_update_session_rejects_concurrent_deletion(self):
+        """Codex P2 L360: if a session is deleted between update_session's
+        read and its write, update_session must NOT silently re-create
+        the file. The existence re-check before the atomic write should
+        raise ValueError so the caller learns the operation lost a race."""
+        save = mcp_server.save_session(name="vanishing", messages=[])
+        sid = save["session_id"]
+        sess_path = self.tmp_path / f"{sid}.json"
+
+        # Wrap json.load so it deletes the file as a side effect after
+        # successfully reading it. This simulates a concurrent
+        # delete_session() landing between our read and our write.
+        original_load = mcp_server.json.load
+
+        def evil_load(fp):
+            data = original_load(fp)
+            sess_path.unlink()
+            return data
+
+        with mock.patch.object(mcp_server.json, "load", side_effect=evil_load):
+            with self.assertRaises(ValueError) as ctx:
+                mcp_server.update_session(sid, name="resurrected?")
+
+        self.assertIn("deleted concurrently", str(ctx.exception))
+        # And critically: the file stayed deleted (no silent recreation).
+        self.assertFalse(sess_path.exists())
+        # No temp leak either.
+        leftover = list(self.tmp_path.glob("*.tmp"))
+        self.assertEqual(leftover, [])
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])

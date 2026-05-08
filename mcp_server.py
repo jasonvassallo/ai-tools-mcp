@@ -169,7 +169,11 @@ def get_session_file(session_id: str) -> Path:
         # canonical 36-char hyphenated lowercase form. The path then
         # provably contains only [0-9a-f-] — no path separators or
         # other shell-interesting characters can survive.
-        parsed = uuid.UUID(str(session_id))
+        # Note: the type hint says ``str`` but Python doesn't enforce
+        # it at runtime; the except clause below catches the TypeError
+        # that uuid.UUID raises on non-string inputs (per PR #4
+        # follow-up review, Gemini nitpick L172).
+        parsed = uuid.UUID(session_id)
     except (ValueError, AttributeError, TypeError):
         raise ValueError(
             f"Invalid session_id: must be a valid UUID, got {session_id!r}"
@@ -262,12 +266,27 @@ def save_session(
     # Ensure the sessions directory exists before writing (lazy mkdir so
     # imports stay side-effect-free for test isolation).
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    # Atomically create the file with 0o600 (owner-only) so session content —
-    # which may include conversation history — is not world-readable on
-    # shared machines (per PR #4 review, CodeRabbit Major).
-    fd = os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(session_data, f, indent=2)
+    # Atomic write: create a temp file with 0o600 (owner-only) so session
+    # content — which may include conversation history — is not
+    # world-readable on shared machines (per PR #4 review, CodeRabbit
+    # Major), then os.replace() the temp into place. If the process
+    # crashes mid json.dump, the partial write is in the temp file, not
+    # in session_file (per PR #4 follow-up review, Codex P2 + Gemini med:
+    # O_TRUNC | O_CREAT direct write is not atomic).
+    temp_file = session_file.with_suffix(session_file.suffix + ".tmp")
+    fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(session_data, f, indent=2)
+        os.replace(temp_file, session_file)
+    except Exception:
+        # Clean up the temp file on any error so we don't leave .tmp
+        # litter in SESSIONS_DIR.
+        try:
+            temp_file.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
     return {
         "success": True,
@@ -312,16 +331,16 @@ def load_session(session_id: str) -> dict[str, Any]:
         # Normalize non-list "messages" to [] so the load_session render
         # path can't be tripped by truthy non-list values (e.g. 1 or
         # "string") in malformed/manually-edited session files
-        # (per PR #4 review, Codex P2).
+        # (per PR #4 review, Codex P2). The trailing ``or []`` /
+        # ``or {}`` was redundant — the ternary already returns the
+        # empty container on type-mismatch (per PR #4 follow-up review,
+        # CodeRabbit + Gemini nitpick L319/L324).
         "messages": (
             data.get("messages") if isinstance(data.get("messages"), list) else []
-        )
-        or [],
-        # Same idea for metadata: only a dict is usable downstream.
+        ),
         "metadata": (
             data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
-        )
-        or {},
+        ),
     }
 
 
@@ -353,13 +372,34 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
     data["last_modified"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    # Same 0o600 permissions on rewrite (per PR #4 review, CodeRabbit Major).
-    # Also normalizes existing files that may have been written with looser
-    # umask before this fix landed.
-    session_file.chmod(0o600) if session_file.exists() else None
-    fd = os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    # Re-check existence right before the write to refuse silent
+    # resurrection if the session was deleted concurrently between our
+    # read and our write. Without this, the atomic write below would
+    # recreate the file (per PR #4 follow-up review, Codex P2 L360:
+    # "Avoid recreating sessions deleted during update").
+    if not session_file.exists():
+        raise ValueError(
+            f"Session was deleted concurrently during update: {session_id}"
+        )
+
+    # Atomic write: same temp+os.replace pattern as save_session so a
+    # crash mid-write doesn't truncate the existing session file (per
+    # PR #4 follow-up review, Codex P2 L360 + Gemini med L362). The
+    # 0o600 mode comes from os.open() on the temp file and is preserved
+    # by os.replace, so the chmod-on-existing-file dance is no longer
+    # needed.
+    temp_file = session_file.with_suffix(session_file.suffix + ".tmp")
+    fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(temp_file, session_file)
+    except Exception:
+        try:
+            temp_file.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
     return {
         "success": True,
