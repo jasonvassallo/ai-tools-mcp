@@ -324,6 +324,24 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertEqual(out[(1, 2)], "tup")
         self.assertEqual(out[42], "i")
 
+    def test_tuple_keys_collision_preserves_all_values(self):
+        """PR #2 follow-up review (Codex P2): tuple keys whose elements get
+        recursively redacted into the same shape would collide and silently
+        drop data. Fix: extend collision-handling to tuples by appending a
+        '#N' string element.
+        """
+        k1 = (FAKE_GOOG_API_KEY + "_one", "x")
+        k2 = (FAKE_GOOG_API_KEY + "_two", "x")
+        d = {k1: "v1", k2: "v2"}
+        out = redact_secrets(d)
+        # Both values must be preserved.
+        self.assertEqual(set(out.values()), {"v1", "v2"})
+        # First collides as the bare redacted tuple; second gets "#2" suffix.
+        bare = ("[REDACTED_GOOGLE_API_KEY]", "x")
+        suffixed = ("[REDACTED_GOOGLE_API_KEY]", "x", "#2")
+        self.assertIn(bare, out)
+        self.assertIn(suffixed, out)
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)

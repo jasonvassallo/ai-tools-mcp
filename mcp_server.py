@@ -74,20 +74,36 @@ def redact_secrets(value: Any) -> Any:
         # suffix (#2, #3, ...) to preserve all entries — naive
         # dict-comprehension would silently lose data (per PR #2 review,
         # Codex P2 + Gemini medium).
-        # Collision-handling is gated on string keys only (per PR #2 follow-up
-        # review, Gemini medium): non-string keys (tuple, int, frozenset, ...)
-        # pass through redact_secrets unchanged and therefore cannot collide
-        # with redacted-string markers, so preserve their original type
-        # without the f-string conversion path.
+        # Collision-handling preserves all entries when two distinct
+        # original keys redact to the same value:
+        #   - String keys: append "#N" suffix.
+        #   - Tuple keys (including tuples whose elements were recursively
+        #     redacted into the same shape — e.g. (api_key_1, "x") and
+        #     (api_key_2, "x") both becoming ("[REDACTED_..]", "x")):
+        #     append a "#N" string element to the tuple. Per PR #2
+        #     follow-up review (Codex P2): without this, tuple-key
+        #     collisions silently drop entries, contradicting the
+        #     preservation guarantee added for string keys.
+        #   - Other hashable types (frozenset, custom __hash__): rare in
+        #     practice; fall through to last-write-wins (Python's default
+        #     dict-comprehension behavior). Document if needed.
         out: dict[Any, Any] = {}
         for k, v in value.items():
             new_k = redact_secrets(k)
             new_v = redact_secrets(v)
-            if isinstance(new_k, str) and new_k in out:
-                i = 2
-                while f"{new_k}#{i}" in out:
-                    i += 1
-                new_k = f"{new_k}#{i}"
+            if new_k in out:
+                if isinstance(new_k, str):
+                    i = 2
+                    while f"{new_k}#{i}" in out:
+                        i += 1
+                    new_k = f"{new_k}#{i}"
+                elif isinstance(new_k, tuple):
+                    i = 2
+                    while (*new_k, f"#{i}") in out:
+                        i += 1
+                    new_k = (*new_k, f"#{i}")
+                # else: leave new_k unchanged → last-write-wins for the
+                # rare case of frozenset/custom-hash collisions.
             out[new_k] = new_v
         return out
     if isinstance(value, list):
