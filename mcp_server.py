@@ -76,8 +76,27 @@ def redact_secrets(value: Any) -> Any:
         return value
     if isinstance(value, dict):
         # Walk both keys and values so secrets-as-dict-key are also masked
-        # (per PR #1 review, Gemini).
-        return {redact_secrets(k): redact_secrets(v) for k, v in value.items()}
+        # (per PR #1 review, Gemini). When two distinct secret-shape keys
+        # would collide on the same redacted marker, append a numeric
+        # suffix (#2, #3, ...) to preserve all entries — naive
+        # dict-comprehension would silently lose data (per PR #3 review,
+        # Codex P2; mirrors the parallel fix in PR #2).
+        #
+        # Collision-handling is gated on string keys only: non-string keys
+        # (tuple, int, etc.) pass through redact_secrets unchanged, so
+        # they cannot collide with redacted-string markers and therefore
+        # preserve their original type without f-string stringification.
+        out: dict[Any, Any] = {}
+        for k, v in value.items():
+            new_k = redact_secrets(k)
+            new_v = redact_secrets(v)
+            if isinstance(new_k, str) and new_k in out:
+                i = 2
+                while f"{new_k}#{i}" in out:
+                    i += 1
+                new_k = f"{new_k}#{i}"
+            out[new_k] = new_v
+        return out
     if isinstance(value, list):
         return [redact_secrets(v) for v in value]
     if isinstance(value, tuple):
@@ -123,8 +142,12 @@ def run_check() -> None:
 #       "messages": [{"role": ..., "content": ...}, ...],
 #       "metadata": {...}
 #     }
+# Note: directory creation happens lazily inside save_session/update_session
+# rather than at module load time. This avoids a side effect during import
+# (per PR #3 follow-up review, Gemini medium): test suites import this
+# module to introspect helpers — they should NOT have the user's real
+# ~/.claude/sessions/ created as a side effect of the import.
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
-SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_session_file(session_id: str) -> Path:
@@ -213,6 +236,11 @@ def save_session(
     }
 
     session_file = get_session_file(session_id)
+    # Ensure the sessions directory exists before writing (per PR #3 follow-up
+    # review, Gemini medium): with the module-level mkdir removed for test
+    # isolation, save_session takes responsibility for ensuring its target
+    # directory exists.
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     with open(session_file, "w", encoding="utf-8") as f:
         json.dump(session_data, f, indent=2)
 
@@ -225,38 +253,53 @@ def save_session(
 
 
 def load_session(session_id: str) -> dict[str, Any]:
-    """Load a previously saved session by id."""
-    session_file = get_session_file(session_id)
-    if not session_file.exists():
-        raise ValueError(f"Session not found: {session_id}")
+    """Load a previously saved session by id.
 
-    with open(session_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    Wraps the file read in try/except (per PR #3 follow-up review, Gemini
+    medium): avoids a TOCTOU race between exists()/open() and surfaces
+    corrupted JSON as a clean ValueError instead of bubbling JSONDecodeError
+    up to the MCP layer.
+    """
+    session_file = get_session_file(session_id)
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise ValueError(f"Session not found: {session_id}") from e
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"Session file invalid or unreadable: {session_id}") from e
 
     return {
-        "session_id": data["session_id"],
-        "name": data["name"],
-        "created_at": data["created_at"],
-        "last_modified": data["last_modified"],
-        "messages": data["messages"],
+        "session_id": data.get("session_id", session_id),
+        "name": data.get("name", "Untitled"),
+        "created_at": data.get("created_at"),
+        "last_modified": data.get("last_modified"),
+        "messages": data.get("messages", []),
         "metadata": data.get("metadata", {}),
     }
 
 
 def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
-    """Update mutable session metadata (name) and bump ``last_modified``."""
-    session_file = get_session_file(session_id)
-    if not session_file.exists():
-        raise ValueError(f"Session not found: {session_id}")
+    """Update mutable session metadata (name) and bump ``last_modified``.
 
-    with open(session_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    Wraps the file read in try/except (per PR #3 follow-up review, Gemini
+    medium): avoids a TOCTOU race and handles corrupted JSON cleanly.
+    """
+    session_file = get_session_file(session_id)
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise ValueError(f"Session not found: {session_id}") from e
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"Session file invalid or unreadable: {session_id}") from e
 
     if name:
         # Same name-redaction as save_session (per PR #3 review, Codex P2).
         data["name"] = redact_secrets(name)
     data["last_modified"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     with open(session_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
@@ -475,8 +518,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "|------------|------|----------|---------------|",
         ]
         for s in sessions:
+            # Escape pipe characters in session names so they don't break
+            # the Markdown table formatting (per PR #3 follow-up review,
+            # Gemini medium).
+            safe_name = s["name"].replace("|", "&#124;")
             lines.append(
-                f"| `{s['session_id']}` | {s['name']} | {s['message_count']} | {s['last_modified']} |"
+                f"| `{s['session_id']}` | {safe_name} | {s['message_count']} | {s['last_modified']} |"
             )
         return [TextContent(type="text", text="\n".join(lines) + "\n")]
 

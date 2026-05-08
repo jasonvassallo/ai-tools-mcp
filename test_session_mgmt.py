@@ -409,6 +409,54 @@ class TestNameRedaction(_SessionMgmtBase):
         self.assertIn("[REDACTED_GOOGLE_API_KEY]", on_disk)
 
 
+class TestRobustness(_SessionMgmtBase):
+    """PR #3 follow-up review (Gemini medium): error-handling + lazy mkdir."""
+
+    def test_load_session_handles_corrupted_json(self):
+        """Corrupted JSON surfaces as a clean ValueError, not raw JSONDecodeError."""
+        import uuid as _uuid
+
+        sid = str(_uuid.uuid4())
+        (self.tmp_path / f"{sid}.json").write_text("{not valid json")
+        with self.assertRaises(ValueError) as ctx:
+            mcp_server.load_session(sid)
+        self.assertIn("invalid", str(ctx.exception).lower())
+
+    def test_update_session_handles_corrupted_json(self):
+        import uuid as _uuid
+
+        sid = str(_uuid.uuid4())
+        (self.tmp_path / f"{sid}.json").write_text("not-json-either")
+        with self.assertRaises(ValueError) as ctx:
+            mcp_server.update_session(sid, name="x")
+        self.assertIn("invalid", str(ctx.exception).lower())
+
+    def test_save_session_creates_sessions_dir_lazily(self):
+        """Module-level mkdir was removed for test isolation; save_session
+        must create the directory on demand."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as fresh_root:
+            target = Path(fresh_root) / "fresh-sessions"
+            self.assertFalse(target.exists())
+            mcp_server.SESSIONS_DIR = target
+            try:
+                result = mcp_server.save_session(name="x", messages=[])
+                self.assertTrue(target.exists())
+                self.assertTrue((target / f"{result['session_id']}.json").exists())
+            finally:
+                mcp_server.SESSIONS_DIR = self.tmp_path
+
+    def test_list_sessions_helper_returns_raw_name(self):
+        """list_sessions() helper preserves the raw session name verbatim;
+        the Markdown-table pipe escape happens in the call_tool rendering
+        path. This test guards that the helper itself does not pre-escape."""
+        original_name = "session | with | pipes"
+        mcp_server.save_session(name=original_name, messages=[])
+        listed = mcp_server.list_sessions()
+        self.assertEqual(listed[0]["name"], original_name)
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])

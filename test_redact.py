@@ -264,6 +264,37 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
         self.assertEqual(out["title"], "[REDACTED_GOOGLE_API_KEY]")
 
+    def test_dict_keys_collision_preserves_all_values_after_pr3_codex_review(self):
+        """PR #3 review (Codex P2): two distinct secret-shape keys that both
+        redact to the same marker would collapse into one dict entry under
+        naive comprehension, losing values. Backported PR #2 collision
+        handling fixes this by appending #2, #3 suffixes.
+        """
+        k1 = _GOOG_API_KEY_PREFIX + "SyDistinctKey1foobarbazquux1234567"
+        k2 = _GOOG_API_KEY_PREFIX + "SyDistinctKey2foobarbazquux1234567"
+        d = {k1: "value1", k2: "value2"}
+        out = redact_secrets(d)
+        self.assertEqual(set(out.values()), {"value1", "value2"})
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]#2", out)
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", str(out))
+
+    def test_dict_non_string_keys_preserve_type(self):
+        """Mirrors PR #2 follow-up Gemini concern: non-string keys
+        (tuples, ints) must pass through with original type intact —
+        collision-handling is string-only.
+        """
+        d_tuple = {(1, 2): "v1", (3, 4): "v2"}
+        out = redact_secrets(d_tuple)
+        self.assertEqual(out, d_tuple)
+        self.assertTrue(all(isinstance(k, tuple) for k in out.keys()))
+
+        mixed = {FAKE_GOOG_API_KEY: "leaked", (1, 2): "tup", 42: "i"}
+        out = redact_secrets(mixed)
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", out)
+        self.assertIn((1, 2), out)
+        self.assertIn(42, out)
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
