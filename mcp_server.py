@@ -4,18 +4,25 @@
 # dependencies = ["openai>=1.0.0", "mcp>=1.0.0"]
 # ///
 """
-MCP server providing deep research via Perplexity Sonar Pro.
+MCP server providing deep research via Perplexity Sonar Pro plus
+local session-management tools backed by ``~/.claude/sessions/``.
 
 Designed to complement Claude's built-in WebSearch tool:
 - Built-in WebSearch: quick factual lookups, single-answer questions
 - deep_research: multi-source synthesis, comparisons, ambiguous queries
+- session_*: persist/restore conversation context across runs
 """
 
+import asyncio
+import json
 import re
 import subprocess
 import sys
-import asyncio
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -68,25 +75,13 @@ def redact_secrets(value: Any) -> Any:
             value = pattern.sub(replacement, value)
         return value
     if isinstance(value, dict):
-        # Walk both keys and values so secrets-as-dict-key are also masked
-        # (per PR #1 review, Gemini). When two distinct secret-shape keys
-        # would collide on the same redacted marker, append a numeric
-        # suffix (#2, #3, ...) to preserve all entries — naive
-        # dict-comprehension would silently lose data (per PR #2 review,
-        # Codex P2 + Gemini medium).
         # Collision-handling preserves all entries when two distinct
         # original keys redact to the same value:
         #   - String keys: append "#N" suffix.
-        #   - Tuple keys (including tuples whose elements were recursively
-        #     redacted into the same shape — e.g. (api_key_1, "x") and
-        #     (api_key_2, "x") both becoming ("[REDACTED_..]", "x")):
-        #     append a "#N" string element to the tuple. Per PR #2
-        #     follow-up review (Codex P2): without this, tuple-key
-        #     collisions silently drop entries, contradicting the
-        #     preservation guarantee added for string keys.
-        #   - Other hashable types (frozenset, custom __hash__): rare in
-        #     practice; fall through to last-write-wins (Python's default
-        #     dict-comprehension behavior). Document if needed.
+        #   - Tuple keys (e.g. (api_key_1, "x") and (api_key_2, "x") both
+        #     becoming ("[REDACTED_..]", "x") after recursion): append a
+        #     "#N" string element to the tuple.
+        #   - Other hashable types: fall through to last-write-wins (rare).
         out: dict[Any, Any] = {}
         for k, v in value.items():
             new_k = redact_secrets(k)
@@ -102,8 +97,6 @@ def redact_secrets(value: Any) -> Any:
                     while (*new_k, f"#{i}") in out:
                         i += 1
                     new_k = (*new_k, f"#{i}")
-                # else: leave new_k unchanged → last-write-wins for the
-                # rare case of frozenset/custom-hash collisions.
             out[new_k] = new_v
         return out
     if isinstance(value, list):
@@ -138,6 +131,227 @@ def run_check() -> None:
         print(f"fail: {e}")
         errors += 1
     sys.exit(errors)
+
+
+# ─── Session management storage ───────────────────────────────────────
+#
+# Sessions are persisted as ``~/.claude/sessions/<uuid>.json`` with shape:
+#     {
+#       "session_id": str,
+#       "name": str,
+#       "created_at": ISO-8601 UTC,
+#       "last_modified": ISO-8601 UTC,
+#       "messages": [{"role": ..., "content": ...}, ...],
+#       "metadata": {...}
+#     }
+# Note: directory creation happens lazily inside save_session/update_session
+# rather than at module load time. This avoids a side effect during import
+# (per PR #3 follow-up review, Gemini medium): test suites import this
+# module to introspect helpers — they should NOT have the user's real
+# ~/.claude/sessions/ created as a side effect of the import.
+SESSIONS_DIR = Path.home() / ".claude" / "sessions"
+
+
+def get_session_file(session_id: str) -> Path:
+    """Return the on-disk path for a session id.
+
+    Validates that ``session_id`` is a valid UUID to prevent path
+    traversal (per PR #3 review, Codex P1). Without this check, an
+    attacker-controlled session_id like ``"/tmp/victim"`` or
+    ``"../../../etc/passwd"`` would resolve to a .json file OUTSIDE
+    ``SESSIONS_DIR``, allowing the load/update/delete MCP tools to
+    read, overwrite, or unlink arbitrary local files.
+    """
+    try:
+        # Parse + canonicalize: uuid.UUID accepts braced and urn:uuid:
+        # forms, so we re-stringify the parsed object to get the
+        # canonical 36-char hyphenated lowercase form. The path then
+        # provably contains only [0-9a-f-] — no path separators or
+        # other shell-interesting characters can survive.
+        parsed = uuid.UUID(str(session_id))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError(
+            f"Invalid session_id: must be a valid UUID, got {session_id!r}"
+        )
+    return SESSIONS_DIR / f"{parsed}.json"
+
+
+def list_sessions() -> list[dict[str, Any]]:
+    """List all sessions, most-recently-modified first."""
+    sessions: list[dict[str, Any]] = []
+    if not SESSIONS_DIR.exists():
+        return sessions
+
+    for session_file in SESSIONS_DIR.glob("*.json"):
+        try:
+            with open(session_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            continue
+        # Defensive: skip files where the parsed JSON is not a session
+        # object or where "messages" is present but not a list. Without
+        # these guards, a syntactically-valid JSON file shaped like
+        # ``[]`` or ``{"messages": "not-a-list"}`` would crash
+        # data.get() or len() and abort the entire listing instead of
+        # just skipping the bad file. Note: relying on the broad
+        # except (json.JSONDecodeError, OSError, AttributeError,
+        # TypeError) does NOT cover the "messages is a string" case
+        # because len("string") returns 10, not a TypeError. Explicit
+        # isinstance guards are clearer and correct
+        # (per PR #3 follow-up review, Gemini medium + Codex P3).
+        if not isinstance(data, dict):
+            continue
+        messages = data.get("messages", [])
+        if not isinstance(messages, list):
+            continue
+        sessions.append(
+            {
+                "session_id": session_file.stem,
+                "name": data.get("name") or "Untitled",
+                "created_at": data.get("created_at"),
+                "last_modified": data.get("last_modified"),
+                "message_count": len(messages),
+            }
+        )
+
+    sessions.sort(key=lambda x: x.get("last_modified") or "", reverse=True)
+    return sessions
+
+
+def save_session(
+    name: str = "Untitled",
+    messages: list[dict[str, Any]] | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Save a conversation session to ``SESSIONS_DIR``.
+
+    SECURITY: ``messages`` and ``metadata`` are passed through
+    ``redact_secrets`` before being persisted to disk. This is the same
+    exposure shape that motivated PR #1 (tool result persisted with
+    secrets) — session content may originate from upstream tool output
+    or user-pasted material that included secret-shape strings, and we
+    do not want those landing on disk in plaintext where they will be
+    read back into future conversations.
+    """
+    session_id = str(uuid.uuid4())
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    # Redact name too (per PR #3 review, Codex P2). User-typed names or
+    # AI-generated titles can contain secret-shape strings; without this
+    # they would land on disk in plaintext while messages/metadata are
+    # protected.
+    safe_name = redact_secrets(name)
+    safe_messages = redact_secrets(messages or [])
+    safe_metadata = redact_secrets(metadata or {})
+
+    session_data = {
+        "session_id": session_id,
+        "name": safe_name,
+        "created_at": now,
+        "last_modified": now,
+        "messages": safe_messages,
+        "metadata": safe_metadata,
+    }
+
+    session_file = get_session_file(session_id)
+    # Ensure the sessions directory exists before writing (per PR #3 follow-up
+    # review, Gemini medium): with the module-level mkdir removed for test
+    # isolation, save_session takes responsibility for ensuring its target
+    # directory exists.
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(session_file, "w", encoding="utf-8") as f:
+        json.dump(session_data, f, indent=2)
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "name": safe_name,
+        "message_count": len(session_data["messages"]),
+    }
+
+
+def load_session(session_id: str) -> dict[str, Any]:
+    """Load a previously saved session by id.
+
+    Wraps the file read in try/except (per PR #3 follow-up review, Gemini
+    medium): avoids a TOCTOU race between exists()/open() and surfaces
+    corrupted JSON as a clean ValueError instead of bubbling JSONDecodeError
+    up to the MCP layer.
+    """
+    session_file = get_session_file(session_id)
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise ValueError(f"Session not found: {session_id}") from e
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"Session file invalid or unreadable: {session_id}") from e
+
+    # Defensive: a syntactically-valid JSON file shaped like ``[]`` or
+    # ``"string"`` would crash the .get() calls below. Raise a clean
+    # ValueError so the MCP layer sees a consistent error contract
+    # (per PR #3 follow-up review, Gemini medium L275).
+    if not isinstance(data, dict):
+        raise ValueError(f"Session file shape is not a JSON object: {session_id}")
+
+    # Use `or` fallback (not get-default) so JSON null round-trips to a
+    # usable value rather than None — same reason as the list_sessions
+    # name fix (per PR #3 follow-up review, Gemini medium L284).
+    return {
+        "session_id": data.get("session_id") or session_id,
+        "name": data.get("name") or "Untitled",
+        "created_at": data.get("created_at"),
+        "last_modified": data.get("last_modified"),
+        "messages": data.get("messages") or [],
+        "metadata": data.get("metadata") or {},
+    }
+
+
+def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
+    """Update mutable session metadata (name) and bump ``last_modified``.
+
+    Wraps the file read in try/except (per PR #3 follow-up review, Gemini
+    medium): avoids a TOCTOU race and handles corrupted JSON cleanly.
+    """
+    session_file = get_session_file(session_id)
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError as e:
+        raise ValueError(f"Session not found: {session_id}") from e
+    except (json.JSONDecodeError, OSError) as e:
+        raise ValueError(f"Session file invalid or unreadable: {session_id}") from e
+
+    # Defensive: same shape guard as load_session (per PR #3 follow-up
+    # review, Gemini medium L301).
+    if not isinstance(data, dict):
+        raise ValueError(f"Session file shape is not a JSON object: {session_id}")
+
+    if name:
+        # Same name-redaction as save_session (per PR #3 review, Codex P2).
+        data["name"] = redact_secrets(name)
+    data["last_modified"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(session_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+    return {
+        "success": True,
+        "session_id": session_id,
+        "name": data["name"],
+        "last_modified": data["last_modified"],
+    }
+
+
+def delete_session(session_id: str) -> dict[str, Any]:
+    """Delete a session file by id."""
+    session_file = get_session_file(session_id)
+    if not session_file.exists():
+        raise ValueError(f"Session not found: {session_id}")
+
+    session_file.unlink()
+    return {"success": True, "session_id": session_id}
 
 
 if "--check" in sys.argv:
@@ -183,7 +397,108 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["query"],
             },
-        )
+        ),
+        Tool(
+            name="list_sessions",
+            description=(
+                "List all saved conversation sessions, most recent first. "
+                "Returns session id, name, created_at, last_modified, and "
+                "message count for each."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        ),
+        Tool(
+            name="save_session",
+            description=(
+                "Persist the current conversation context to a new session "
+                "file. Returns the new session id. Pass the full conversation "
+                "history as the 'messages' array. Secret-shape strings in "
+                "messages and metadata are redacted before write."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "A descriptive name for the session",
+                    },
+                    "messages": {
+                        "type": "array",
+                        "description": "Array of message objects from the conversation",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "role": {
+                                    "type": "string",
+                                    "enum": ["user", "assistant", "system"],
+                                },
+                                "content": {"type": "string"},
+                            },
+                        },
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional free-form metadata for the session",
+                    },
+                },
+                "required": ["name", "messages"],
+            },
+        ),
+        Tool(
+            name="load_session",
+            description=(
+                "Load a previously saved session by its id. Returns the "
+                "full conversation history and metadata."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The UUID of the session to load",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="update_session",
+            description=(
+                "Update a saved session's name and bump its last_modified timestamp."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The UUID of the session to update",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "New name for the session",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        ),
+        Tool(
+            name="delete_session",
+            description=("Delete a saved session permanently. Use with caution."),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The UUID of the session to delete",
+                    },
+                },
+                "required": ["session_id"],
+            },
+        ),
     ]
 
 
@@ -221,8 +536,99 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         return [TextContent(type="text", text=result)]
 
-    else:
-        raise ValueError(f"Unknown tool: {name}")
+    if name == "list_sessions":
+        sessions = list_sessions()
+        if not sessions:
+            return [
+                TextContent(
+                    type="text", text="## Saved Sessions\n\nNo saved sessions found.\n"
+                )
+            ]
+        lines = [
+            "## Saved Sessions",
+            "",
+            "| Session ID | Name | Messages | Last Modified |",
+            "|------------|------|----------|---------------|",
+        ]
+        for s in sessions:
+            # Escape pipe characters in session names so they don't break
+            # the Markdown table formatting (per PR #3 follow-up review,
+            # Gemini medium).
+            safe_name = s["name"].replace("|", "&#124;")
+            lines.append(
+                f"| `{s['session_id']}` | {safe_name} | {s['message_count']} | {s['last_modified']} |"
+            )
+        return [TextContent(type="text", text="\n".join(lines) + "\n")]
+
+    if name == "save_session":
+        session_name = arguments.get("name", "Untitled")
+        messages = arguments.get("messages", [])
+        metadata = arguments.get("metadata", {})
+        result = save_session(name=session_name, messages=messages, metadata=metadata)
+        return [
+            TextContent(
+                type="text",
+                text=f"Session saved: {result['session_id']} ({result['message_count']} messages)",
+            )
+        ]
+
+    if name == "load_session":
+        session_id = arguments.get("session_id")
+        if not session_id:
+            return [TextContent(type="text", text="Error: session_id is required")]
+        try:
+            session = load_session(session_id)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
+        lines = [
+            f"## Session: {session['name']}",
+            "",
+            f"**Created:** {session['created_at']}",
+            f"**Last Modified:** {session['last_modified']}",
+            "",
+            "### Conversation History",
+            "",
+        ]
+        for msg in session["messages"]:
+            # Defensive: skip non-dict entries (corrupted/manually-edited
+            # files) and coerce role to str before .upper() in case it
+            # is null or numeric (per PR #3 follow-up review,
+            # Gemini medium L569).
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "unknown").upper()
+            content = msg.get("content", "")
+            lines.append(f"**{role}:** {content}")
+            lines.append("")
+        return [TextContent(type="text", text="\n".join(lines))]
+
+    if name == "update_session":
+        session_id = arguments.get("session_id")
+        new_name = arguments.get("name")
+        if not session_id:
+            return [TextContent(type="text", text="Error: session_id is required")]
+        try:
+            result = update_session(session_id, name=new_name)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
+        return [
+            TextContent(
+                type="text",
+                text=f"Session updated: {result['session_id']} (name={result['name']})",
+            )
+        ]
+
+    if name == "delete_session":
+        session_id = arguments.get("session_id")
+        if not session_id:
+            return [TextContent(type="text", text="Error: session_id is required")]
+        try:
+            delete_session(session_id)
+        except ValueError as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
+        return [TextContent(type="text", text=f"Session deleted: {session_id}")]
+
+    raise ValueError(f"Unknown tool: {name}")
 
 
 async def main():
