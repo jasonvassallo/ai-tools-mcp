@@ -184,6 +184,12 @@ def list_sessions() -> list[dict[str, Any]]:
         try:
             with open(session_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            # Defensive: if a session file is valid JSON but not an object
+            # (e.g. "[]" or a string), data.get(...) would raise
+            # AttributeError; if "messages" exists but isn't a list, len()
+            # raises TypeError. Skip such files instead of failing the
+            # entire listing (per PR #3 follow-up review, Gemini medium +
+            # Codex P3).
             sessions.append(
                 {
                     "session_id": session_file.stem,
@@ -193,7 +199,7 @@ def list_sessions() -> list[dict[str, Any]]:
                     "message_count": len(data.get("messages", [])),
                 }
             )
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, OSError, AttributeError, TypeError):
             continue
 
     sessions.sort(key=lambda x: x.get("last_modified") or "", reverse=True)

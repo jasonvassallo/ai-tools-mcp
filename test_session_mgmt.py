@@ -456,6 +456,38 @@ class TestRobustness(_SessionMgmtBase):
         listed = mcp_server.list_sessions()
         self.assertEqual(listed[0]["name"], original_name)
 
+    def test_list_sessions_skips_non_object_json(self):
+        """PR #3 follow-up review (Gemini medium + Codex P3): if a session
+        file is valid JSON but not an object (e.g. "[]"), the .get(...)
+        call would raise AttributeError. Verify list_sessions skips such
+        files cleanly instead of failing the entire listing.
+        """
+        # Drop a list-shaped JSON file in the sessions dir
+        (self.tmp_path / "list-shape.json").write_text("[]")
+        # Drop a string-shaped JSON file
+        (self.tmp_path / "string-shape.json").write_text('"hello"')
+        # And a valid session for contrast
+        good = mcp_server.save_session(name="ok", messages=[])
+
+        listing = mcp_server.list_sessions()
+        # Only the good session shows up
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["session_id"], good["session_id"])
+
+    def test_list_sessions_skips_non_list_messages(self):
+        """If messages is present but not a list (malformed file),
+        len() raises TypeError. Skip the file, don't crash."""
+        sid = "00000000-0000-0000-0000-000000000001"
+        (self.tmp_path / f"{sid}.json").write_text(
+            '{"name": "broken", "messages": "not-a-list"}'
+        )
+        good = mcp_server.save_session(name="ok", messages=[])
+
+        listing = mcp_server.list_sessions()
+        # Only good shows up
+        self.assertEqual(len(listing), 1)
+        self.assertEqual(listing[0]["session_id"], good["session_id"])
+
 
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
