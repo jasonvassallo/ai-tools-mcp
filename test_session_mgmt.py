@@ -38,23 +38,17 @@ _GOOG_API_KEY_PREFIX = "AI" + "za"
 FAKE_GOOG_API_KEY = _GOOG_API_KEY_PREFIX + "SyDsyntheticTestValue1234567890_-end"
 
 
-def _stub_module(name: str, **attrs) -> types.ModuleType:
-    mod = types.ModuleType(name)
-    for k, v in attrs.items():
-        setattr(mod, k, v)
-    sys.modules[name] = mod
-    return mod
-
-
-def _install_stubs() -> None:
-    """Install minimal stand-ins for mcp.* and openai so importing
-    mcp_server does not require those packages or hit the Keychain."""
+def _build_stub_modules() -> dict[str, types.ModuleType]:
+    """Return the dict of fake mcp/openai modules used during import.
+    Caller is expected to scope these via mock.patch.dict(sys.modules)
+    rather than mutating sys.modules directly (per PR #4 review,
+    CodeRabbit Major: test stubs must not leak into other tests'
+    sys.modules entries — would break unittest discover ordering).
+    """
 
     class _FakeOpenAI:
         def __init__(self, *a, **kw):
             pass
-
-    _stub_module("openai", OpenAI=_FakeOpenAI)
 
     class _FakeServer:
         def __init__(self, name):
@@ -75,10 +69,6 @@ def _install_stubs() -> None:
     async def _fake_stdio_server():
         yield None, None
 
-    _stub_module("mcp")
-    _stub_module("mcp.server", Server=_FakeServer)
-    _stub_module("mcp.server.stdio", stdio_server=_fake_stdio_server)
-
     class _Tool:
         def __init__(self, **kw):
             self.__dict__.update(kw)
@@ -87,19 +77,34 @@ def _install_stubs() -> None:
         def __init__(self, **kw):
             self.__dict__.update(kw)
 
-    _stub_module("mcp.types", Tool=_Tool, TextContent=_TextContent)
+    def _make(name, **attrs):
+        mod = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        return mod
+
+    return {
+        "openai": _make("openai", OpenAI=_FakeOpenAI),
+        "mcp": _make("mcp"),
+        "mcp.server": _make("mcp.server", Server=_FakeServer),
+        "mcp.server.stdio": _make("mcp.server.stdio", stdio_server=_fake_stdio_server),
+        "mcp.types": _make("mcp.types", Tool=_Tool, TextContent=_TextContent),
+    }
 
 
 def _load_mcp_server():
-    _install_stubs()
+    """Import mcp_server.py with mcp.*/openai stubbed via a scoped
+    sys.modules patch so the fakes don't leak into later test imports."""
+    stubs = _build_stub_modules()
     fake_proc = types.SimpleNamespace(returncode=0, stdout="dummy-key\n")
-    with mock.patch("subprocess.run", return_value=fake_proc):
-        spec = importlib.util.spec_from_file_location(
-            "mcp_server_under_test_session", SERVER_PATH
-        )
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+    with mock.patch.dict(sys.modules, stubs):
+        with mock.patch("subprocess.run", return_value=fake_proc):
+            spec = importlib.util.spec_from_file_location(
+                "mcp_server_under_test_session", SERVER_PATH
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
     return module
 
 

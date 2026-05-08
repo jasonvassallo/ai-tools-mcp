@@ -15,6 +15,7 @@ Designed to complement Claude's built-in WebSearch tool:
 
 import asyncio
 import json
+import os
 import re
 import subprocess
 import sys
@@ -207,9 +208,13 @@ def list_sessions() -> list[dict[str, Any]]:
         sessions.append(
             {
                 "session_id": session_file.stem,
-                "name": data.get("name") or "Untitled",
-                "created_at": data.get("created_at"),
-                "last_modified": data.get("last_modified"),
+                # str() coercion (per PR #4 review, Gemini medium): if a
+                # session file has numeric or null values for these fields,
+                # the Markdown render path (.replace, .upper, etc.) would
+                # crash. Coerce here at the boundary.
+                "name": str(data.get("name") or "Untitled"),
+                "created_at": str(data.get("created_at") or ""),
+                "last_modified": str(data.get("last_modified") or ""),
                 "message_count": len(messages),
             }
         )
@@ -254,12 +259,14 @@ def save_session(
     }
 
     session_file = get_session_file(session_id)
-    # Ensure the sessions directory exists before writing (per PR #3 follow-up
-    # review, Gemini medium): with the module-level mkdir removed for test
-    # isolation, save_session takes responsibility for ensuring its target
-    # directory exists.
+    # Ensure the sessions directory exists before writing (lazy mkdir so
+    # imports stay side-effect-free for test isolation).
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(session_file, "w", encoding="utf-8") as f:
+    # Atomically create the file with 0o600 (owner-only) so session content —
+    # which may include conversation history — is not world-readable on
+    # shared machines (per PR #4 review, CodeRabbit Major).
+    fd = os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(session_data, f, indent=2)
 
     return {
@@ -298,12 +305,23 @@ def load_session(session_id: str) -> dict[str, Any]:
     # usable value rather than None — same reason as the list_sessions
     # name fix (per PR #3 follow-up review, Gemini medium L284).
     return {
-        "session_id": data.get("session_id") or session_id,
-        "name": data.get("name") or "Untitled",
-        "created_at": data.get("created_at"),
-        "last_modified": data.get("last_modified"),
-        "messages": data.get("messages") or [],
-        "metadata": data.get("metadata") or {},
+        "session_id": str(data.get("session_id") or session_id),
+        "name": str(data.get("name") or "Untitled"),
+        "created_at": str(data.get("created_at") or ""),
+        "last_modified": str(data.get("last_modified") or ""),
+        # Normalize non-list "messages" to [] so the load_session render
+        # path can't be tripped by truthy non-list values (e.g. 1 or
+        # "string") in malformed/manually-edited session files
+        # (per PR #4 review, Codex P2).
+        "messages": (
+            data.get("messages") if isinstance(data.get("messages"), list) else []
+        )
+        or [],
+        # Same idea for metadata: only a dict is usable downstream.
+        "metadata": (
+            data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
+        )
+        or {},
     }
 
 
@@ -333,7 +351,12 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
     data["last_modified"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(session_file, "w", encoding="utf-8") as f:
+    # Same 0o600 permissions on rewrite (per PR #4 review, CodeRabbit Major).
+    # Also normalizes existing files that may have been written with looser
+    # umask before this fix landed.
+    session_file.chmod(0o600) if session_file.exists() else None
+    fd = os.open(session_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
     return {
@@ -445,7 +468,10 @@ async def list_tools() -> list[Tool]:
                         "description": "Optional free-form metadata for the session",
                     },
                 },
-                "required": ["name", "messages"],
+                # All optional: implementation defaults to "Untitled" + []
+                # (per PR #4 review, CodeRabbit Major: schema must align
+                # with implementation defaults).
+                "required": [],
             },
         ),
         Tool(
