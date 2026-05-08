@@ -307,13 +307,13 @@ class TestRedactSecrets(unittest.TestCase):
         d_tuple = {(1, 2): "v1", (3, 4): "v2"}
         out = redact_secrets(d_tuple)
         self.assertEqual(out, d_tuple)
-        self.assertTrue(all(isinstance(k, tuple) for k in out.keys()))
+        self.assertTrue(all(isinstance(k, tuple) for k in out))
 
         # Integer keys
         d_int = {42: "v1", 99: "v2"}
         out = redact_secrets(d_int)
         self.assertEqual(out, d_int)
-        self.assertTrue(all(isinstance(k, int) for k in out.keys()))
+        self.assertTrue(all(isinstance(k, int) for k in out))
 
         # Mixed: secret-shape string + non-string keys all in one dict
         mixed = {FAKE_GOOG_API_KEY: "leaked", (1, 2): "tup", 42: "i"}
