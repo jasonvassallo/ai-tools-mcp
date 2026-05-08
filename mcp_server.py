@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -153,6 +154,38 @@ def run_check() -> None:
 SESSIONS_DIR = Path.home() / ".claude" / "sessions"
 
 
+def _atomic_temp_for(target: Path) -> Path:
+    """Create a unique-per-call empty temp file in ``target``'s directory.
+
+    Used by save_session/update_session for atomic writes via
+    ``os.replace(temp, target)``. ``tempfile.mkstemp`` ensures:
+
+    1. **Uniqueness**: O_EXCL + randomized name → each concurrent
+       writer gets its own inode. Without this, two writers sharing
+       a fixed ``<sid>.json.tmp`` path can have one's still-open fd
+       end up writing into the post-replace final file (per PR #4
+       round-5 review, Codex P2 L392: "Use unique temp files").
+    2. **Mode**: 0o600 by default on POSIX → session content stays
+       owner-only at every moment, even before the rename lands.
+    3. **Atomic creation**: no race window between ``open`` and
+       ``write`` where another process could see a half-formed file.
+
+    Returns the temp file's Path; the caller is responsible for
+    writing to it and ``os.replace``-ing into place (or unlinking
+    on error).
+    """
+    fd, path_str = tempfile.mkstemp(
+        suffix=target.suffix + ".tmp",
+        prefix=target.stem + ".",
+        dir=str(target.parent),
+    )
+    # Close the descriptor — we'll open the path again with the
+    # standard ``open()`` in the caller. mkstemp's role is just to
+    # reserve a unique path with the right mode.
+    os.close(fd)
+    return Path(path_str)
+
+
 def get_session_file(session_id: str) -> Path:
     """Return the on-disk path for a session id.
 
@@ -266,17 +299,18 @@ def save_session(
     # Ensure the sessions directory exists before writing (lazy mkdir so
     # imports stay side-effect-free for test isolation).
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    # Atomic write: create a temp file with 0o600 (owner-only) so session
-    # content — which may include conversation history — is not
-    # world-readable on shared machines (per PR #4 review, CodeRabbit
-    # Major), then os.replace() the temp into place. If the process
-    # crashes mid json.dump, the partial write is in the temp file, not
-    # in session_file (per PR #4 follow-up review, Codex P2 + Gemini med:
-    # O_TRUNC | O_CREAT direct write is not atomic).
-    temp_file = session_file.with_suffix(session_file.suffix + ".tmp")
-    fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Atomic write via per-call unique temp file + os.replace(). Using
+    # tempfile.mkstemp instead of a fixed ``<sid>.json.tmp`` name avoids
+    # the concurrent-update race Codex flagged on PR #4 (round-5 review):
+    # with a shared temp path, two writers' fds bind to the same inode
+    # and the second writer's bytes can land in the final session file
+    # after the first writer's os.replace(). mkstemp uses O_EXCL +
+    # randomized name so each writer gets its own inode. Mode is 0o600
+    # by default on POSIX, so session content stays owner-only (per
+    # PR #4 review, CodeRabbit Major).
+    temp_file = _atomic_temp_for(session_file)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(session_data, f, indent=2)
         os.replace(temp_file, session_file)
     except Exception:
@@ -382,16 +416,15 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
             f"Session was deleted concurrently during update: {session_id}"
         )
 
-    # Atomic write: same temp+os.replace pattern as save_session so a
-    # crash mid-write doesn't truncate the existing session file (per
-    # PR #4 follow-up review, Codex P2 L360 + Gemini med L362). The
-    # 0o600 mode comes from os.open() on the temp file and is preserved
-    # by os.replace, so the chmod-on-existing-file dance is no longer
-    # needed.
-    temp_file = session_file.with_suffix(session_file.suffix + ".tmp")
-    fd = os.open(temp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Atomic write: same per-call mkstemp + os.replace pattern as
+    # save_session so a crash mid-write doesn't truncate the existing
+    # session file, AND concurrent updates don't corrupt each other
+    # via shared temp inode (per PR #4 follow-up review, Codex P2
+    # L360 / L362 / L392 + Gemini med L270/L362). 0o600 mode comes
+    # from mkstemp's default and is preserved by os.replace.
+    temp_file = _atomic_temp_for(session_file)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
+        with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         os.replace(temp_file, session_file)
     except Exception:

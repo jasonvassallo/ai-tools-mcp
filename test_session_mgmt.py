@@ -24,6 +24,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -607,6 +608,83 @@ class TestAtomicWrites(_SessionMgmtBase):
         self.assertEqual(after, before)
         leftover = list(self.tmp_path.glob("*.tmp"))
         self.assertEqual(leftover, [])
+
+    def test_atomic_temp_paths_are_unique_per_call(self):
+        """PR #4 round-5 review (Codex P2 L392): _atomic_temp_for must
+        return a different path on each call so two concurrent writers
+        can't share an inode and corrupt each other's writes."""
+        target = self.tmp_path / "abc.json"
+        # mkstemp needs the dir to exist
+        self.tmp_path.mkdir(parents=True, exist_ok=True)
+        paths = {mcp_server._atomic_temp_for(target) for _ in range(10)}
+        # All 10 paths distinct.
+        self.assertEqual(len(paths), 10, f"non-unique temp paths: {paths}")
+        # All 10 inside the target's directory.
+        for p in paths:
+            self.assertEqual(p.parent, target.parent)
+        # Cleanup so the test doesn't leave 10 empty temp files behind.
+        for p in paths:
+            p.unlink(missing_ok=True)
+
+    def test_concurrent_updates_do_not_corrupt_session_file(self):
+        """Codex P2 L392 in scenario form: two threads update the same
+        session concurrently. The final file must (a) be valid JSON,
+        (b) match one of the two writers' content end-to-end, and
+        (c) leave no .tmp leak behind. With a fixed temp path this
+        test would intermittently produce mixed/truncated JSON."""
+        save = mcp_server.save_session(name="initial", messages=[])
+        sid = save["session_id"]
+
+        results: list[Exception | dict] = []
+        barrier = threading.Barrier(2)
+
+        def worker(new_name: str) -> None:
+            try:
+                # Sync both threads at the start so they actually race.
+                barrier.wait(timeout=2)
+                results.append(mcp_server.update_session(sid, name=new_name))
+            except Exception as exc:  # pragma: no cover — defensive
+                results.append(exc)
+
+        # Run a handful of rounds to give the race opportunities to fire.
+        # Single-round contention is unlikely to corrupt under the GIL,
+        # so the loop is the actual coverage. With the fixed ``.tmp``
+        # name this would have occasionally produced JSONDecodeError on
+        # the post-write read.
+        for round_idx in range(5):
+            results.clear()
+            barrier = threading.Barrier(2)
+            threads = [
+                threading.Thread(target=worker, args=(f"name-A-{round_idx}",)),
+                threading.Thread(target=worker, args=(f"name-B-{round_idx}",)),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+                self.assertFalse(t.is_alive(), "worker hung")
+
+            # Both calls returned successfully (no exceptions).
+            for r in results:
+                self.assertIsInstance(
+                    r, dict, f"update_session raised in concurrent run: {r!r}"
+                )
+
+            # The final on-disk file is valid JSON, and its name field
+            # matches ONE of the two writers (whichever's os.replace
+            # landed last). It is NEVER a mix of bytes from both.
+            sess_path = self.tmp_path / f"{sid}.json"
+            with open(sess_path, "r", encoding="utf-8") as f:
+                final = json.load(f)
+            self.assertIn(
+                final["name"],
+                {f"name-A-{round_idx}", f"name-B-{round_idx}"},
+                f"final name corrupted: {final['name']!r}",
+            )
+
+            # No temp leak after either round.
+            leftover = list(self.tmp_path.glob("*.tmp"))
+            self.assertEqual(leftover, [], f"Leftover temp files: {leftover}")
 
     def test_update_session_rejects_concurrent_deletion(self):
         """Codex P2 L360: if a session is deleted between update_session's
