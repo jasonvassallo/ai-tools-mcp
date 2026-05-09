@@ -468,11 +468,20 @@ class TestRobustness(_SessionMgmtBase):
         file is valid JSON but not an object (e.g. "[]"), the .get(...)
         call would raise AttributeError. Verify list_sessions skips such
         files cleanly instead of failing the entire listing.
+
+        NOTE: filenames must be valid UUID stems so they pass the
+        round-7 UUID-filter check (mcp_server.py L271-L283); otherwise
+        these files exit at the UUID gate and never reach the
+        ``isinstance(data, dict)`` branch this test is meant to
+        exercise (per PR #4 round-7 review, Gemini medium L475).
         """
-        # Drop a list-shaped JSON file in the sessions dir
-        (self.tmp_path / "list-shape.json").write_text("[]")
-        # Drop a string-shaped JSON file
-        (self.tmp_path / "string-shape.json").write_text('"hello"')
+        # Drop a list-shaped JSON file in the sessions dir; UUID stem
+        # so the round-7 UUID filter doesn't short-circuit it.
+        list_sid = "00000000-0000-0000-0000-000000000002"
+        (self.tmp_path / f"{list_sid}.json").write_text("[]")
+        # Drop a string-shaped JSON file.
+        string_sid = "00000000-0000-0000-0000-000000000003"
+        (self.tmp_path / f"{string_sid}.json").write_text('"hello"')
         # And a valid session for contrast
         good = mcp_server.save_session(name="ok", messages=[])
 
