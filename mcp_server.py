@@ -14,6 +14,7 @@ Designed to complement Claude's built-in WebSearch tool:
 """
 
 import asyncio
+import fcntl
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -184,6 +186,51 @@ def _atomic_temp_for(target: Path) -> Path:
     # reserve a unique path with the right mode.
     os.close(fd)
     return Path(path_str)
+
+
+@contextmanager
+def _session_lock(session_file: Path):
+    """Cooperative per-session lockfile (POSIX flock).
+
+    Used by ``update_session`` / ``delete_session`` to serialize their
+    critical sections against each other. This closes the resurrection
+    race Codex flagged on PR #4 round 5 (P2 L429): without the lock,
+    a concurrent ``delete_session`` could land between
+    ``update_session``'s existence check and its ``os.replace``,
+    leaving ``os.replace`` to recreate the just-deleted file.
+
+    Lockfile path: ``<session_file>.lock`` (sibling). We pick
+    ``.lock`` instead of ``.json.lock`` so ``list_sessions``'
+    ``glob("*.json")`` doesn't accidentally enumerate it as a
+    session. The lockfile persists across operations — we don't
+    unlink on release (would create its own race with another
+    waiter). 0o600 mode keeps it owner-only.
+
+    LIMITATION: this is **advisory** locking — it only protects
+    callers that go through ``update_session`` / ``delete_session``.
+    A non-cooperating deleter (manual ``rm``, foreign tool not
+    using this API) can still slip past the lock; ``update_session``
+    keeps an existence re-check before its atomic write as a
+    best-effort safeguard for that case, but the residual hairline
+    race against non-cooperating processes can only be fully closed
+    with platform-specific syscalls (``renameat2 RENAME_EXCHANGE``
+    on Linux, ``renamex_np`` on macOS), which aren't portably
+    exposed in stdlib Python.
+    """
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = session_file.with_suffix(".lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            # Lock release on a closed-or-already-released fd is
+            # benign; we close the fd next anyway.
+            pass
+        os.close(fd)
 
 
 def get_session_file(session_id: str) -> Path:
@@ -381,58 +428,69 @@ def load_session(session_id: str) -> dict[str, Any]:
 def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
     """Update mutable session metadata (name) and bump ``last_modified``.
 
-    Wraps the file read in try/except (per PR #3 follow-up review, Gemini
-    medium): avoids a TOCTOU race and handles corrupted JSON cleanly.
+    Wraps the read+write critical section in a per-session advisory
+    lockfile (``_session_lock``) so concurrent ``delete_session``
+    calls can't slip in between our read and our atomic-write,
+    resurrecting a just-deleted session. (Per PR #4 round-6 review,
+    Codex P2 L429.)
+
+    Wraps the file read in try/except (per PR #3 follow-up review,
+    Gemini medium): avoids a TOCTOU race and handles corrupted JSON
+    cleanly.
     """
     session_file = get_session_file(session_id)
-    try:
-        with open(session_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError as e:
-        raise ValueError(f"Session not found: {session_id}") from e
-    except (json.JSONDecodeError, OSError) as e:
-        raise ValueError(f"Session file invalid or unreadable: {session_id}") from e
 
-    # Defensive: same shape guard as load_session (per PR #3 follow-up
-    # review, Gemini medium L301).
-    if not isinstance(data, dict):
-        raise ValueError(f"Session file shape is not a JSON object: {session_id}")
-
-    if name is not None:
-        # `is not None` (not truthy check) so callers can pass name=""
-        # to explicitly clear the name (per PR #4 follow-up review,
-        # CodeRabbit nitpick L360).
-        data["name"] = redact_secrets(name)
-    data["last_modified"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
-
-    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-    # Re-check existence right before the write to refuse silent
-    # resurrection if the session was deleted concurrently between our
-    # read and our write. Without this, the atomic write below would
-    # recreate the file (per PR #4 follow-up review, Codex P2 L360:
-    # "Avoid recreating sessions deleted during update").
-    if not session_file.exists():
-        raise ValueError(
-            f"Session was deleted concurrently during update: {session_id}"
-        )
-
-    # Atomic write: same per-call mkstemp + os.replace pattern as
-    # save_session so a crash mid-write doesn't truncate the existing
-    # session file, AND concurrent updates don't corrupt each other
-    # via shared temp inode (per PR #4 follow-up review, Codex P2
-    # L360 / L362 / L392 + Gemini med L270/L362). 0o600 mode comes
-    # from mkstemp's default and is preserved by os.replace.
-    temp_file = _atomic_temp_for(session_file)
-    try:
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-        os.replace(temp_file, session_file)
-    except Exception:
+    with _session_lock(session_file):
         try:
-            temp_file.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+            with open(session_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except FileNotFoundError as e:
+            raise ValueError(f"Session not found: {session_id}") from e
+        except (json.JSONDecodeError, OSError) as e:
+            raise ValueError(
+                f"Session file invalid or unreadable: {session_id}"
+            ) from e
+
+        # Defensive: same shape guard as load_session (per PR #3
+        # follow-up review, Gemini medium L301).
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Session file shape is not a JSON object: {session_id}"
+            )
+
+        if name is not None:
+            # `is not None` (not truthy check) so callers can pass
+            # name="" to explicitly clear the name (per PR #4
+            # follow-up review, CodeRabbit nitpick L360).
+            data["name"] = redact_secrets(name)
+        data["last_modified"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+        # Best-effort safeguard against non-cooperating deleters
+        # (manual ``rm``, foreign tools not using this API) that
+        # bypass the advisory lock. Cooperating deleters are
+        # serialized by the surrounding ``_session_lock`` and
+        # cannot reach this point with a deleted session.
+        if not session_file.exists():
+            raise ValueError(
+                f"Session was deleted concurrently during update: {session_id}"
+            )
+
+        # Atomic write: per-call mkstemp + os.replace so a crash
+        # mid-write doesn't truncate the live session file, and so
+        # concurrent updates don't corrupt each other via a shared
+        # temp inode (per PR #4 follow-up review, Codex P2 L360 /
+        # L362 / L392 + Gemini med L270/L362).
+        temp_file = _atomic_temp_for(session_file)
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(temp_file, session_file)
+        except Exception:
+            try:
+                temp_file.unlink()
+            except FileNotFoundError:
+                pass
+            raise
 
     return {
         "success": True,
@@ -445,15 +503,21 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
 def delete_session(session_id: str) -> dict[str, Any]:
     """Delete a session file by id.
 
+    Wraps the unlink in the same per-session advisory lockfile
+    (``_session_lock``) used by ``update_session`` so a concurrent
+    ``update_session`` can't resurrect the file via its atomic
+    ``os.replace`` (per PR #4 round-6 review, Codex P2 L429).
+
     Catches FileNotFoundError from unlink() directly to avoid the
     TOCTOU race window between exists() and unlink() (per PR #4
     follow-up review, CodeRabbit nitpick L377).
     """
     session_file = get_session_file(session_id)
-    try:
-        session_file.unlink()
-    except FileNotFoundError:
-        raise ValueError(f"Session not found: {session_id}") from None
+    with _session_lock(session_file):
+        try:
+            session_file.unlink()
+        except FileNotFoundError:
+            raise ValueError(f"Session not found: {session_id}") from None
     return {"success": True, "session_id": session_id}
 
 

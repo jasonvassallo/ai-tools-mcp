@@ -686,6 +686,115 @@ class TestAtomicWrites(_SessionMgmtBase):
             leftover = list(self.tmp_path.glob("*.tmp"))
             self.assertEqual(leftover, [], f"Leftover temp files: {leftover}")
 
+    def test_cooperative_concurrent_update_and_delete_no_resurrection(self):
+        """PR #4 round-6 review (Codex P2 L429): when two callers
+        race ``update_session`` and ``delete_session`` on the same
+        session via the public API, both honor ``_session_lock``
+        and the result is consistent.
+
+        Possible outcomes per round:
+          - update wins lock first → completes → delete wins lock
+            second, unlinks the updated file → final: no session.
+          - delete wins lock first → unlinks → update wins lock
+            second, hits FileNotFoundError on read → raises
+            ``Session not found`` → final: no session.
+
+        In BOTH outcomes the session ends up deleted; the file
+        must NEVER exist at end of round (no resurrection)."""
+        for round_idx in range(15):
+            save = mcp_server.save_session(
+                name=f"contested-{round_idx}",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+            sid = save["session_id"]
+            sess_path = self.tmp_path / f"{sid}.json"
+            self.assertTrue(
+                sess_path.exists(),
+                f"setup failed at round {round_idx}",
+            )
+
+            results: dict[str, Exception | dict] = {}
+            barrier = threading.Barrier(2)
+
+            def do_update(name: str = f"upd-{round_idx}") -> None:
+                try:
+                    barrier.wait(timeout=2)
+                    results["update"] = mcp_server.update_session(sid, name=name)
+                except Exception as exc:
+                    results["update"] = exc
+
+            def do_delete() -> None:
+                try:
+                    barrier.wait(timeout=2)
+                    results["delete"] = mcp_server.delete_session(sid)
+                except Exception as exc:
+                    results["delete"] = exc
+
+            threads = [
+                threading.Thread(target=do_update),
+                threading.Thread(target=do_delete),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=5)
+                self.assertFalse(t.is_alive(), "worker hung")
+
+            # No resurrection: the session file must not exist at
+            # end of round, regardless of which call won the lock
+            # first.
+            self.assertFalse(
+                sess_path.exists(),
+                f"session resurrected at round {round_idx}: {results}",
+            )
+
+            # If delete won the lock first, update sees FileNotFound
+            # and raises ValueError("Session not found"). If update
+            # won first, both calls succeed.
+            update_res = results.get("update")
+            if isinstance(update_res, Exception):
+                self.assertIsInstance(update_res, ValueError)
+                self.assertIn("not found", str(update_res).lower())
+            else:
+                self.assertIsInstance(update_res, dict)
+            # Delete should never raise in this scenario — even if
+            # update went first, delete's unlink targets the
+            # post-update file, which still exists when delete
+            # acquires the lock.
+            self.assertIsInstance(
+                results.get("delete"), dict, f"delete raised: {results}"
+            )
+
+            # Cleanup the leftover lockfile so glob counts stay
+            # predictable across rounds.
+            for lockfile in self.tmp_path.glob("*.lock"):
+                lockfile.unlink()
+
+    def test_lockfile_released_on_update_exception(self):
+        """If ``update_session`` raises mid-critical-section, the
+        lockfile must be released so subsequent calls aren't
+        deadlocked. This validates the ``finally`` arm of
+        ``_session_lock``'s context manager."""
+        save = mcp_server.save_session(name="x", messages=[])
+        sid = save["session_id"]
+        sess_path = self.tmp_path / f"{sid}.json"
+
+        # Force update_session to raise during write.
+        with mock.patch.object(
+            mcp_server.json, "dump", side_effect=OSError("simulated")
+        ):
+            with self.assertRaises(OSError):
+                mcp_server.update_session(sid, name="will-fail")
+
+        # The lock file may exist (we don't unlink on release —
+        # that's documented behavior to avoid a re-acquire race),
+        # but it must NOT be flock'd by a stale fd. Re-acquiring
+        # via another update_session call must succeed quickly,
+        # not block.
+        result = mcp_server.update_session(sid, name="recovered")
+        self.assertEqual(result["name"], "recovered")
+        self.assertTrue(sess_path.exists())
+
     def test_update_session_rejects_concurrent_deletion(self):
         """Codex P2 L360: if a session is deleted between update_session's
         read and its write, update_session must NOT silently re-create
