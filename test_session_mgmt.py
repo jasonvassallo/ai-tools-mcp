@@ -20,6 +20,7 @@ The test class points ``SESSIONS_DIR`` at a per-test
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import json
 import sys
@@ -554,6 +555,89 @@ class TestRobustness(_SessionMgmtBase):
         with self.assertRaises(ValueError) as ctx:
             mcp_server.delete_session(sid)
         self.assertIn("Session not found", str(ctx.exception))
+
+
+class TestToolRendering(_SessionMgmtBase):
+    """Coverage for the call_tool handler's Markdown rendering paths.
+    These exercise the public MCP surface (not just the helpers) so
+    bugs in the wire format are caught."""
+
+    def test_load_session_tool_includes_metadata(self):
+        """PR #4 round-7 review (Codex P2 L760): metadata stored via
+        save_session must surface in the load_session tool output.
+        Previously the helper returned metadata in its dict but the
+        tool handler dropped it before assembling the TextContent."""
+        meta = {"project": "openclaw", "tags": ["security", "review"]}
+        save = mcp_server.save_session(
+            name="with-meta",
+            messages=[{"role": "user", "content": "hi"}],
+            metadata=meta,
+        )
+        sid = save["session_id"]
+
+        result = asyncio.run(
+            mcp_server.call_tool("load_session", {"session_id": sid})
+        )
+        text = result[0].text
+
+        self.assertIn("### Metadata", text)
+        # Both keys and the array element must round-trip through the
+        # JSON-fenced render.
+        self.assertIn("openclaw", text)
+        self.assertIn("security", text)
+        self.assertIn("review", text)
+        # Conversation section still rendered.
+        self.assertIn("### Conversation History", text)
+        self.assertIn("USER:", text)
+
+    def test_load_session_tool_omits_metadata_section_when_empty(self):
+        """If metadata is empty/missing, no ``### Metadata`` heading
+        should appear in the output (cosmetic — keeps the render
+        clean for the common no-metadata case)."""
+        save = mcp_server.save_session(
+            name="no-meta",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        sid = save["session_id"]
+
+        result = asyncio.run(
+            mcp_server.call_tool("load_session", {"session_id": sid})
+        )
+        text = result[0].text
+
+        self.assertNotIn("### Metadata", text)
+        self.assertIn("### Conversation History", text)
+
+    def test_list_sessions_skips_non_uuid_filenames(self):
+        """PR #4 round-7 review (Gemini medium L270): files in
+        SESSIONS_DIR whose stems aren't valid UUIDs (e.g. a manual
+        ``notes.json`` backup) must be skipped — not parsed and not
+        listed under a misleading session id."""
+        # Create a real session so we have a baseline.
+        save = mcp_server.save_session(name="real", messages=[])
+        real_sid = save["session_id"]
+
+        # Drop a stray file with valid JSON shape but non-UUID stem.
+        stray = self.tmp_path / "notes.json"
+        stray.write_text(
+            json.dumps(
+                {
+                    "name": "manual notes",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            )
+        )
+        # And a stray file with a non-JSON stem to be doubly sure.
+        odd = self.tmp_path / "config.json"
+        odd.write_text(json.dumps({"foo": "bar"}))
+
+        sessions = mcp_server.list_sessions()
+        ids = {s["session_id"] for s in sessions}
+        self.assertEqual(
+            ids,
+            {real_sid},
+            f"non-UUID files leaked into listing: {ids}",
+        )
 
 
 class TestAtomicWrites(_SessionMgmtBase):

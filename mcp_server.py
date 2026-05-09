@@ -268,6 +268,18 @@ def list_sessions() -> list[dict[str, Any]]:
         return sessions
 
     for session_file in SESSIONS_DIR.glob("*.json"):
+        # Skip stray ``.json`` files whose stem isn't a valid UUID.
+        # Without this, a manually-dropped ``notes.json`` or backup
+        # file in SESSIONS_DIR would be parsed as if it were a
+        # session and either error out (skipped below) or appear
+        # in the listing under a misleading id. UUID validation
+        # mirrors get_session_file's check (per PR #4 round-7
+        # review, Gemini medium L270: "filter for files whose names
+        # are valid UUIDs").
+        try:
+            uuid.UUID(session_file.stem)
+        except (ValueError, AttributeError, TypeError):
+            continue
         try:
             with open(session_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -758,9 +770,25 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             f"**Created:** {session['created_at']}",
             f"**Last Modified:** {session['last_modified']}",
             "",
-            "### Conversation History",
-            "",
         ]
+        # Surface saved metadata in the rendered output. Without this,
+        # callers can save metadata via save_session but cannot retrieve
+        # it via load_session — the helper returns it but the tool
+        # surface used to drop it (per PR #4 round-7 review, Codex P2
+        # L760: "Include saved metadata in load_session output").
+        # Render the metadata as pretty JSON inside a fenced block so
+        # nested objects/arrays survive the markdown trip without the
+        # ambiguity of a flat key:value dump.
+        metadata = session.get("metadata") or {}
+        if metadata:
+            lines.append("### Metadata")
+            lines.append("")
+            lines.append("```json")
+            lines.append(json.dumps(metadata, indent=2, sort_keys=True))
+            lines.append("```")
+            lines.append("")
+        lines.append("### Conversation History")
+        lines.append("")
         for msg in session["messages"]:
             # Defensive: skip non-dict entries (corrupted/manually-edited
             # files) and coerce role to str before .upper() in case it
