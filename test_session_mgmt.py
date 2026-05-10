@@ -891,25 +891,41 @@ class TestAtomicWrites(_SessionMgmtBase):
         to release. The original exception (if any) should propagate
         cleanly; the cleanup should be a quiet no-op for the unlock
         and still close the fd.
+
+        PR #4 round-12 review (Codex P3 L912): the original version
+        of this test used a nested ``mock.patch.object`` context
+        manager inside ``_session_lock``. Because Python unwinds the
+        inner context first, ``mcp_server.fcntl`` was restored to
+        the real module BEFORE ``_session_lock.__exit__`` ran — so
+        the defensive guard was never exercised and this test
+        passed vacuously against the buggy implementation. Fix:
+        mutate ``mcp_server.fcntl`` directly inside the lock and
+        restore it from the OUTER ``try/finally`` so the patch
+        stays active when the lock's finally fires.
         """
         save = mcp_server.save_session(name="y", messages=[])
         sid = save["session_id"]
         session_file = mcp_server.get_session_file(sid)
 
-        # Acquire the lock normally, then mutate mcp_server.fcntl to
-        # None inside the context. The finally must skip the
-        # fcntl.flock call without raising. We trigger the finally
-        # via an explicit raise so we can verify the original
-        # exception propagates instead of being masked.
         class _Sentinel(Exception):
             pass
 
-        with self.assertRaises(_Sentinel):
-            with mcp_server._session_lock(session_file):
-                # Lock is held; now flip fcntl to None so cleanup
-                # has to take the defensive branch.
-                with mock.patch.object(mcp_server, "fcntl", None):
+        # Manual save+restore (rather than nested with-statement) so
+        # mcp_server.fcntl stays None when _session_lock.__exit__
+        # runs the unlock-then-close cleanup. The outer try/finally
+        # ensures the real fcntl is restored even if the inner
+        # assertRaises itself raises something unexpected.
+        real_fcntl = mcp_server.fcntl
+        try:
+            with self.assertRaises(_Sentinel):
+                with mcp_server._session_lock(session_file):
+                    # Lock is held; now flip fcntl to None so the
+                    # finally block has to take the defensive
+                    # ``if fcntl is not None:`` branch.
+                    mcp_server.fcntl = None
                     raise _Sentinel("propagate me")
+        finally:
+            mcp_server.fcntl = real_fcntl
 
     def test_lockfile_released_on_update_exception(self):
         """If ``update_session`` raises mid-critical-section, the
