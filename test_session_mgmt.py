@@ -863,6 +863,26 @@ class TestAtomicWrites(_SessionMgmtBase):
             for lockfile in self.tmp_path.glob("*.lock"):
                 lockfile.unlink()
 
+    def test_session_lock_raises_clean_error_on_non_posix(self):
+        """PR #4 round-9 review (Gemini medium L17): on Windows or
+        any platform without ``fcntl``, ``_session_lock`` must raise
+        a clear OSError instead of crashing with AttributeError. The
+        module's top-level ``import fcntl`` is wrapped in try/except
+        so the module loads fine on Windows; this test verifies the
+        runtime guard inside the helper."""
+        save = mcp_server.save_session(name="x", messages=[])
+        sid = save["session_id"]
+        session_file = mcp_server.get_session_file(sid)
+
+        # Simulate a Windows environment by setting mcp_server.fcntl
+        # to None — the same state the conditional import produces
+        # when ImportError fires.
+        with mock.patch.object(mcp_server, "fcntl", None):
+            with self.assertRaises(OSError) as ctx:
+                with mcp_server._session_lock(session_file):
+                    pass  # pragma: no cover — should not reach
+            self.assertIn("POSIX", str(ctx.exception))
+
     def test_lockfile_released_on_update_exception(self):
         """If ``update_session`` raises mid-critical-section, the
         lockfile must be released so subsequent calls aren't

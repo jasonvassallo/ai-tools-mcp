@@ -11,10 +11,16 @@ Designed to complement Claude's built-in WebSearch tool:
 - Built-in WebSearch: quick factual lookups, single-answer questions
 - deep_research: multi-source synthesis, comparisons, ambiguous queries
 - session_*: persist/restore conversation context across runs
+
+PLATFORM: macOS / POSIX only. The session helpers use ``fcntl.flock``
+(Unix-specific) and the Perplexity-key lookup uses macOS's ``security``
+CLI. Importing this module on Windows succeeds (so docs/inspection
+tools work) but invoking ``update_session`` / ``delete_session`` will
+raise OSError with a clear message (per PR #4 round-9 review, Gemini
+medium L17: "fcntl module is Unix-specific").
 """
 
 import asyncio
-import fcntl
 import json
 import os
 import re
@@ -26,6 +32,16 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+# fcntl is POSIX-only; on Windows the import fails. We catch
+# ImportError so the module can still be imported (e.g. for docs,
+# tool discovery, or the deep_research path which doesn't need
+# locking) — _session_lock raises a clean error if invoked on a
+# non-POSIX platform (per PR #4 round-9 review, Gemini medium L17).
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised via mocked import
+    fcntl = None  # type: ignore[assignment]
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -217,6 +233,16 @@ def _session_lock(session_file: Path):
     on Linux, ``renamex_np`` on macOS), which aren't portably
     exposed in stdlib Python.
     """
+    if fcntl is None:
+        # Non-POSIX platform (Windows). The session-mgmt path requires
+        # advisory locking that fcntl provides; fail clearly rather
+        # than fall through to a no-op lock that would silently let
+        # the resurrection race re-open. (Per PR #4 round-9 review,
+        # Gemini medium L17: "fcntl module is Unix-specific".)
+        raise OSError(
+            "Session management requires POSIX (macOS/Linux). "
+            "fcntl is unavailable on this platform."
+        )
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = session_file.with_suffix(".lock")
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
