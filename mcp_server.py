@@ -254,12 +254,20 @@ def _session_lock(session_file: Path):
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            # Lock release on a closed-or-already-released fd is
-            # benign; we close the fd next anyway.
-            pass
+        # Defensive: if mcp_server.fcntl was monkey-patched to None
+        # mid-context (test fixtures, runtime mutation), the unlock
+        # call would raise AttributeError and mask the real exception
+        # this finally is trying to clean up after. Guard explicitly
+        # rather than relying on the early check at the top of the
+        # context manager (per PR #4 round-11 review, Gemini medium
+        # L258).
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                # Lock release on a closed-or-already-released fd is
+                # benign; we close the fd next anyway.
+                pass
         os.close(fd)
 
 

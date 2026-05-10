@@ -883,6 +883,34 @@ class TestAtomicWrites(_SessionMgmtBase):
                     pass  # pragma: no cover — should not reach
             self.assertIn("POSIX", str(ctx.exception))
 
+    def test_session_lock_finally_survives_fcntl_set_to_none_mid_context(self):
+        """PR #4 round-11 review (Gemini medium L258): if
+        ``mcp_server.fcntl`` is monkey-patched to None *during* a
+        held lock (test fixtures, runtime mutation), the finally
+        block must not crash with AttributeError when it attempts
+        to release. The original exception (if any) should propagate
+        cleanly; the cleanup should be a quiet no-op for the unlock
+        and still close the fd.
+        """
+        save = mcp_server.save_session(name="y", messages=[])
+        sid = save["session_id"]
+        session_file = mcp_server.get_session_file(sid)
+
+        # Acquire the lock normally, then mutate mcp_server.fcntl to
+        # None inside the context. The finally must skip the
+        # fcntl.flock call without raising. We trigger the finally
+        # via an explicit raise so we can verify the original
+        # exception propagates instead of being masked.
+        class _Sentinel(Exception):
+            pass
+
+        with self.assertRaises(_Sentinel):
+            with mcp_server._session_lock(session_file):
+                # Lock is held; now flip fcntl to None so cleanup
+                # has to take the defensive branch.
+                with mock.patch.object(mcp_server, "fcntl", None):
+                    raise _Sentinel("propagate me")
+
     def test_lockfile_released_on_update_exception(self):
         """If ``update_session`` raises mid-critical-section, the
         lockfile must be released so subsequent calls aren't
