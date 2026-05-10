@@ -939,6 +939,155 @@ class TestAtomicWrites(_SessionMgmtBase):
         self.assertEqual(leftover, [])
 
 
+class TestLazyKeychainImport(unittest.TestCase):
+    """PR #4 round-10 review (Codex P2 L38): the perplexity client must
+    be constructed lazily so importing ``mcp_server`` succeeds even when
+    the macOS ``security`` CLI is unavailable. This complements round-9's
+    fcntl portability fix — the goal of "module loads cleanly on
+    non-POSIX" requires *both* fcntl and the keychain lookup to be
+    deferred. These tests do a fresh ``importlib`` load with
+    ``subprocess.run`` mocked to fail, so we exercise the import-time
+    path rather than poking the already-imported ``mcp_server`` global."""
+
+    def _import_with_failing_keychain(self, *, drop_fcntl: bool):
+        """Import mcp_server in a fresh module slot with the keychain
+        CLI mocked to raise ``FileNotFoundError`` (simulating Windows
+        or a stripped container where ``security`` is absent). When
+        ``drop_fcntl`` is True we additionally make ``import fcntl``
+        raise ImportError to mimic a true Windows environment.
+
+        Returns the freshly imported module on success; raises the
+        underlying error if the import itself blew up.
+        """
+        stubs = _build_stub_modules()
+
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError(
+                "[Errno 2] No such file or directory: 'security'"
+            )
+
+        # Use a unique slot name so the import isn't served from a
+        # cached entry left by ``_load_mcp_server`` at module-load
+        # time.
+        slot_name = (
+            "mcp_server_lazy_keychain_no_fcntl"
+            if drop_fcntl
+            else "mcp_server_lazy_keychain"
+        )
+
+        # Build a builtins.__import__ wrapper that raises ImportError
+        # specifically for fcntl. This is what actually fires the
+        # round-9 try/except path on Windows; setting ``sys.modules
+        # ["fcntl"] = None`` is not sufficient when fcntl is a
+        # statically-linked built-in (as on macOS), because the import
+        # machinery resolves it directly without consulting
+        # sys.modules.
+        import builtins as _builtins
+
+        original_import = _builtins.__import__
+
+        def blocking_import(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("No module named 'fcntl' (simulated)")
+            return original_import(name, *args, **kwargs)
+
+        ctx = mock.patch.dict(sys.modules, stubs)
+        with ctx:
+            # Force a fresh resolution of fcntl by removing any
+            # already-cached entry; otherwise Python returns the
+            # cached real fcntl without ever calling our import hook.
+            sys.modules.pop("fcntl", None)
+            import_patch = (
+                mock.patch.object(_builtins, "__import__", side_effect=blocking_import)
+                if drop_fcntl
+                else mock.patch.object(_builtins, "__import__", wraps=original_import)
+            )
+            with import_patch:
+                with mock.patch("subprocess.run", side_effect=fake_run):
+                    spec = importlib.util.spec_from_file_location(
+                        slot_name, SERVER_PATH
+                    )
+                    assert spec is not None and spec.loader is not None
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+        # Drop the freshly-loaded module from sys.modules so it doesn't
+        # leak into other tests that import via _load_mcp_server.
+        sys.modules.pop(slot_name, None)
+        return module
+
+    def test_module_imports_when_keychain_cli_missing(self):
+        """The headline round-10 case: ``security`` is absent, but
+        ``import mcp_server`` still succeeds. Without the lazy
+        accessor this would raise FileNotFoundError at import time."""
+        module = self._import_with_failing_keychain(drop_fcntl=False)
+        # The cache must start uninitialised — proves we did not eagerly
+        # call ``get_api_key_from_keychain`` at module load.
+        self.assertIsNone(module._perplexity_client_cache)
+        # And the helper functions we care about are still reachable
+        # for tool discovery.
+        self.assertTrue(callable(module._get_perplexity_client))
+        self.assertTrue(callable(module.list_sessions))
+
+    def test_module_imports_when_fcntl_and_keychain_missing(self):
+        """Combined non-POSIX scenario: neither ``fcntl`` nor the
+        ``security`` CLI is available. Round 9 fixed fcntl; round 10
+        must additionally not regress when both fail. Together they
+        deliver the round-9 stated goal of a clean Windows import."""
+        module = self._import_with_failing_keychain(drop_fcntl=True)
+        # fcntl flag was set to None by the stubbed import.
+        self.assertIsNone(module.fcntl)
+        # Keychain client still uninitialised.
+        self.assertIsNone(module._perplexity_client_cache)
+
+    def test_get_perplexity_client_propagates_keychain_error(self):
+        """When ``deep_research`` is invoked on a system without the
+        keychain CLI, the underlying error must surface — we are
+        deferring the lookup, not silently swallowing it. This proves
+        the laziness preserves the original failure-mode signal."""
+        module = self._import_with_failing_keychain(drop_fcntl=False)
+        with mock.patch.object(
+            module,
+            "subprocess",
+            mock.Mock(
+                run=mock.Mock(
+                    side_effect=FileNotFoundError(
+                        "[Errno 2] No such file or directory: 'security'"
+                    )
+                ),
+                CalledProcessError=Exception,
+            ),
+        ):
+            with self.assertRaises(FileNotFoundError):
+                module._get_perplexity_client()
+
+    def test_get_perplexity_client_caches_first_call(self):
+        """The accessor must memoise — repeated invocations should
+        not re-shell out to ``security`` once the first call has
+        succeeded."""
+        # Reuse the already-imported test module (it was loaded with a
+        # stubbed succeeding ``subprocess.run`` returning ``dummy-key``)
+        # and reset the cache so we can observe the first-call write.
+        original = mcp_server._perplexity_client_cache
+        try:
+            mcp_server._perplexity_client_cache = None
+            call_count = {"n": 0}
+
+            def counting_run(*args, **kwargs):
+                call_count["n"] += 1
+                return types.SimpleNamespace(returncode=0, stdout="k\n")
+
+            with mock.patch.object(
+                mcp_server.subprocess, "run", side_effect=counting_run
+            ):
+                first = mcp_server._get_perplexity_client()
+                second = mcp_server._get_perplexity_client()
+
+            self.assertIs(first, second)
+            self.assertEqual(call_count["n"], 1)
+        finally:
+            mcp_server._perplexity_client_cache = original
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     suite = unittest.TestLoader().loadTestsFromModule(sys.modules[__name__])

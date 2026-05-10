@@ -17,7 +17,11 @@ PLATFORM: macOS / POSIX only. The session helpers use ``fcntl.flock``
 CLI. Importing this module on Windows succeeds (so docs/inspection
 tools work) but invoking ``update_session`` / ``delete_session`` will
 raise OSError with a clear message (per PR #4 round-9 review, Gemini
-medium L17: "fcntl module is Unix-specific").
+medium L17: "fcntl module is Unix-specific"), and invoking
+``deep_research`` will raise the keychain-lookup error from the
+lazy ``_get_perplexity_client`` accessor (per PR #4 round-10 review,
+Codex P2 L38: keychain lookup must be deferred so ``import mcp_server``
+succeeds even when the ``security`` CLI is unavailable).
 """
 
 import asyncio
@@ -562,11 +566,35 @@ def delete_session(session_id: str) -> dict[str, Any]:
 if "--check" in sys.argv:
     run_check()
 
-# Initialize Perplexity client
-perplexity_client = OpenAI(
-    api_key=get_api_key_from_keychain("api_tokens", "perplexity"),
-    base_url="https://api.perplexity.ai",
-)
+# Perplexity client is constructed lazily so the module imports
+# cleanly even when the keychain CLI is unavailable (e.g. on Windows
+# or in a container without the macOS ``security`` binary). The round-9
+# fcntl fix made the lock helpers Windows-tolerant, but the eager call
+# to ``get_api_key_from_keychain`` here still shelled out at import
+# time and raised on non-macOS, defeating the "module loads cleanly on
+# non-POSIX" goal. Per PR #4 round-10 review, Codex P2 L38: defer the
+# lookup so tool discovery and non-deep-research code paths (including
+# the session helpers) can load without a keychain dependency. The
+# error surfaces only when ``deep_research`` is actually invoked.
+_perplexity_client_cache: OpenAI | None = None
+
+
+def _get_perplexity_client() -> OpenAI:
+    """Lazy accessor for the Perplexity client.
+
+    Builds and caches a single ``OpenAI`` client on first call. Raises
+    whatever ``get_api_key_from_keychain`` raises (typically
+    ``ValueError`` for a missing key, or ``FileNotFoundError`` if the
+    macOS ``security`` CLI itself is absent). Per PR #4 round-10
+    review, Codex P2 L38.
+    """
+    global _perplexity_client_cache
+    if _perplexity_client_cache is None:
+        _perplexity_client_cache = OpenAI(
+            api_key=get_api_key_from_keychain("api_tokens", "perplexity"),
+            base_url="https://api.perplexity.ai",
+        )
+    return _perplexity_client_cache
 
 # Create MCP server
 server = Server("ai-tools-mcp")
@@ -718,7 +746,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         query = arguments.get("query")
         max_tokens = arguments.get("max_tokens", 2048)
 
-        response = perplexity_client.chat.completions.create(
+        # Lazy client construction: per PR #4 round-10 review, Codex
+        # P2 L38, the keychain lookup is deferred to here so the module
+        # imports cleanly on non-macOS even though the ``security`` CLI
+        # is unavailable.
+        response = _get_perplexity_client().chat.completions.create(
             model="sonar-pro",
             messages=[
                 {
