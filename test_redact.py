@@ -235,7 +235,55 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertEqual(redact_secrets(s), s)
 
 
+class TestValidateInteractionId(unittest.TestCase):
+    """The Gemini interaction_id flows into the URL of an authenticated HTTP
+    call, so the validator is the boundary that prevents credential leakage to
+    an attacker-controlled host."""
+
+    def setUp(self):
+        self.validate = mcp_server._validate_interaction_id
+
+    def test_accepts_alphanumeric(self):
+        self.assertEqual(self.validate("abc123XYZ_-"), "abc123XYZ_-")
+
+    def test_rejects_path_traversal(self):
+        with self.assertRaises(ValueError):
+            self.validate("../../etc/passwd")
+
+    def test_rejects_slash(self):
+        with self.assertRaises(ValueError):
+            self.validate("abc/def")
+
+    def test_rejects_at_sign_host_swap(self):
+        # Classic URL trick: foo@evil.com would shift the host of a naive
+        # f-string URL construction.
+        with self.assertRaises(ValueError):
+            self.validate("abc@evil.com")
+
+    def test_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            self.validate("")
+
+    def test_rejects_too_long(self):
+        with self.assertRaises(ValueError):
+            self.validate("a" * 129)
+
+    def test_rejects_non_string(self):
+        with self.assertRaises(ValueError):
+            self.validate(None)  # type: ignore[arg-type]
+
+    def test_rejects_whitespace(self):
+        with self.assertRaises(ValueError):
+            self.validate("abc def")
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestRedactSecrets)
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite(
+        [
+            loader.loadTestsFromTestCase(TestRedactSecrets),
+            loader.loadTestsFromTestCase(TestValidateInteractionId),
+        ]
+    )
     sys.exit(0 if runner.run(suite).wasSuccessful() else 1)

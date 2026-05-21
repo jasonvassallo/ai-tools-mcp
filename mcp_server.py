@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["openai>=1.0.0", "mcp>=1.0.0"]
+# dependencies = ["openai>=1.0.0", "mcp>=1.0.0", "httpx>=0.27"]
 # ///
 """
-MCP server providing deep research via Perplexity Sonar Pro.
+MCP server providing hosted deep-research tools.
 
 Designed to complement Claude's built-in WebSearch tool:
 - Built-in WebSearch: quick factual lookups, single-answer questions
-- deep_research: multi-source synthesis, comparisons, ambiguous queries
+- deep_research: Perplexity Sonar Pro — fast inline multi-source synthesis
+- gemini_deep_research_start / _result: Gemini Deep Research — long-running
+  (minutes), citation-dense reports via Google's hosted research agent
 """
 
+import json
 import re
 import subprocess
 import sys
 import asyncio
 from typing import Any
+import httpx
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -88,12 +92,13 @@ def get_api_key_from_keychain(service: str, account: str) -> str:
 def run_check() -> None:
     """Validate configuration and exit. Used by install.sh to verify setup."""
     errors = 0
-    try:
-        get_api_key_from_keychain("api_tokens", "perplexity")
-        print("ok: perplexity key found in keychain")
-    except ValueError as e:
-        print(f"fail: {e}")
-        errors += 1
+    for account in ("perplexity", "gemini"):
+        try:
+            get_api_key_from_keychain("api_tokens", account)
+            print(f"ok: {account} key found in keychain")
+        except ValueError as e:
+            print(f"fail: {e}")
+            errors += 1
     sys.exit(errors)
 
 
@@ -105,6 +110,78 @@ perplexity_client = OpenAI(
     api_key=get_api_key_from_keychain("api_tokens", "perplexity"),
     base_url="https://api.perplexity.ai",
 )
+
+# Gemini Deep Research configuration. The /interactions endpoint is a separate
+# surface from the standard Generative Language API and is not yet covered by
+# the google-genai SDK at time of writing — call it directly via httpx.
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODELS = {
+    "fast": "deep-research-preview-04-2026",
+    "max": "deep-research-max-preview-04-2026",
+}
+# Strict allowlist: interaction IDs from tool parameters are concatenated into
+# the request URL. Reject anything that could perform path traversal or escape
+# the API host, since the API key header is attached to every request.
+_INTERACTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_gemini_api_key = get_api_key_from_keychain("api_tokens", "gemini")
+
+
+def _gemini_headers() -> dict[str, str]:
+    return {
+        "x-goog-api-key": _gemini_api_key,
+        "Content-Type": "application/json",
+    }
+
+
+def _validate_interaction_id(interaction_id: str) -> str:
+    """Reject interaction IDs that could redirect the authenticated request.
+
+    The interaction_id is concatenated into the URL of an authenticated HTTP
+    call; an attacker-controlled value containing ``/``, ``..``, or a scheme
+    could cause the Gemini API key to be sent to an unintended host.
+    """
+    if not isinstance(interaction_id, str) or not _INTERACTION_ID_RE.fullmatch(
+        interaction_id
+    ):
+        raise ValueError(
+            "interaction_id must match ^[A-Za-z0-9_-]{1,128}$ — refusing to "
+            "send authenticated request with untrusted path segment."
+        )
+    return interaction_id
+
+
+async def _post_gemini_interaction(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST a Deep Research interaction. URL is fully static; no tool input.
+
+    follow_redirects is disabled so the Gemini API key cannot be forwarded to
+    another host via a redirect response.
+    """
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+        response = await client.post(
+            f"{GEMINI_API_BASE}/interactions",
+            headers=_gemini_headers(),
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
+    """GET a Deep Research interaction by ID.
+
+    The interaction_id MUST have already passed _validate_interaction_id; this
+    helper re-validates as defense in depth so the URL cannot escape the API
+    host even if a future caller forgets.
+    """
+    safe_id = _validate_interaction_id(interaction_id)
+    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+        response = await client.get(
+            f"{GEMINI_API_BASE}/interactions/{safe_id}",
+            headers=_gemini_headers(),
+        )
+        response.raise_for_status()
+        return response.json()
+
 
 # Create MCP server
 server = Server("ai-tools-mcp")
@@ -140,7 +217,69 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["query"],
             },
-        )
+        ),
+        Tool(
+            name="gemini_deep_research_start",
+            description=(
+                "Start a Gemini Deep Research task (asynchronous). Returns an "
+                "interaction_id you must poll with gemini_deep_research_result. "
+                "Tasks run for several minutes and up to 60 minutes. Use when "
+                "you need a citation-dense, multi-page report drawing on many "
+                "sources. For quick inline research that completes in seconds, "
+                "use `deep_research` (Perplexity) instead."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The research question or topic.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["fast", "max"],
+                        "default": "fast",
+                        "description": (
+                            "fast = deep-research-preview (speed/efficiency); "
+                            "max = deep-research-max-preview (maximum comprehensiveness)."
+                        ),
+                    },
+                    "collaborative_planning": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Enable collaborative planning mode.",
+                    },
+                    "thinking_summaries": {
+                        "type": "string",
+                        "enum": ["auto", "none"],
+                        "default": "auto",
+                        "description": "Whether the agent should emit thinking summaries.",
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="gemini_deep_research_result",
+            description=(
+                "Retrieve the status or final result of a Gemini Deep Research "
+                "task started with gemini_deep_research_start. Returns "
+                "{status, output_text, steps_summary} when status='completed', "
+                "{status: 'failed', error} on failure, or "
+                "{status: 'in_progress', hint} while running. Poll roughly "
+                "every 30 seconds."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "interaction_id": {
+                        "type": "string",
+                        "description": "ID returned by gemini_deep_research_start.",
+                    },
+                },
+                "required": ["interaction_id"],
+            },
+        ),
     ]
 
 
@@ -178,8 +317,61 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         return [TextContent(type="text", text=result)]
 
-    else:
-        raise ValueError(f"Unknown tool: {name}")
+    if name == "gemini_deep_research_start":
+        query = arguments["query"]
+        mode = arguments.get("mode", "fast")
+        if mode not in GEMINI_MODELS:
+            raise ValueError(
+                f"mode must be one of {sorted(GEMINI_MODELS)}; got {mode!r}"
+            )
+
+        payload = {
+            "agent": GEMINI_MODELS[mode],
+            "input": query,
+            "background": True,
+            "agent_config": {
+                "type": "deep-research",
+                "thinking_summaries": arguments.get("thinking_summaries", "auto"),
+                "collaborative_planning": bool(
+                    arguments.get("collaborative_planning", False)
+                ),
+            },
+        }
+
+        data = await _post_gemini_interaction(payload)
+
+        result = {
+            "interaction_id": data.get("id"),
+            "status": data.get("status", "in_progress"),
+            "model": GEMINI_MODELS[mode],
+            "hint": (
+                "Poll gemini_deep_research_result with this interaction_id. "
+                "Tasks take several minutes; up to 60 minutes max."
+            ),
+        }
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name == "gemini_deep_research_result":
+        safe_id = _validate_interaction_id(arguments["interaction_id"])
+        data = await _get_gemini_interaction(safe_id)
+        status = data.get("status", "unknown")
+        result: dict[str, Any] = {"status": status}
+
+        if status == "completed":
+            # Route all model-emitted text through the redactor — Deep Research
+            # can lift API keys, JWTs, and private-key blocks from the open web.
+            result["output_text"] = redact_secrets(data.get("output_text", ""))
+            steps = data.get("steps") or []
+            result["steps_count"] = len(steps)
+            result["steps_summary"] = [s.get("type") for s in steps]
+        elif status == "failed":
+            result["error"] = redact_secrets(data.get("error", "unknown error"))
+        else:
+            result["hint"] = "Still running. Poll again in ~30 seconds."
+
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    raise ValueError(f"Unknown tool: {name}")
 
 
 async def main():
