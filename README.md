@@ -92,18 +92,33 @@ Safe to run multiple times — updates existing config without clobbering.
 
 ### Keychain Entries
 
-The server expects two API keys in the macOS Keychain:
+The server expects one API key in the macOS Keychain (for Perplexity):
 
 - service `api_tokens`, account `perplexity`
-- service `api_tokens`, account `gemini`
 
-Both are required — the server fails fast at startup if either is missing.
 The installer handles this automatically. For manual setup:
 
 ```bash
 security add-generic-password -s 'api_tokens' -a 'perplexity' -w 'YOUR_PERPLEXITY_API_KEY'
-security add-generic-password -s 'api_tokens' -a 'gemini'     -w 'YOUR_GEMINI_API_KEY'
 ```
+
+### Google Cloud Application Default Credentials (ADC)
+
+The Gemini Deep Research tools authenticate via **ADC**, not a static API
+key. Set this up once with:
+
+```bash
+gcloud auth application-default login
+gcloud auth application-default set-quota-project YOUR_GCP_PROJECT
+```
+
+The server reads ADC from the standard location
+(`~/.config/gcloud/application_default_credentials.json`) and refreshes
+short-lived bearer tokens transparently via the `google-auth` library. The
+billing project is auto-detected from ADC.
+
+The preflight check (`uv run mcp_server.py --check`) verifies both the
+Perplexity key and ADC, refreshing a token to confirm credentials are live.
 
 ## Running
 

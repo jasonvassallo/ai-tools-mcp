@@ -1,10 +1,13 @@
 .venv/
+.venv.*/
 .mypy_cache/
 .pytest_cache/
 __pycache__/
 .DS_Store
 .vscode/
 .claude/
+.serena/
+*.recovered
 zshrc_debug.txt
 .env
 .env.*

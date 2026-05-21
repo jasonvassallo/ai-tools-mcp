@@ -96,6 +96,45 @@ def _install_stubs() -> None:
 
     _stub_module("mcp.types", Tool=_Tool, TextContent=_TextContent)
 
+    # Stub google.auth so module import doesn't touch real ADC. Tests don't
+    # exercise the auth path; they only need the import to succeed.
+    class _FakeCredentials:
+        valid = True
+        token = "fake-bearer-token-for-tests"
+
+        def refresh(self, request):  # noqa: D401 - test stub
+            self.token = "fake-bearer-token-for-tests"
+
+    def _fake_default(scopes=None):
+        return _FakeCredentials(), "fake-test-project"
+
+    class _FakeAuthExceptions:
+        class DefaultCredentialsError(Exception):
+            pass
+
+    class _FakeRequest:
+        def __init__(self, *a, **kw):
+            pass
+
+    # `_stub_module` only adds to sys.modules; for dotted-attribute access
+    # like `google.auth.exceptions.X` to work, each parent must also expose
+    # the child as an attribute.
+    google_mod = _stub_module("google")
+    auth_exceptions_mod = _stub_module(
+        "google.auth.exceptions",
+        DefaultCredentialsError=_FakeAuthExceptions.DefaultCredentialsError,
+    )
+    auth_mod = _stub_module(
+        "google.auth", default=_fake_default, exceptions=auth_exceptions_mod
+    )
+    transport_mod = _stub_module("google.auth.transport")
+    transport_requests_mod = _stub_module(
+        "google.auth.transport.requests", Request=_FakeRequest
+    )
+    google_mod.auth = auth_mod
+    auth_mod.transport = transport_mod
+    transport_mod.requests = transport_requests_mod
+
 
 def _load_mcp_server():
     _install_stubs()

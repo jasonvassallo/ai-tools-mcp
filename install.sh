@@ -31,8 +31,11 @@ KEYCHAIN_SERVICE="api_tokens"
 # API tokens required: "account_name|display_name|description"
 REQUIRED_TOKENS=(
     "perplexity|Perplexity API Key|Get one at https://www.perplexity.ai/settings/api"
-    "gemini|Gemini API Key|Get one at https://aistudio.google.com/apikey"
 )
+# Gemini Deep Research authenticates via Google Cloud Application Default
+# Credentials (ADC), not a static API key. ADC must be configured separately:
+#   gcloud auth application-default login
+# The preflight check (--check) verifies ADC is valid at install time.
 
 # ─── END CONFIG ──────────────────────────────────────────────────
 

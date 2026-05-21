@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["openai>=1.0.0", "mcp>=1.0.0", "httpx>=0.27"]
+# dependencies = [
+#     "openai>=1.0.0",
+#     "mcp>=1.0.0",
+#     "httpx>=0.27",
+#     "google-auth>=2.30",
+#     "requests>=2.31",
+# ]
 # ///
 """
 MCP server providing hosted deep-research tools.
@@ -20,6 +26,8 @@ import sys
 import asyncio
 from typing import Any
 import httpx
+import google.auth
+import google.auth.transport.requests
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
@@ -89,16 +97,51 @@ def get_api_key_from_keychain(service: str, account: str) -> str:
     return result.stdout.strip()
 
 
+_ADC_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+
+
+def _load_adc() -> tuple[Any, str]:
+    """Load Google Cloud Application Default Credentials.
+
+    Returns (credentials, billing_project). Raises a clear error if ADC is not
+    configured. The credentials object is refreshable — tokens are minted
+    lazily per request via `_get_bearer_token`.
+    """
+    try:
+        creds, project = google.auth.default(scopes=list(_ADC_SCOPES))
+    except google.auth.exceptions.DefaultCredentialsError as exc:
+        raise ValueError(
+            "Google Cloud Application Default Credentials not found. "
+            "Run: gcloud auth application-default login"
+        ) from exc
+    if not project:
+        raise ValueError(
+            "Could not determine billing project from ADC. Run: "
+            "gcloud auth application-default set-quota-project YOUR_PROJECT"
+        )
+    return creds, project
+
+
 def run_check() -> None:
     """Validate configuration and exit. Used by install.sh to verify setup."""
     errors = 0
-    for account in ("perplexity", "gemini"):
-        try:
-            get_api_key_from_keychain("api_tokens", account)
-            print(f"ok: {account} key found in keychain")
-        except ValueError as e:
-            print(f"fail: {e}")
-            errors += 1
+    try:
+        get_api_key_from_keychain("api_tokens", "perplexity")
+        print("ok: perplexity key found in keychain")
+    except ValueError as e:
+        print(f"fail: {e}")
+        errors += 1
+
+    try:
+        creds, project = _load_adc()
+        # Force a refresh so a stale/expired ADC fails the check here rather
+        # than at first tool call.
+        creds.refresh(google.auth.transport.requests.Request())
+        print(f"ok: google ADC valid (billing project: {project})")
+    except (ValueError, Exception) as e:  # noqa: BLE001 - report any auth issue
+        print(f"fail: {e}")
+        errors += 1
+
     sys.exit(errors)
 
 
@@ -114,6 +157,10 @@ perplexity_client = OpenAI(
 # Gemini Deep Research configuration. The /interactions endpoint is a separate
 # surface from the standard Generative Language API and is not yet covered by
 # the google-genai SDK at time of writing — call it directly via httpx.
+#
+# Authentication uses Google Cloud Application Default Credentials (ADC)
+# rather than a static API key. Tokens are short-lived (~1 hour) and refreshed
+# transparently by the google-auth library.
 GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_MODELS = {
     "fast": "deep-research-preview-04-2026",
@@ -121,14 +168,36 @@ GEMINI_MODELS = {
 }
 # Strict allowlist: interaction IDs from tool parameters are concatenated into
 # the request URL. Reject anything that could perform path traversal or escape
-# the API host, since the API key header is attached to every request.
+# the API host, since the ADC bearer token is attached to every request.
 _INTERACTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_gemini_api_key = get_api_key_from_keychain("api_tokens", "gemini")
+
+_gemini_credentials, _gemini_billing_project = _load_adc()
+_gemini_token_lock = asyncio.Lock()
 
 
-def _gemini_headers() -> dict[str, str]:
+async def _get_bearer_token() -> str:
+    """Return a fresh ADC bearer token, refreshing on a worker thread if
+    expired. The lock serializes concurrent refreshes from parallel tool calls.
+    """
+    async with _gemini_token_lock:
+        if not _gemini_credentials.valid:
+            await asyncio.to_thread(
+                _gemini_credentials.refresh,
+                google.auth.transport.requests.Request(),
+            )
+        token = _gemini_credentials.token
+    if not token:
+        raise RuntimeError("ADC refresh returned empty token")
+    return token
+
+
+async def _gemini_headers() -> dict[str, str]:
     return {
-        "x-goog-api-key": _gemini_api_key,
+        "Authorization": f"Bearer {await _get_bearer_token()}",
+        # Required when using OAuth (not API key) so the request is billed and
+        # quota-attributed to the user's project rather than the credential's
+        # home project.
+        "x-goog-user-project": _gemini_billing_project,
         "Content-Type": "application/json",
     }
 
@@ -153,13 +222,14 @@ def _validate_interaction_id(interaction_id: str) -> str:
 async def _post_gemini_interaction(payload: dict[str, Any]) -> dict[str, Any]:
     """POST a Deep Research interaction. URL is fully static; no tool input.
 
-    follow_redirects is disabled so the Gemini API key cannot be forwarded to
-    another host via a redirect response.
+    follow_redirects is disabled so the ADC bearer token cannot be forwarded
+    to another host via a redirect response.
     """
+    headers = await _gemini_headers()
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
         response = await client.post(
             f"{GEMINI_API_BASE}/interactions",
-            headers=_gemini_headers(),
+            headers=headers,
             json=payload,
         )
         response.raise_for_status()
@@ -174,10 +244,11 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
     host even if a future caller forgets.
     """
     safe_id = _validate_interaction_id(interaction_id)
+    headers = await _gemini_headers()
     async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
         response = await client.get(
             f"{GEMINI_API_BASE}/interactions/{safe_id}",
-            headers=_gemini_headers(),
+            headers=headers,
         )
         response.raise_for_status()
         return response.json()

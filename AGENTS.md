@@ -32,9 +32,9 @@ Keep those tool names stable unless a change is explicitly requested.
 
 `mcp_server.py` uses PEP 723 inline script metadata — no virtualenv or project config needed. `uv run mcp_server.py` handles everything.
 
-- macOS Keychain items (both required):
-  - service `api_tokens`, account `perplexity`
-  - service `api_tokens`, account `gemini`
+Credentials:
+- macOS Keychain: service `api_tokens`, account `perplexity` (required)
+- Google Cloud ADC at `~/.config/gcloud/application_default_credentials.json` (required for Gemini Deep Research). Configure with `gcloud auth application-default login`. Billing project is auto-detected.
 
 ## Running
 
