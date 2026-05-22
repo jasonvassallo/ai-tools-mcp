@@ -1,16 +1,30 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["openai>=1.0.0", "mcp>=1.0.0"]
+# dependencies = [
+#     "openai>=1.0.0",
+#     "mcp>=1.0.0",
+#     "httpx>=0.27",
+#     "google-auth>=2.30",
+#     "requests>=2.31",
+# ]
 # ///
 """
-MCP server providing deep research via Perplexity Sonar Pro plus
-local session-management tools backed by ``~/.claude/sessions/``.
+MCP server providing three families of tools:
 
-Designed to complement Claude's built-in WebSearch tool:
-- Built-in WebSearch: quick factual lookups, single-answer questions
-- deep_research: multi-source synthesis, comparisons, ambiguous queries
-- session_*: persist/restore conversation context across runs
+- ``deep_research``: Perplexity Sonar Pro — fast inline multi-source
+  synthesis with citations. Use for comparisons, ambiguous queries,
+  and answers that span multiple sources.
+- ``gemini_deep_research_start`` / ``_result``: Gemini Deep Research —
+  long-running (minutes, up to 60), citation-dense reports via
+  Google's hosted research agent. Asynchronous: ``_start`` returns an
+  interaction_id; poll ``_result`` until terminal status.
+- ``list_sessions`` / ``save_session`` / ``load_session`` /
+  ``update_session`` / ``delete_session``: local conversation-session
+  persistence backed by ``~/.claude/sessions/``.
+
+Designed to complement Claude's built-in WebSearch tool (quick factual
+lookups, single-answer questions).
 
 PLATFORM: macOS / POSIX only. The session helpers use ``fcntl.flock``
 (Unix-specific) and the Perplexity-key lookup uses macOS's ``security``
@@ -22,6 +36,13 @@ medium L17: "fcntl module is Unix-specific"), and invoking
 lazy ``_get_perplexity_client`` accessor (per PR #4 round-10 review,
 Codex P2 L38: keychain lookup must be deferred so ``import mcp_server``
 succeeds even when the ``security`` CLI is unavailable).
+
+For the Gemini tools, Application Default Credentials (ADC) are
+likewise loaded lazily on first ``gemini_*`` call rather than at
+module import. This means the MCP server can start and the
+Perplexity-backed ``deep_research`` and session tools can be used
+even on a machine without ``gcloud auth application-default login``
+having been run; only the ``gemini_*`` tools will fail when invoked.
 """
 
 import asyncio
@@ -36,6 +57,10 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+import google.auth
+import google.auth.transport.requests
+import httpx
 
 # fcntl is POSIX-only; on Windows the import fails. We catch
 # ImportError so the module can still be imported (e.g. for docs,
@@ -145,6 +170,31 @@ def get_api_key_from_keychain(service: str, account: str) -> str:
     return result.stdout.strip()
 
 
+_ADC_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+
+
+def _load_adc() -> tuple[Any, str]:
+    """Load Google Cloud Application Default Credentials.
+
+    Returns (credentials, billing_project). Raises a clear error if ADC is not
+    configured. The credentials object is refreshable — tokens are minted
+    lazily per request via `_get_bearer_token`.
+    """
+    try:
+        creds, project = google.auth.default(scopes=list(_ADC_SCOPES))
+    except google.auth.exceptions.DefaultCredentialsError as exc:
+        raise ValueError(
+            "Google Cloud Application Default Credentials not found. "
+            "Run: gcloud auth application-default login"
+        ) from exc
+    if not project:
+        raise ValueError(
+            "Could not determine billing project from ADC. Run: "
+            "gcloud auth application-default set-quota-project YOUR_PROJECT"
+        )
+    return creds, project
+
+
 def run_check() -> None:
     """Validate configuration and exit. Used by install.sh to verify setup."""
     errors = 0
@@ -154,6 +204,17 @@ def run_check() -> None:
     except ValueError as e:
         print(f"fail: {e}")
         errors += 1
+
+    try:
+        creds, project = _load_adc()
+        # Force a refresh so a stale/expired ADC fails the check here rather
+        # than at first tool call.
+        creds.refresh(google.auth.transport.requests.Request())
+        print(f"ok: google ADC valid (billing project: {project})")
+    except (ValueError, Exception) as e:  # noqa: BLE001 - report any auth issue
+        print(f"fail: {e}")
+        errors += 1
+
     sys.exit(errors)
 
 
@@ -497,16 +558,12 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
         except FileNotFoundError as e:
             raise ValueError(f"Session not found: {session_id}") from e
         except (json.JSONDecodeError, OSError) as e:
-            raise ValueError(
-                f"Session file invalid or unreadable: {session_id}"
-            ) from e
+            raise ValueError(f"Session file invalid or unreadable: {session_id}") from e
 
         # Defensive: same shape guard as load_session (per PR #3
         # follow-up review, Gemini medium L301).
         if not isinstance(data, dict):
-            raise ValueError(
-                f"Session file shape is not a JSON object: {session_id}"
-            )
+            raise ValueError(f"Session file shape is not a JSON object: {session_id}")
 
         if name is not None:
             # `is not None` (not truthy check) so callers can pass
@@ -604,6 +661,187 @@ def _get_perplexity_client() -> OpenAI:
         )
     return _perplexity_client_cache
 
+
+# Gemini Deep Research configuration. The /interactions endpoint is a separate
+# surface from the standard Generative Language API and is not yet covered by
+# the google-genai SDK at time of writing — call it directly via httpx.
+#
+# Authentication uses Google Cloud Application Default Credentials (ADC)
+# rather than a static API key. Tokens are short-lived (~1 hour) and refreshed
+# transparently by the google-auth library.
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_MODELS = {
+    "fast": "deep-research-preview-04-2026",
+    "max": "deep-research-max-preview-04-2026",
+}
+# Strict allowlist: interaction IDs from tool parameters are concatenated into
+# the request URL. Reject anything that could perform path traversal or escape
+# the API host, since the ADC bearer token is attached to every request.
+_INTERACTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+# ADC is loaded LAZILY on first Gemini tool call rather than at module import.
+# This means the MCP server can start (and the Perplexity-backed deep_research
+# tool can be used) even on a machine without gcloud ADC configured — only the
+# gemini_* tools will fail when invoked. Module-level eager-load was crashing
+# the entire server at startup if ADC was missing or slow to fetch.
+_gemini_credentials: Any = None
+_gemini_billing_project: str | None = None
+_gemini_token_lock = asyncio.Lock()
+
+# Terminal states for a Gemini Deep Research interaction. Anything not in this
+# set is treated as still-in-progress so the client knows to keep polling.
+# Includes "cancelled" (user-cancelled or quota-cancelled) per Gemini API docs
+# alongside the obvious "completed"/"failed", plus "incomplete" (run ended
+# without a final answer — e.g. tool/agent failure mid-stream) and
+# "budget_exceeded" (token or compute budget exhausted). Status strings are
+# matched case-insensitively at the comparison site.
+#
+# Note: "requires_action" is intentionally NOT in this set — it's a distinct
+# non-terminal state where the agent is awaiting user input (typically when
+# collaborative_planning=true). It is handled with its own branch in the
+# result tool so the caller knows it's actionable, not stuck.
+_GEMINI_TERMINAL_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "incomplete", "budget_exceeded"}
+)
+
+# Module-level lazy singleton httpx.AsyncClient. Created on first Gemini call
+# and reused across all subsequent calls so we get connection pooling / keep-
+# alive against the Gemini API host. Initialized under a lock so a burst of
+# concurrent tool calls doesn't race on first use.
+_http_client: httpx.AsyncClient | None = None
+_http_client_lock = asyncio.Lock()
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Return the module-level shared httpx client, creating it on first use.
+
+    follow_redirects is disabled so the ADC bearer token cannot be forwarded
+    to another host via a redirect response.
+    """
+    global _http_client
+    if _http_client is None:
+        async with _http_client_lock:
+            if _http_client is None:
+                _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return _http_client
+
+
+def _http_error_payload(exc: httpx.HTTPStatusError) -> dict[str, Any]:
+    """Build a structured failure dict from an httpx HTTPStatusError.
+
+    Keeps a short body snippet (≤500 chars) so the caller has enough context to
+    diagnose without bloating the MCP response. Runs the snippet through
+    `redact_secrets` because Gemini error bodies have, on occasion, echoed
+    request headers or query content.
+    """
+    status_code = exc.response.status_code
+    try:
+        body = exc.response.text or ""
+    except Exception:  # noqa: BLE001 - never let body extraction shadow the real error
+        body = ""
+    snippet = redact_secrets(body[:500])
+    return {"status": "failed", "error": f"{status_code}: {snippet}"}
+
+
+async def _get_bearer_token() -> str:
+    """Return a fresh ADC bearer token, loading credentials on first call and
+    refreshing on a worker thread if expired. The lock serializes concurrent
+    init/refresh attempts from parallel tool calls.
+    """
+    global _gemini_credentials, _gemini_billing_project
+    async with _gemini_token_lock:
+        if _gemini_credentials is None:
+            # Defer the blocking ADC lookup to a worker thread — google.auth.default
+            # can do file I/O and (rarely) network calls under the hood.
+            _gemini_credentials, _gemini_billing_project = await asyncio.to_thread(
+                _load_adc
+            )
+        if not _gemini_credentials.valid:
+            await asyncio.to_thread(
+                _gemini_credentials.refresh,
+                google.auth.transport.requests.Request(),
+            )
+        token = _gemini_credentials.token
+    if not token:
+        raise RuntimeError("ADC refresh returned empty token")
+    return token
+
+
+async def _gemini_headers() -> dict[str, str]:
+    # _get_bearer_token populates _gemini_billing_project as a side effect of
+    # first-time ADC load, so call it first to ensure the project is available.
+    token = await _get_bearer_token()
+    return {
+        "Authorization": f"Bearer {token}",
+        # Required when using OAuth (not API key) so the request is billed and
+        # quota-attributed to the user's project rather than the credential's
+        # home project.
+        "x-goog-user-project": _gemini_billing_project,
+        "Content-Type": "application/json",
+    }
+
+
+def _validate_interaction_id(interaction_id: str) -> str:
+    """Reject interaction IDs that could redirect the authenticated request.
+
+    The interaction_id is concatenated into the URL of an authenticated HTTP
+    call; an attacker-controlled value containing ``/``, ``..``, or a scheme
+    could cause the Gemini API key to be sent to an unintended host.
+    """
+    if not isinstance(interaction_id, str) or not _INTERACTION_ID_RE.fullmatch(
+        interaction_id
+    ):
+        raise ValueError(
+            "interaction_id must match ^[A-Za-z0-9_-]{1,128}$ — refusing to "
+            "send authenticated request with untrusted path segment."
+        )
+    return interaction_id
+
+
+async def _post_gemini_interaction(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST a Deep Research interaction. URL is fully static; no tool input.
+
+    On HTTP error, returns a structured ``{"status": "failed", "error": ...}``
+    dict instead of raising so the MCP client gets a graceful error envelope
+    rather than an opaque exception. The shared httpx client gives us
+    connection pooling across calls.
+    """
+    headers = await _gemini_headers()
+    client = await _get_http_client()
+    try:
+        response = await client.post(
+            f"{GEMINI_API_BASE}/interactions",
+            headers=headers,
+            json=payload,
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc)
+
+
+async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
+    """GET a Deep Research interaction by ID.
+
+    The interaction_id MUST have already passed _validate_interaction_id; this
+    helper re-validates as defense in depth so the URL cannot escape the API
+    host even if a future caller forgets. Same structured-error contract as
+    `_post_gemini_interaction`.
+    """
+    safe_id = _validate_interaction_id(interaction_id)
+    headers = await _gemini_headers()
+    client = await _get_http_client()
+    try:
+        response = await client.get(
+            f"{GEMINI_API_BASE}/interactions/{safe_id}",
+            headers=headers,
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc)
+
+
 # Create MCP server
 server = Server("ai-tools-mcp")
 
@@ -637,6 +875,77 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["query"],
+            },
+        ),
+        Tool(
+            name="gemini_deep_research_start",
+            description=(
+                "Start a Gemini Deep Research task (asynchronous). Returns an "
+                "interaction_id you must poll with gemini_deep_research_result. "
+                "Tasks run for several minutes and up to 60 minutes. Use when "
+                "you need a citation-dense, multi-page report drawing on many "
+                "sources. For quick inline research that completes in seconds, "
+                "use `deep_research` (Perplexity) instead."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The research question or topic.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["fast", "max"],
+                        "default": "fast",
+                        "description": (
+                            "fast = deep-research-preview (speed/efficiency); "
+                            "max = deep-research-max-preview (maximum comprehensiveness)."
+                        ),
+                    },
+                    "collaborative_planning": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Enable collaborative planning mode.",
+                    },
+                    "thinking_summaries": {
+                        "type": "string",
+                        "enum": ["auto", "none"],
+                        "default": "auto",
+                        "description": "Whether the agent should emit thinking summaries.",
+                    },
+                    "previous_interaction_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional ID of a prior interaction to continue from. "
+                            "Must match ^[A-Za-z0-9_-]{1,128}$."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="gemini_deep_research_result",
+            description=(
+                "Retrieve the status or final result of a Gemini Deep Research "
+                "task started with gemini_deep_research_start. Returns "
+                "{status, output_text, steps_summary} when status='completed', "
+                "{status: 'failed'|'cancelled'|'incomplete'|'budget_exceeded', "
+                "error} on terminal non-success, {status: 'requires_action', "
+                "hint} when the agent is awaiting user input, or "
+                "{status: 'in_progress', hint} while running. Poll roughly "
+                "every 30 seconds."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "interaction_id": {
+                        "type": "string",
+                        "description": "ID returned by gemini_deep_research_start.",
+                    },
+                },
+                "required": ["interaction_id"],
             },
         ),
         Tool(
@@ -783,6 +1092,131 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = f"## Research Results\n\n{content}"
 
         return [TextContent(type="text", text=result)]
+
+    if name == "gemini_deep_research_start":
+        try:
+            query = arguments["query"]
+            mode = arguments.get("mode", "fast")
+            if mode not in GEMINI_MODELS:
+                raise ValueError(
+                    f"mode must be one of {sorted(GEMINI_MODELS)}; got {mode!r}"
+                )
+
+            # Strict bool check — `bool("false")` is True in Python, so a
+            # JSON-stringified flag would silently flip the meaning.
+            collaborative_planning = arguments.get("collaborative_planning", False)
+            if not isinstance(collaborative_planning, bool):
+                raise ValueError(
+                    "collaborative_planning must be a JSON boolean "
+                    "(true/false), not a string or number."
+                )
+
+            thinking_summaries = arguments.get("thinking_summaries", "auto")
+            if thinking_summaries not in {"auto", "none"}:
+                raise ValueError(
+                    "thinking_summaries must be 'auto' or 'none'; "
+                    f"got {thinking_summaries!r}."
+                )
+
+            payload: dict[str, Any] = {
+                "agent": GEMINI_MODELS[mode],
+                "input": query,
+                "background": True,
+                "agent_config": {
+                    "type": "deep-research",
+                    "thinking_summaries": thinking_summaries,
+                    "collaborative_planning": collaborative_planning,
+                },
+            }
+
+            # Optional continuation. Validate with the same allowlist used for
+            # interaction_id since it's also concatenated into the request body
+            # and (more importantly) used by the upstream API for routing.
+            previous_interaction_id = arguments.get("previous_interaction_id")
+            if previous_interaction_id is not None:
+                payload["previous_interaction_id"] = _validate_interaction_id(
+                    previous_interaction_id
+                )
+
+            data = await _post_gemini_interaction(payload)
+
+            # If the helper returned a structured failure, surface it directly
+            # — no point trying to extract an id from an error envelope.
+            if data.get("status") == "failed":
+                return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+            interaction_id = data.get("id")
+            if not isinstance(interaction_id, str) or not _INTERACTION_ID_RE.fullmatch(
+                interaction_id
+            ):
+                # Fail loudly: a null/malformed id breaks the poll contract
+                # since the result tool can't be called without a valid id.
+                raise RuntimeError(
+                    "Gemini start response did not include a valid interaction id; "
+                    f"got {interaction_id!r}."
+                )
+
+            result = {
+                "interaction_id": interaction_id,
+                "status": data.get("status", "in_progress"),
+                "model": GEMINI_MODELS[mode],
+                "hint": (
+                    "Poll gemini_deep_research_result with this interaction_id. "
+                    "Tasks take several minutes; up to 60 minutes max."
+                ),
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        except ValueError as exc:
+            err = {"status": "failed", "error": str(exc)}
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+    if name == "gemini_deep_research_result":
+        try:
+            safe_id = _validate_interaction_id(arguments["interaction_id"])
+        except ValueError as exc:
+            err = {"status": "failed", "error": str(exc)}
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+        data = await _get_gemini_interaction(safe_id)
+        status = data.get("status", "unknown")
+        result: dict[str, Any] = {"status": status}
+
+        # Normalize for terminal-status comparison; the API has used mixed case
+        # historically (e.g. "Completed") — be liberal in what we accept.
+        normalized_status = status.lower() if isinstance(status, str) else "unknown"
+
+        if normalized_status == "completed":
+            # Route all model-emitted text through the redactor — Deep Research
+            # can lift API keys, JWTs, and private-key blocks from the open web.
+            result["output_text"] = redact_secrets(data.get("output_text", ""))
+            steps = data.get("steps") or []
+            result["steps_count"] = len(steps)
+            # Some upstream payloads have included non-dict step entries (raw
+            # strings, nulls) — guard so a single malformed step doesn't crash
+            # the entire result handler.
+            result["steps_summary"] = [
+                s.get("type") for s in steps if isinstance(s, dict)
+            ]
+        elif normalized_status == "requires_action":
+            # Distinct non-terminal state: the agent has paused mid-run and is
+            # waiting on user input (typically when collaborative_planning is
+            # enabled). The caller should re-issue the interaction with the
+            # required action attached rather than continuing to poll.
+            result["hint"] = (
+                "Agent is awaiting user input; collaborative-planning "
+                "approval may be needed."
+            )
+        elif normalized_status in _GEMINI_TERMINAL_STATUSES:
+            # "failed", "cancelled", "incomplete", "budget_exceeded", and any
+            # future terminal status. Use whatever error/message field the
+            # upstream provided.
+            result["error"] = redact_secrets(
+                data.get("error") or data.get("message") or f"task {normalized_status}"
+            )
+        else:
+            result["hint"] = "Still running. Poll again in ~30 seconds."
+
+        return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
     if name == "list_sessions":
         sessions = list_sessions()

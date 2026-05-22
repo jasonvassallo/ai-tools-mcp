@@ -18,7 +18,7 @@ set -euo pipefail
 # ─── CONFIG (customize this section for each project) ────────────
 
 APP_NAME="ai-tools-mcp"
-APP_VERSION="0.2.0"
+APP_VERSION="0.3.0"
 INSTALL_DIR="$HOME/.local/share/${APP_NAME}"
 SCRIPT_NAME="mcp_server.py"
 
@@ -32,6 +32,10 @@ KEYCHAIN_SERVICE="api_tokens"
 REQUIRED_TOKENS=(
     "perplexity|Perplexity API Key|Get one at https://www.perplexity.ai/settings/api"
 )
+# Gemini Deep Research authenticates via Google Cloud Application Default
+# Credentials (ADC), not a static API key. ADC must be configured separately:
+#   gcloud auth application-default login
+# The preflight check (--check) verifies ADC is valid at install time.
 
 # ─── END CONFIG ──────────────────────────────────────────────────
 

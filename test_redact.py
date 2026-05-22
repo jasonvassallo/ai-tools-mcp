@@ -96,6 +96,45 @@ def _install_stubs() -> None:
 
     _stub_module("mcp.types", Tool=_Tool, TextContent=_TextContent)
 
+    # Stub google.auth so module import doesn't touch real ADC. Tests don't
+    # exercise the auth path; they only need the import to succeed.
+    class _FakeCredentials:
+        valid = True
+        token = "fake-bearer-token-for-tests"
+
+        def refresh(self, request):  # noqa: D401 - test stub
+            self.token = "fake-bearer-token-for-tests"
+
+    def _fake_default(scopes=None):
+        return _FakeCredentials(), "fake-test-project"
+
+    class _FakeAuthExceptions:
+        class DefaultCredentialsError(Exception):
+            pass
+
+    class _FakeRequest:
+        def __init__(self, *a, **kw):
+            pass
+
+    # `_stub_module` only adds to sys.modules; for dotted-attribute access
+    # like `google.auth.exceptions.X` to work, each parent must also expose
+    # the child as an attribute.
+    google_mod = _stub_module("google")
+    auth_exceptions_mod = _stub_module(
+        "google.auth.exceptions",
+        DefaultCredentialsError=_FakeAuthExceptions.DefaultCredentialsError,
+    )
+    auth_mod = _stub_module(
+        "google.auth", default=_fake_default, exceptions=auth_exceptions_mod
+    )
+    transport_mod = _stub_module("google.auth.transport")
+    transport_requests_mod = _stub_module(
+        "google.auth.transport.requests", Request=_FakeRequest
+    )
+    google_mod.auth = auth_mod
+    auth_mod.transport = transport_mod
+    transport_mod.requests = transport_requests_mod
+
 
 def _load_mcp_server():
     _install_stubs()
@@ -343,7 +382,187 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertIn(suffixed, out)
 
 
+class TestValidateInteractionId(unittest.TestCase):
+    """The Gemini interaction_id flows into the URL of an authenticated HTTP
+    call, so the validator is the boundary that prevents credential leakage to
+    an attacker-controlled host."""
+
+    def setUp(self):
+        self.validate = mcp_server._validate_interaction_id
+
+    def test_accepts_alphanumeric(self):
+        self.assertEqual(self.validate("abc123XYZ_-"), "abc123XYZ_-")
+
+    def test_rejects_path_traversal(self):
+        with self.assertRaises(ValueError):
+            self.validate("../../etc/passwd")
+
+    def test_rejects_slash(self):
+        with self.assertRaises(ValueError):
+            self.validate("abc/def")
+
+    def test_rejects_at_sign_host_swap(self):
+        # Classic URL trick: foo@evil.com would shift the host of a naive
+        # f-string URL construction.
+        with self.assertRaises(ValueError):
+            self.validate("abc@evil.com")
+
+    def test_rejects_empty(self):
+        with self.assertRaises(ValueError):
+            self.validate("")
+
+    def test_rejects_too_long(self):
+        with self.assertRaises(ValueError):
+            self.validate("a" * 129)
+
+    def test_rejects_non_string(self):
+        with self.assertRaises(ValueError):
+            self.validate(None)  # type: ignore[arg-type]
+
+    def test_rejects_whitespace(self):
+        with self.assertRaises(ValueError):
+            self.validate("abc def")
+
+
+class TestGeminiStartValidation(unittest.IsolatedAsyncioTestCase):
+    """Strict input validation at the gemini_deep_research_start boundary.
+
+    These checks defend against truthy-string traps (`bool("false") is True`),
+    arbitrary thinking_summaries values, and silent acceptance of an empty/
+    missing interaction id from the upstream response."""
+
+    async def _call(self, args, post_return):
+        async def _fake_post(payload):
+            self.last_payload = payload
+            return post_return
+
+        with mock.patch.object(mcp_server, "_post_gemini_interaction", _fake_post):
+            return await mcp_server.call_tool("gemini_deep_research_start", args)
+
+    async def test_collaborative_planning_string_rejected(self):
+        # `bool("false")` is True in Python — guard must catch this.
+        out = await self._call(
+            {"query": "x", "collaborative_planning": "false"},
+            {"id": "abc123"},
+        )
+        text = out[0].text
+        self.assertIn('"status": "failed"', text)
+        self.assertIn("collaborative_planning", text)
+
+    async def test_collaborative_planning_int_rejected(self):
+        out = await self._call(
+            {"query": "x", "collaborative_planning": 1},
+            {"id": "abc123"},
+        )
+        self.assertIn('"status": "failed"', out[0].text)
+
+    async def test_collaborative_planning_true_accepted(self):
+        out = await self._call(
+            {"query": "x", "collaborative_planning": True},
+            {"id": "abc123", "status": "in_progress"},
+        )
+        self.assertIn('"interaction_id": "abc123"', out[0].text)
+        self.assertTrue(self.last_payload["agent_config"]["collaborative_planning"])
+
+    async def test_thinking_summaries_invalid_value_rejected(self):
+        out = await self._call(
+            {"query": "x", "thinking_summaries": "verbose"},
+            {"id": "abc123"},
+        )
+        text = out[0].text
+        self.assertIn('"status": "failed"', text)
+        self.assertIn("thinking_summaries", text)
+
+    async def test_thinking_summaries_none_accepted(self):
+        out = await self._call(
+            {"query": "x", "thinking_summaries": "none"},
+            {"id": "abc123", "status": "in_progress"},
+        )
+        self.assertIn('"interaction_id": "abc123"', out[0].text)
+
+    async def test_missing_interaction_id_fails_loudly(self):
+        # Upstream returned no id → must raise RuntimeError so the MCP layer
+        # surfaces a tool error rather than handing back a poll id of `null`.
+        async def _fake_post(payload):
+            return {"status": "in_progress"}  # no id
+
+        with mock.patch.object(mcp_server, "_post_gemini_interaction", _fake_post):
+            with self.assertRaises(RuntimeError):
+                await mcp_server.call_tool("gemini_deep_research_start", {"query": "x"})
+
+    async def test_malformed_interaction_id_fails_loudly(self):
+        async def _fake_post(payload):
+            return {"id": "has/slash"}
+
+        with mock.patch.object(mcp_server, "_post_gemini_interaction", _fake_post):
+            with self.assertRaises(RuntimeError):
+                await mcp_server.call_tool("gemini_deep_research_start", {"query": "x"})
+
+    async def test_previous_interaction_id_validated_and_forwarded(self):
+        out = await self._call(
+            {"query": "x", "previous_interaction_id": "prev_abc-123"},
+            {"id": "abc123", "status": "in_progress"},
+        )
+        self.assertIn('"interaction_id": "abc123"', out[0].text)
+        self.assertEqual(self.last_payload["previous_interaction_id"], "prev_abc-123")
+
+    async def test_previous_interaction_id_invalid_rejected(self):
+        out = await self._call(
+            {"query": "x", "previous_interaction_id": "../etc/passwd"},
+            {"id": "abc123"},
+        )
+        self.assertIn('"status": "failed"', out[0].text)
+
+
+class TestGeminiResultTerminalStates(unittest.IsolatedAsyncioTestCase):
+    """The result handler must treat cancelled/failed/completed as terminal,
+    everything else as in-progress, and tolerate malformed step entries."""
+
+    async def _call(self, response):
+        async def _fake_get(interaction_id):
+            return response
+
+        with mock.patch.object(mcp_server, "_get_gemini_interaction", _fake_get):
+            out = await mcp_server.call_tool(
+                "gemini_deep_research_result", {"interaction_id": "abc123"}
+            )
+        return out[0].text
+
+    async def test_cancelled_is_terminal(self):
+        text = await self._call({"status": "cancelled"})
+        self.assertIn('"status": "cancelled"', text)
+        self.assertIn('"error"', text)
+        self.assertNotIn("Still running", text)
+
+    async def test_unknown_status_is_in_progress(self):
+        text = await self._call({"status": "queued"})
+        self.assertIn("Still running", text)
+
+    async def test_steps_summary_skips_non_dict_entries(self):
+        text = await self._call(
+            {
+                "status": "completed",
+                "output_text": "done",
+                "steps": [{"type": "search"}, "garbage", None, {"type": "synth"}],
+            }
+        )
+        # Non-dict entries are skipped; the two dict types remain.
+        self.assertIn('"search"', text)
+        self.assertIn('"synth"', text)
+        # steps_count includes ALL entries, not just dicts, so the upstream
+        # count is preserved for diagnostic accuracy.
+        self.assertIn('"steps_count": 4', text)
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestRedactSecrets)
+    loader = unittest.TestLoader()
+    suite = unittest.TestSuite(
+        [
+            loader.loadTestsFromTestCase(TestRedactSecrets),
+            loader.loadTestsFromTestCase(TestValidateInteractionId),
+            loader.loadTestsFromTestCase(TestGeminiStartValidation),
+            loader.loadTestsFromTestCase(TestGeminiResultTerminalStates),
+        ]
+    )
     sys.exit(0 if runner.run(suite).wasSuccessful() else 1)

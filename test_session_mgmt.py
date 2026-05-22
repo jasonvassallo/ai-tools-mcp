@@ -584,9 +584,7 @@ class TestToolRendering(_SessionMgmtBase):
         )
         sid = save["session_id"]
 
-        result = asyncio.run(
-            mcp_server.call_tool("load_session", {"session_id": sid})
-        )
+        result = asyncio.run(mcp_server.call_tool("load_session", {"session_id": sid}))
         text = result[0].text
 
         self.assertIn("### Metadata", text)
@@ -609,9 +607,7 @@ class TestToolRendering(_SessionMgmtBase):
         )
         sid = save["session_id"]
 
-        result = asyncio.run(
-            mcp_server.call_tool("load_session", {"session_id": sid})
-        )
+        result = asyncio.run(mcp_server.call_tool("load_session", {"session_id": sid}))
         text = result[0].text
 
         self.assertNotIn("### Metadata", text)
@@ -1006,9 +1002,7 @@ class TestLazyKeychainImport(unittest.TestCase):
         stubs = _build_stub_modules()
 
         def fake_run(*args, **kwargs):
-            raise FileNotFoundError(
-                "[Errno 2] No such file or directory: 'security'"
-            )
+            raise FileNotFoundError("[Errno 2] No such file or directory: 'security'")
 
         # Use a unique slot name so the import isn't served from a
         # cached entry left by ``_load_mcp_server`` at module-load
