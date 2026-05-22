@@ -9,7 +9,7 @@ The `ai-tools-mcp` server exposes two hosted research APIs alongside Claude's bu
 
 ## Decision Tree
 
-```
+```text
 Is the question a simple factual lookup ("when did X happen", "what is Y's price")?
   → Use built-in WebSearch. Don't burn paid tokens on this.
 

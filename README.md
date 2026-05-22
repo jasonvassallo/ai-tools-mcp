@@ -116,7 +116,7 @@ Bundles the MCP server with slash commands (`/ai-tools-mcp:deep-research <q>`, `
 Test locally — Claude Code loads the plugin directly from this directory:
 
 ```bash
-claude --plugin-dir /Users/jasonvassallo/Documents/Code/ai-tools-mcp
+claude --plugin-dir /path/to/ai-tools-mcp
 ```
 
 The plugin manifest lives at `.claude-plugin/plugin.json`. To make it permanently installable via `/plugin install`, publish through a marketplace (see [plugin-marketplaces](https://code.claude.com/docs/en/plugin-marketplaces)).
