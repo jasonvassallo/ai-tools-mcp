@@ -12,6 +12,7 @@ This repository contains a small MCP server for hosted AI APIs. It is not a loca
 
 - MCP server key: `ai-tools-mcp`
 - Tool names (research):
+  - `quick_research`
   - `deep_research`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
@@ -34,6 +35,9 @@ The same `mcp_server.py` is wrapped three ways. When making changes, update all 
 
 ## Provider Mapping
 
+- `quick_research`:
+  - Provider: Perplexity
+  - Model: `sonar`
 - `deep_research`:
   - Provider: Perplexity
   - Model: `sonar-pro`

@@ -1,7 +1,7 @@
 {
   "name": "ai-tools-mcp",
-  "description": "Hosted-API research and session-management MCP server. Exposes Perplexity Sonar Pro deep research, Google Gemini Deep Research (async, long-form), and local conversation-session persistence. Includes slash commands, routing skills, and a session-start preflight hook.",
-  "version": "1.0.0",
+  "description": "Hosted-API research and session-management MCP server. Exposes Perplexity Sonar (quick) and Sonar Pro (deep) research, Google Gemini Deep Research (async, long-form), and local conversation-session persistence. Includes slash commands, routing skills, and a session-start preflight hook.",
+  "version": "1.1.0",
   "author": {
     "name": "Jason Vassallo",
     "email": "jasonvassallo@mac.com"

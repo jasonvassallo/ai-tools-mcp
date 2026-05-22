@@ -12,9 +12,11 @@
 """
 MCP server providing three families of tools:
 
-- ``deep_research``: Perplexity Sonar Pro — fast inline multi-source
-  synthesis with citations. Use for comparisons, ambiguous queries,
-  and answers that span multiple sources.
+- ``quick_research`` / ``deep_research``: Perplexity Sonar / Sonar Pro
+  — inline research with citations. ``quick_research`` uses the smaller
+  Sonar model for fast, concise, well-scoped answers; ``deep_research``
+  uses Sonar Pro for multi-source synthesis when the question spans
+  sources or needs cross-referencing.
 - ``gemini_deep_research_start`` / ``_result``: Gemini Deep Research —
   long-running (minutes, up to 60), citation-dense reports via
   Google's hosted research agent. Asynchronous: ``_start`` returns an
@@ -851,6 +853,35 @@ async def list_tools() -> list[Tool]:
     """List available tools."""
     return [
         Tool(
+            name="quick_research",
+            description=(
+                "Quick research using Perplexity Sonar (the smaller, faster, "
+                "cheaper sibling of Sonar Pro). Returns a concise answer with "
+                "citations in a few seconds. Use when: the query is well-scoped "
+                "and a single-source answer with citations is enough, you've "
+                "already tried built-in WebSearch and need LLM synthesis on top, "
+                "or you want a citation-backed answer without paying for Sonar "
+                "Pro's deeper multi-source reasoning. For ambiguous queries, "
+                "cross-source comparisons, or architectural tradeoff "
+                "investigations, use `deep_research` (Sonar Pro) instead."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The research question or topic.",
+                    },
+                    "max_tokens": {
+                        "type": "integer",
+                        "description": "Maximum tokens for response (default: 1024)",
+                        "default": 1024,
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
             name="deep_research",
             description=(
                 "Deep research using Perplexity Sonar Pro with multi-source "
@@ -859,7 +890,10 @@ async def list_tools() -> list[Tool]:
                 "involves comparing tradeoffs/architectures/approaches, "
                 "the query is ambiguous and benefits from AI-powered search reasoning, "
                 "or you need comprehensive coverage with source citations. "
-                "Do NOT use for simple factual lookups (use built-in WebSearch for those)."
+                "Do NOT use for simple factual lookups (use built-in WebSearch for those). "
+                "For well-scoped single-source questions where a quick citation-backed "
+                "answer suffices, use `quick_research` (Sonar) instead — it is faster "
+                "and cheaper."
             ),
             inputSchema={
                 "type": "object",
@@ -1058,6 +1092,38 @@ async def list_tools() -> list[Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool calls."""
+
+    if name == "quick_research":
+        query = arguments.get("query")
+        max_tokens = arguments.get("max_tokens", 1024)
+
+        # Same lazy-client + redaction path as deep_research; only the
+        # model and system prompt differ. Sonar is smaller/faster than
+        # Sonar Pro — the system prompt asks for brevity to match the
+        # use case rather than coaxing the smaller model into mimicking
+        # Sonar Pro's depth.
+        response = _get_perplexity_client().chat.completions.create(
+            model="sonar",
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a concise research assistant. Answer the user's "
+                        "question directly, with citations. Prefer a single "
+                        "well-sourced answer over a survey of perspectives. "
+                        "Skip caveats unless they materially change the answer."
+                    ),
+                },
+                {"role": "user", "content": query},
+            ],
+            max_tokens=max_tokens,
+        )
+
+        message = response.choices[0].message
+        content = redact_secrets(message.content or "")
+        result = f"## Quick Research\n\n{content}"
+
+        return [TextContent(type="text", text=result)]
 
     if name == "deep_research":
         query = arguments.get("query")
