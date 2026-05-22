@@ -19,6 +19,13 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel any in-progress run on the same ref when a new commit lands.
+# Saves CI minutes on rapid push sequences (e.g., reviewer fix-ups) and
+# means each PR only ever has one current run reflected in its checks.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -31,12 +38,23 @@ jobs:
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      # SHA-pin third-party actions (defense against tag-hijacking attacks
+      # where a maintainer's tag is moved to point at malicious code).
+      # persist-credentials: false prevents the auto-checked-out GITHUB_TOKEN
+      # from sitting in .git/config across subsequent steps — we only need
+      # checkout for read, never for push, so leaving the token attached is
+      # gratuitous attack surface.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        # Pinned to a SHA (v5) and to a specific uv version for fully
+        # deterministic CI: failures must be attributable to repo changes,
+        # never to an upstream uv release that landed between two of our runs.
+        uses: astral-sh/setup-uv@e58605a9b6da7c637471fab8847a5e5a6b8df081  # v5
         with:
-          version: "latest"
+          version: "0.11.16"
 
       - name: Install Python
         run: uv python install ${{ matrix.python-version }}
