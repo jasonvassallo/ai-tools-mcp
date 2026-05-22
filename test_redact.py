@@ -54,14 +54,35 @@ def _stub_module(name: str, **attrs) -> types.ModuleType:
 
 
 def _install_stubs() -> None:
-    """Install minimal stand-ins for mcp.* and openai so importing
-    mcp_server does not require those packages or hit the Keychain."""
+    """Install minimal stand-ins for mcp.*, openai, httpx and google.auth.*
+    so importing mcp_server does not require those packages or hit the
+    Keychain. None of the stubbed code paths are exercised by the tests
+    themselves — the stubs only need to satisfy the module-level imports
+    in mcp_server.py."""
 
     class _FakeOpenAI:  # noqa: D401 - test stub
         def __init__(self, *a, **kw):
             pass
 
     _stub_module("openai", OpenAI=_FakeOpenAI)
+
+    # httpx is imported at module level for the Gemini Deep Research HTTP
+    # client (mcp_server.py L63). Tests never call the Gemini helpers
+    # directly — _post_gemini_interaction/_get_gemini_interaction are
+    # mock.patch.object'd in TestGeminiStartValidation and friends — so
+    # the fakes here just need to be classes with the right names.
+    class _FakeAsyncClient:  # noqa: D401 - test stub
+        def __init__(self, *a, **kw):
+            pass
+
+    class _FakeHTTPStatusError(Exception):  # noqa: D401 - test stub
+        pass
+
+    _stub_module(
+        "httpx",
+        AsyncClient=_FakeAsyncClient,
+        HTTPStatusError=_FakeHTTPStatusError,
+    )
 
     class _FakeServer:
         def __init__(self, name):

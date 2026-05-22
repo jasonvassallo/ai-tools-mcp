@@ -52,6 +52,17 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
         def __init__(self, *a, **kw):
             pass
 
+    # httpx is imported at module level by mcp_server.py for the Gemini
+    # Deep Research HTTP client. Tests don't exercise that code path
+    # (Gemini helpers are mock.patch.object'd in test_redact.py), but
+    # the bare `import httpx` still has to resolve.
+    class _FakeAsyncClient:
+        def __init__(self, *a, **kw):
+            pass
+
+    class _FakeHTTPStatusError(Exception):
+        pass
+
     class _FakeServer:
         def __init__(self, name):
             self.name = name
@@ -91,6 +102,11 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
         "mcp.server": _make("mcp.server", Server=_FakeServer),
         "mcp.server.stdio": _make("mcp.server.stdio", stdio_server=_fake_stdio_server),
         "mcp.types": _make("mcp.types", Tool=_Tool, TextContent=_TextContent),
+        "httpx": _make(
+            "httpx",
+            AsyncClient=_FakeAsyncClient,
+            HTTPStatusError=_FakeHTTPStatusError,
+        ),
     }
 
 
