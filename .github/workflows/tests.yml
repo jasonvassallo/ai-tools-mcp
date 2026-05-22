@@ -60,13 +60,13 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Run unit tests
-        # Test stubs in _install_stubs() cover openai, mcp.*, google.auth.* —
-        # but NOT httpx, which mcp_server.py imports at module level for the
-        # Gemini Deep Research HTTP client. We --with the un-stubbed deps so
-        # the `import httpx` line in mcp_server.py can resolve. requests is
-        # the transport library google.auth's Request class needs (also not
-        # stubbed; pulled in defensively).
-        run: uv run --with pytest --with 'httpx>=0.27' --with 'requests>=2.31' pytest test_redact.py test_session_mgmt.py -q
+        # Test stubs (_install_stubs in test_redact.py / _build_stub_modules
+        # in test_session_mgmt.py) cover every module-level import in
+        # mcp_server.py: openai, mcp.*, google.auth.*, and httpx. pytest is
+        # the only real dependency CI needs — no transitive httpx/requests
+        # install. Adding a new module-level import to mcp_server.py means
+        # extending the stubs, not patching this workflow.
+        run: uv run --with pytest pytest test_redact.py test_session_mgmt.py -q
 
       - name: Ruff format check
         run: uv tool run ruff format --check mcp_server.py test_redact.py test_session_mgmt.py
