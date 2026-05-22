@@ -45,44 +45,30 @@ FAKE_JWT = (
 )
 
 
-def _stub_module(name: str, **attrs) -> types.ModuleType:
-    mod = types.ModuleType(name)
-    for k, v in attrs.items():
-        setattr(mod, k, v)
-    sys.modules[name] = mod
-    return mod
+def _build_stub_modules() -> dict[str, types.ModuleType]:
+    """Return the dict of fake mcp/openai/httpx/google.auth modules used
+    during import. Caller is expected to scope these via
+    mock.patch.dict(sys.modules) rather than mutating sys.modules
+    directly (per PR #8 review, Gemini comment #3285598397: test stubs
+    must not leak into other tests' sys.modules entries — leakage masks
+    missing imports in sibling test files and makes results depend on
+    pytest's discovery order).
+    """
 
-
-def _install_stubs() -> None:
-    """Install minimal stand-ins for mcp.*, openai, httpx and google.auth.*
-    so importing mcp_server does not require those packages or hit the
-    Keychain. None of the stubbed code paths are exercised by the tests
-    themselves — the stubs only need to satisfy the module-level imports
-    in mcp_server.py."""
-
-    class _FakeOpenAI:  # noqa: D401 - test stub
+    class _FakeOpenAI:
         def __init__(self, *a, **kw):
             pass
 
-    _stub_module("openai", OpenAI=_FakeOpenAI)
-
-    # httpx is imported at module level for the Gemini Deep Research HTTP
-    # client (mcp_server.py L63). Tests never call the Gemini helpers
-    # directly — _post_gemini_interaction/_get_gemini_interaction are
-    # mock.patch.object'd in TestGeminiStartValidation and friends — so
+    # httpx is imported at module level by mcp_server.py for the Gemini
+    # Deep Research HTTP client. Tests never exercise the network path
+    # — TestGemini* uses mock.patch.object on the helper functions — so
     # the fakes here just need to be classes with the right names.
-    class _FakeAsyncClient:  # noqa: D401 - test stub
+    class _FakeAsyncClient:
         def __init__(self, *a, **kw):
             pass
 
-    class _FakeHTTPStatusError(Exception):  # noqa: D401 - test stub
+    class _FakeHTTPStatusError(Exception):
         pass
-
-    _stub_module(
-        "httpx",
-        AsyncClient=_FakeAsyncClient,
-        HTTPStatusError=_FakeHTTPStatusError,
-    )
 
     class _FakeServer:
         def __init__(self, name):
@@ -103,10 +89,6 @@ def _install_stubs() -> None:
     async def _fake_stdio_server():  # not actually awaited in tests
         yield None, None
 
-    _stub_module("mcp")
-    _stub_module("mcp.server", Server=_FakeServer)
-    _stub_module("mcp.server.stdio", stdio_server=_fake_stdio_server)
-
     class _Tool:
         def __init__(self, **kw):
             self.__dict__.update(kw)
@@ -115,58 +97,98 @@ def _install_stubs() -> None:
         def __init__(self, **kw):
             self.__dict__.update(kw)
 
-    _stub_module("mcp.types", Tool=_Tool, TextContent=_TextContent)
-
-    # Stub google.auth so module import doesn't touch real ADC. Tests don't
-    # exercise the auth path; they only need the import to succeed.
+    # Fakes for google.auth ADC plumbing. mcp_server.py imports
+    # `google.auth` and `google.auth.transport.requests` at module level
+    # and uses dotted access like `google.auth.default(...)` and
+    # `google.auth.exceptions.DefaultCredentialsError`. Tests never
+    # invoke the real ADC path.
     class _FakeCredentials:
         valid = True
         token = "fake-bearer-token-for-tests"
 
-        def refresh(self, request):  # noqa: D401 - test stub
+        def refresh(self, request):
             self.token = "fake-bearer-token-for-tests"
 
     def _fake_default(scopes=None):
         return _FakeCredentials(), "fake-test-project"
 
-    class _FakeAuthExceptions:
-        class DefaultCredentialsError(Exception):
-            pass
+    class _FakeDefaultCredentialsError(Exception):
+        pass
 
     class _FakeRequest:
         def __init__(self, *a, **kw):
             pass
 
-    # `_stub_module` only adds to sys.modules; for dotted-attribute access
-    # like `google.auth.exceptions.X` to work, each parent must also expose
-    # the child as an attribute.
-    google_mod = _stub_module("google")
-    auth_exceptions_mod = _stub_module(
+    def _make(name, **attrs):
+        mod = types.ModuleType(name)
+        for k, v in attrs.items():
+            setattr(mod, k, v)
+        return mod
+
+    # Build the google.auth chain with parent/child attribute wiring so
+    # dotted access like `google.auth.exceptions.X` resolves after an
+    # `import google.auth` statement.
+    google_mod = _make("google")
+    auth_exceptions_mod = _make(
         "google.auth.exceptions",
-        DefaultCredentialsError=_FakeAuthExceptions.DefaultCredentialsError,
+        DefaultCredentialsError=_FakeDefaultCredentialsError,
     )
-    auth_mod = _stub_module(
+    auth_mod = _make(
         "google.auth", default=_fake_default, exceptions=auth_exceptions_mod
     )
-    transport_mod = _stub_module("google.auth.transport")
-    transport_requests_mod = _stub_module(
+    transport_mod = _make("google.auth.transport")
+    transport_requests_mod = _make(
         "google.auth.transport.requests", Request=_FakeRequest
     )
     google_mod.auth = auth_mod
     auth_mod.transport = transport_mod
     transport_mod.requests = transport_requests_mod
 
+    return {
+        "openai": _make("openai", OpenAI=_FakeOpenAI),
+        "mcp": _make("mcp"),
+        "mcp.server": _make("mcp.server", Server=_FakeServer),
+        "mcp.server.stdio": _make("mcp.server.stdio", stdio_server=_fake_stdio_server),
+        "mcp.types": _make("mcp.types", Tool=_Tool, TextContent=_TextContent),
+        "httpx": _make(
+            "httpx",
+            AsyncClient=_FakeAsyncClient,
+            HTTPStatusError=_FakeHTTPStatusError,
+        ),
+        "google": google_mod,
+        "google.auth": auth_mod,
+        "google.auth.exceptions": auth_exceptions_mod,
+        "google.auth.transport": transport_mod,
+        "google.auth.transport.requests": transport_requests_mod,
+    }
+
 
 def _load_mcp_server():
-    _install_stubs()
+    """Import mcp_server.py with mcp.*/openai/httpx/google.auth stubbed
+    via a scoped sys.modules patch so the fakes don't leak into later
+    test imports."""
+    stubs = _build_stub_modules()
     fake_proc = types.SimpleNamespace(returncode=0, stdout="dummy-key\n")
-    with mock.patch("subprocess.run", return_value=fake_proc):
-        spec = importlib.util.spec_from_file_location(
-            "mcp_server_under_test", SERVER_PATH
-        )
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+    with mock.patch.dict(sys.modules, stubs):
+        with mock.patch("subprocess.run", return_value=fake_proc):
+            # DO NOT CONSOLIDATE this name with test_session_mgmt.py's.
+            # Today the loaded module is bound to a local variable and
+            # the spec name is not registered in sys.modules (manual
+            # exec_module + scoped patch.dict), so collisions would be
+            # harmless. But three plausible future changes would make
+            # them dangerous: (a) adopting the docs' canonical
+            # `sys.modules[spec.name] = module` pattern for circular-
+            # import support, (b) weakening or removing the patch.dict
+            # scope above, (c) switching to a loader that auto-registers.
+            # Unique per-file suffixes cost nothing, surface in tracebacks
+            # so you can tell which test loaded which copy, and pre-empt
+            # all three regressions. Keep them distinct.
+            spec = importlib.util.spec_from_file_location(
+                "mcp_server_under_test_redact", SERVER_PATH
+            )
+            assert spec is not None and spec.loader is not None
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
     return module
 
 

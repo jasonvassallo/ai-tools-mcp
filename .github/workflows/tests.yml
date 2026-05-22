@@ -60,12 +60,15 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
 
       - name: Run unit tests
-        # Test stubs (_install_stubs in test_redact.py / _build_stub_modules
-        # in test_session_mgmt.py) cover every module-level import in
-        # mcp_server.py: openai, mcp.*, google.auth.*, and httpx. pytest is
-        # the only real dependency CI needs — no transitive httpx/requests
-        # install. Adding a new module-level import to mcp_server.py means
-        # extending the stubs, not patching this workflow.
+        # Test stubs (_build_stub_modules in both test_redact.py and
+        # test_session_mgmt.py) cover every module-level import in
+        # mcp_server.py: openai, mcp.*, google.auth.*, and httpx. Each file
+        # scopes its stubs via mock.patch.dict(sys.modules, ...) so they
+        # don't leak across files — results are order-independent. pytest
+        # is the only real dependency CI needs — no transitive
+        # httpx/requests install. Adding a new module-level import to
+        # mcp_server.py means extending the stubs in BOTH files, not
+        # patching this workflow.
         run: uv run --with pytest pytest test_redact.py test_session_mgmt.py -q
 
       - name: Ruff format check

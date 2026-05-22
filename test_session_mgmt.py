@@ -41,11 +41,18 @@ FAKE_GOOG_API_KEY = _GOOG_API_KEY_PREFIX + "SyDsyntheticTestValue1234567890_-end
 
 
 def _build_stub_modules() -> dict[str, types.ModuleType]:
-    """Return the dict of fake mcp/openai modules used during import.
-    Caller is expected to scope these via mock.patch.dict(sys.modules)
-    rather than mutating sys.modules directly (per PR #4 review,
-    CodeRabbit Major: test stubs must not leak into other tests'
-    sys.modules entries — would break unittest discover ordering).
+    """Return the dict of fake mcp/openai/httpx/google.auth modules used
+    during import. Caller is expected to scope these via
+    mock.patch.dict(sys.modules) rather than mutating sys.modules
+    directly (per PR #4 review, CodeRabbit Major: test stubs must not
+    leak into other tests' sys.modules entries — would break unittest
+    discover ordering and mask missing imports in sibling test files).
+
+    google.auth.* fakes were added alongside the PR #8 test_redact.py
+    scoping refactor: alphabetical pytest collection was previously
+    running test_redact.py first, leaking its google.auth stubs into
+    sys.modules and satisfying this file's `import google.auth` by
+    accident. With the leak fixed, this file needs its own fakes.
     """
 
     class _FakeOpenAI:
@@ -90,11 +97,52 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
         def __init__(self, **kw):
             self.__dict__.update(kw)
 
+    # Fakes for google.auth ADC plumbing. mcp_server.py imports
+    # `google.auth` and `google.auth.transport.requests` at module level
+    # and uses dotted access like `google.auth.default(...)` and
+    # `google.auth.exceptions.DefaultCredentialsError`. Tests never
+    # invoke the real ADC path.
+    class _FakeCredentials:
+        valid = True
+        token = "fake-bearer-token-for-tests"
+
+        def refresh(self, request):
+            self.token = "fake-bearer-token-for-tests"
+
+    def _fake_default(scopes=None):
+        return _FakeCredentials(), "fake-test-project"
+
+    class _FakeDefaultCredentialsError(Exception):
+        pass
+
+    class _FakeRequest:
+        def __init__(self, *a, **kw):
+            pass
+
     def _make(name, **attrs):
         mod = types.ModuleType(name)
         for k, v in attrs.items():
             setattr(mod, k, v)
         return mod
+
+    # Build the google.auth chain with parent/child attribute wiring so
+    # dotted access like `google.auth.exceptions.X` resolves after an
+    # `import google.auth` statement.
+    google_mod = _make("google")
+    auth_exceptions_mod = _make(
+        "google.auth.exceptions",
+        DefaultCredentialsError=_FakeDefaultCredentialsError,
+    )
+    auth_mod = _make(
+        "google.auth", default=_fake_default, exceptions=auth_exceptions_mod
+    )
+    transport_mod = _make("google.auth.transport")
+    transport_requests_mod = _make(
+        "google.auth.transport.requests", Request=_FakeRequest
+    )
+    google_mod.auth = auth_mod
+    auth_mod.transport = transport_mod
+    transport_mod.requests = transport_requests_mod
 
     return {
         "openai": _make("openai", OpenAI=_FakeOpenAI),
@@ -107,6 +155,11 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             AsyncClient=_FakeAsyncClient,
             HTTPStatusError=_FakeHTTPStatusError,
         ),
+        "google": google_mod,
+        "google.auth": auth_mod,
+        "google.auth.exceptions": auth_exceptions_mod,
+        "google.auth.transport": transport_mod,
+        "google.auth.transport.requests": transport_requests_mod,
     }
 
 
@@ -117,6 +170,18 @@ def _load_mcp_server():
     fake_proc = types.SimpleNamespace(returncode=0, stdout="dummy-key\n")
     with mock.patch.dict(sys.modules, stubs):
         with mock.patch("subprocess.run", return_value=fake_proc):
+            # DO NOT CONSOLIDATE this name with test_redact.py's. Today
+            # the loaded module is bound to a local variable and the spec
+            # name is not registered in sys.modules (manual exec_module
+            # + scoped patch.dict), so collisions would be harmless. But
+            # three plausible future changes would make them dangerous:
+            # (a) adopting the docs' canonical
+            # `sys.modules[spec.name] = module` pattern for circular-
+            # import support, (b) weakening or removing the patch.dict
+            # scope above, (c) switching to a loader that auto-registers.
+            # Unique per-file suffixes cost nothing, surface in tracebacks
+            # so you can tell which test loaded which copy, and pre-empt
+            # all three regressions. Keep them distinct.
             spec = importlib.util.spec_from_file_location(
                 "mcp_server_under_test_session", SERVER_PATH
             )
