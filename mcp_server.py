@@ -171,15 +171,29 @@ GEMINI_MODELS = {
 # the API host, since the ADC bearer token is attached to every request.
 _INTERACTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
-_gemini_credentials, _gemini_billing_project = _load_adc()
+# ADC is loaded LAZILY on first Gemini tool call rather than at module import.
+# This means the MCP server can start (and the Perplexity-backed deep_research
+# tool can be used) even on a machine without gcloud ADC configured — only the
+# gemini_* tools will fail when invoked. Module-level eager-load was crashing
+# the entire server at startup if ADC was missing or slow to fetch.
+_gemini_credentials: Any = None
+_gemini_billing_project: str | None = None
 _gemini_token_lock = asyncio.Lock()
 
 
 async def _get_bearer_token() -> str:
-    """Return a fresh ADC bearer token, refreshing on a worker thread if
-    expired. The lock serializes concurrent refreshes from parallel tool calls.
+    """Return a fresh ADC bearer token, loading credentials on first call and
+    refreshing on a worker thread if expired. The lock serializes concurrent
+    init/refresh attempts from parallel tool calls.
     """
+    global _gemini_credentials, _gemini_billing_project
     async with _gemini_token_lock:
+        if _gemini_credentials is None:
+            # Defer the blocking ADC lookup to a worker thread — google.auth.default
+            # can do file I/O and (rarely) network calls under the hood.
+            _gemini_credentials, _gemini_billing_project = await asyncio.to_thread(
+                _load_adc
+            )
         if not _gemini_credentials.valid:
             await asyncio.to_thread(
                 _gemini_credentials.refresh,
@@ -192,8 +206,11 @@ async def _get_bearer_token() -> str:
 
 
 async def _gemini_headers() -> dict[str, str]:
+    # _get_bearer_token populates _gemini_billing_project as a side effect of
+    # first-time ADC load, so call it first to ensure the project is available.
+    token = await _get_bearer_token()
     return {
-        "Authorization": f"Bearer {await _get_bearer_token()}",
+        "Authorization": f"Bearer {token}",
         # Required when using OAuth (not API key) so the request is billed and
         # quota-attributed to the user's project rather than the credential's
         # home project.
