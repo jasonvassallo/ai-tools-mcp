@@ -1,0 +1,48 @@
+name: Tests
+
+# Runs unit tests on every push and PR.
+#
+# Security posture:
+# - Zero github.event.* interpolation (no command-injection vectors).
+# - Only matrix.python-version is templated — defined statically below.
+# - permissions: contents: read (least privilege).
+# - No secrets are referenced.
+#
+# Why Ubuntu (not macOS): test files (test_redact.py, test_session_mgmt.py)
+# stub out mcp, openai, google.auth, and Keychain via subprocess.run mocks,
+# so they're portable. mcp_server.py at runtime is macOS-targeted (Keychain
+# + fcntl with POSIX fallback), but the test suite is platform-agnostic.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+
+      - name: Install Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Run unit tests
+        run: uv run --with pytest pytest test_redact.py test_session_mgmt.py -q
+
+      - name: Ruff format check
+        run: uv tool run ruff format --check mcp_server.py test_redact.py test_session_mgmt.py
