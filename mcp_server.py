@@ -1132,7 +1132,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # or truncated response would raise IndexError on choices[0].
         choices = response.choices or []
         if not choices:
-            return [TextContent(type="text", text="Error: Perplexity returned no choices for quick_research")]
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: Perplexity returned no choices for quick_research",
+                )
+            ]
         message = choices[0].message
         content = redact_secrets(message.content or "")
         result = f"## Quick Research\n\n{content}"
@@ -1174,7 +1179,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # review, Gemini medium).
         choices = response.choices or []
         if not choices:
-            return [TextContent(type="text", text="Error: Perplexity returned no choices for deep_research")]
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: Perplexity returned no choices for deep_research",
+                )
+            ]
         message = choices[0].message
         # Redact secret-shape patterns from scraped web content before the
         # response leaves this server. Perplexity's synthesis can include raw
