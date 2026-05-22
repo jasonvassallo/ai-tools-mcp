@@ -171,6 +171,18 @@ def _load_mcp_server():
     fake_proc = types.SimpleNamespace(returncode=0, stdout="dummy-key\n")
     with mock.patch.dict(sys.modules, stubs):
         with mock.patch("subprocess.run", return_value=fake_proc):
+            # DO NOT CONSOLIDATE this name with test_session_mgmt.py's.
+            # Today the loaded module is bound to a local variable and
+            # the spec name is not registered in sys.modules (manual
+            # exec_module + scoped patch.dict), so collisions would be
+            # harmless. But three plausible future changes would make
+            # them dangerous: (a) adopting the docs' canonical
+            # `sys.modules[spec.name] = module` pattern for circular-
+            # import support, (b) weakening or removing the patch.dict
+            # scope above, (c) switching to a loader that auto-registers.
+            # Unique per-file suffixes cost nothing, surface in tracebacks
+            # so you can tell which test loaded which copy, and pre-empt
+            # all three regressions. Keep them distinct.
             spec = importlib.util.spec_from_file_location(
                 "mcp_server_under_test_redact", SERVER_PATH
             )
