@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "ai-tools-mcp",
   "display_name": "AI Tools MCP",
-  "version": "1.0.0",
-  "description": "Perplexity Sonar Pro deep research, Google Gemini Deep Research (async, long-form reports), and local conversation-session persistence — exposed as 8 MCP tools.",
-  "long_description": "Three families of tools: (1) deep_research uses Perplexity Sonar Pro for fast inline multi-source synthesis with citations. (2) gemini_deep_research_start/_result run long-form research tasks (5–60 minutes) on Google's Deep Research model and poll for results. (3) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
+  "version": "1.1.0",
+  "description": "Perplexity Sonar (quick) and Sonar Pro (deep) research, Google Gemini Deep Research (async, long-form reports), and local conversation-session persistence — exposed as 9 MCP tools.",
+  "long_description": "Three families of tools: (1) quick_research uses Perplexity Sonar for fast single-source citation-backed answers, and deep_research uses Sonar Pro for inline multi-source synthesis. (2) gemini_deep_research_start/_result run long-form research tasks (5–60 minutes) on Google's Deep Research model and poll for results. (3) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
   "author": {
     "name": "Jason Vassallo",
     "email": "jasonvassallo@mac.com"
@@ -33,6 +33,7 @@
     }
   },
   "tools": [
+    {"name": "quick_research", "description": "Perplexity Sonar — fast, concise, citation-backed answers for well-scoped questions (inline, a few seconds, cheaper than deep_research)."},
     {"name": "deep_research", "description": "Perplexity Sonar Pro deep research with multi-source synthesis and citations (inline, seconds)."},
     {"name": "gemini_deep_research_start", "description": "Start an asynchronous Google Gemini Deep Research task (returns interaction_id; poll with _result)."},
     {"name": "gemini_deep_research_result", "description": "Poll a Gemini Deep Research task by interaction_id (status, output_text when completed)."},

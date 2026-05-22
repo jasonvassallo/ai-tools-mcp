@@ -6,8 +6,8 @@ This repository is intentionally narrow in scope:
 
 - It is for hosted API-backed MCP tooling.
 - It is not a local-model repo.
-- It currently exposes eight tools across two families:
-  - Research: `deep_research`, `gemini_deep_research_start`, `gemini_deep_research_result`
+- It currently exposes nine tools across two families:
+  - Research: `quick_research` (Perplexity Sonar), `deep_research` (Perplexity Sonar Pro), `gemini_deep_research_start`, `gemini_deep_research_result`
   - Sessions: `list_sessions`, `save_session`, `load_session`, `update_session`, `delete_session`
 
 The same `mcp_server.py` is shipped three ways: standalone MCP server (installer registers it directly in `~/.claude/.mcp.json`), Claude Code plugin (`.claude-plugin/` + commands/skills/hooks), and Claude Desktop extension (`.mcpb` archive). Pick whichever fits your client.
@@ -18,6 +18,7 @@ The following identifiers are meant to stay stable unless intentionally changed:
 
 - MCP server key: `ai-tools-mcp`
 - Tool names (research):
+  - `quick_research`
   - `deep_research`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
@@ -30,13 +31,21 @@ The following identifiers are meant to stay stable unless intentionally changed:
 
 ## Provider Mapping
 
+### `quick_research`
+
+- Provider: Perplexity
+- Model: `sonar`
+- Purpose: fast, concise, citation-backed answers for well-scoped questions
+- Latency: a few seconds (synchronous)
+- Use when: a single-source answer with citations is enough; cheaper than `deep_research`
+
 ### `deep_research`
 
 - Provider: Perplexity
 - Model: `sonar-pro`
 - Purpose: deep research with multi-source synthesis, cross-referencing, and citations
 - Latency: seconds (synchronous)
-- Use when: the answer should come back inline in the current session
+- Use when: the answer should come back inline in the current session and spans multiple sources
 
 ### `gemini_deep_research_start` / `gemini_deep_research_result`
 
