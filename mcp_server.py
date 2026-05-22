@@ -1102,7 +1102,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Sonar Pro — the system prompt asks for brevity to match the
         # use case rather than coaxing the smaller model into mimicking
         # Sonar Pro's depth.
-        response = _get_perplexity_client().chat.completions.create(
+        #
+        # asyncio.to_thread wrapper: the openai client's chat.completions
+        # .create is a synchronous blocking call. Running it bare inside
+        # an async def would block the asyncio event loop for the duration
+        # of the request (seconds-to-tens-of-seconds for Sonar). Per
+        # PR #11 review, Gemini high: wrap in asyncio.to_thread so other
+        # coroutines can progress. Same fix applied to deep_research below.
+        response = await asyncio.to_thread(
+            _get_perplexity_client().chat.completions.create,
             model="sonar",
             messages=[
                 {
@@ -1119,7 +1127,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_tokens=max_tokens,
         )
 
-        message = response.choices[0].message
+        # Defensive: per PR #11 review, Gemini medium — response.choices
+        # *should* always be non-empty per the API contract but a malformed
+        # or truncated response would raise IndexError on choices[0].
+        choices = response.choices or []
+        if not choices:
+            return [TextContent(type="text", text="Error: Perplexity returned no choices for quick_research")]
+        message = choices[0].message
         content = redact_secrets(message.content or "")
         result = f"## Quick Research\n\n{content}"
 
@@ -1133,7 +1147,13 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # P2 L38, the keychain lookup is deferred to here so the module
         # imports cleanly on non-macOS even though the ``security`` CLI
         # is unavailable.
-        response = _get_perplexity_client().chat.completions.create(
+        #
+        # asyncio.to_thread wrapper: same rationale as quick_research above
+        # (per PR #11 review, Gemini high). Extending the fix to this
+        # pre-existing call site rather than leave the codebase in a
+        # half-fixed state where only the newer function is event-loop-safe.
+        response = await asyncio.to_thread(
+            _get_perplexity_client().chat.completions.create,
             model="sonar-pro",
             messages=[
                 {
@@ -1150,7 +1170,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_tokens=max_tokens,
         )
 
-        message = response.choices[0].message
+        # Defensive: same empty-choices guard as quick_research (per PR #11
+        # review, Gemini medium).
+        choices = response.choices or []
+        if not choices:
+            return [TextContent(type="text", text="Error: Perplexity returned no choices for deep_research")]
+        message = choices[0].message
         # Redact secret-shape patterns from scraped web content before the
         # response leaves this server. Perplexity's synthesis can include raw
         # API keys / JWTs / private-key blocks lifted from indexed pages.
