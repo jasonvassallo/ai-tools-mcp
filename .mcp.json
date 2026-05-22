@@ -1,0 +1,6 @@
+{
+  "ai-tools-mcp": {
+    "command": "uv",
+    "args": ["run", "${CLAUDE_PLUGIN_ROOT}/mcp_server.py"]
+  }
+}

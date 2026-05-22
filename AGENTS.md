@@ -11,12 +11,26 @@ This repository contains a small MCP server for hosted AI APIs. It is not a loca
 ## Stable Public Surface
 
 - MCP server key: `ai-tools-mcp`
-- Tool names:
+- Tool names (research):
   - `deep_research`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
+- Tool names (session management):
+  - `list_sessions`
+  - `save_session`
+  - `load_session`
+  - `update_session`
+  - `delete_session`
 
 Keep those tool names stable unless a change is explicitly requested.
+
+## Packaging Formats
+
+The same `mcp_server.py` is wrapped three ways. When making changes, update all three:
+
+- Standalone: `install.sh` registers it directly in `~/.claude/.mcp.json`
+- Claude Code plugin: `.claude-plugin/plugin.json` + `.mcp.json` + `commands/` + `skills/` + `hooks/`
+- Claude Desktop extension: `mcpb/manifest.json` (built into `dist/ai-tools-mcp.mcpb` by `scripts/build_mcpb.sh`)
 
 ## Provider Mapping
 

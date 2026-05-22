@@ -1,0 +1,52 @@
+{
+  "manifest_version": "0.3",
+  "name": "ai-tools-mcp",
+  "display_name": "AI Tools MCP",
+  "version": "1.0.0",
+  "description": "Perplexity Sonar Pro deep research, Google Gemini Deep Research (async, long-form reports), and local conversation-session persistence — exposed as 8 MCP tools.",
+  "long_description": "Three families of tools: (1) deep_research uses Perplexity Sonar Pro for fast inline multi-source synthesis with citations. (2) gemini_deep_research_start/_result run long-form research tasks (5–60 minutes) on Google's Deep Research model and poll for results. (3) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
+  "author": {
+    "name": "Jason Vassallo",
+    "email": "jasonvassallo@mac.com"
+  },
+  "homepage": "https://github.com/jasonvassallo/ai-tools-mcp",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jasonvassallo/ai-tools-mcp"
+  },
+  "keywords": ["research", "perplexity", "gemini", "deep-research", "sessions"],
+  "server": {
+    "type": "python",
+    "entry_point": "server/mcp_server.py",
+    "mcp_config": {
+      "command": "${user_config.uv_path}",
+      "args": ["run", "${__dirname}/server/mcp_server.py"]
+    }
+  },
+  "user_config": {
+    "uv_path": {
+      "type": "string",
+      "title": "Path to uv binary",
+      "description": "Absolute path to your uv binary (PEP 723 inline-deps runner). Find yours with `which uv` in Terminal. The default works for Homebrew installs on Apple Silicon.",
+      "default": "/opt/homebrew/bin/uv",
+      "required": true
+    }
+  },
+  "tools": [
+    {"name": "deep_research", "description": "Perplexity Sonar Pro deep research with multi-source synthesis and citations (inline, seconds)."},
+    {"name": "gemini_deep_research_start", "description": "Start an asynchronous Google Gemini Deep Research task (returns interaction_id; poll with _result)."},
+    {"name": "gemini_deep_research_result", "description": "Poll a Gemini Deep Research task by interaction_id (status, output_text when completed)."},
+    {"name": "list_sessions", "description": "List all saved conversation sessions, most recent first."},
+    {"name": "save_session", "description": "Persist the current conversation to ~/.claude/sessions/<uuid>.json with secret redaction."},
+    {"name": "load_session", "description": "Load a previously saved session by UUID."},
+    {"name": "update_session", "description": "Rename a saved session and bump its last_modified timestamp."},
+    {"name": "delete_session", "description": "Permanently delete a saved session by UUID."}
+  ],
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": ["darwin"],
+    "runtimes": {
+      "python": ">=3.12"
+    }
+  }
+}
