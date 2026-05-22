@@ -6,20 +6,27 @@ This repository is intentionally narrow in scope:
 
 - It is for hosted API-backed MCP tooling.
 - It is not a local-model repo.
-- It currently exposes three tools:
-  - `deep_research`
-  - `gemini_deep_research_start`
-  - `gemini_deep_research_result`
+- It currently exposes eight tools across two families:
+  - Research: `deep_research`, `gemini_deep_research_start`, `gemini_deep_research_result`
+  - Sessions: `list_sessions`, `save_session`, `load_session`, `update_session`, `delete_session`
+
+The same `mcp_server.py` is shipped three ways: standalone MCP server (installer registers it directly in `~/.claude/.mcp.json`), Claude Code plugin (`.claude-plugin/` + commands/skills/hooks), and Claude Desktop extension (`.mcpb` archive). Pick whichever fits your client.
 
 ## Stable Public Surface
 
 The following identifiers are meant to stay stable unless intentionally changed:
 
 - MCP server key: `ai-tools-mcp`
-- Tool names:
+- Tool names (research):
   - `deep_research`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
+- Tool names (sessions):
+  - `list_sessions`
+  - `save_session`
+  - `load_session`
+  - `update_session`
+  - `delete_session`
 
 ## Provider Mapping
 
@@ -58,15 +65,35 @@ There are no local model weights, no background service, and no embedded secrets
 
 ## Repository Layout
 
-- `mcp_server.py`: Self-contained MCP server with inline dependency metadata
+Source:
+- `mcp_server.py`: Self-contained MCP server with PEP 723 inline dependency metadata (single source of truth — both packaging formats wrap this same file)
+
+Standalone install:
 - `install.sh`: macOS installer (Keychain setup, Claude Code registration, preflight check)
 - `scripts/launch_ai_tools_mcp.sh`: Legacy launcher (virtualenv-based, for Claude Desktop)
 - `scripts/configure_claude_ai_tools_mcp.sh`: Claude Desktop registration helper
 - `scripts/uv_sync_projects.sh`: Separate local helper for syncing Python projects with `uv`
 
+Claude Code plugin (loaded via `claude --plugin-dir .`):
+- `.claude-plugin/plugin.json`: Plugin manifest (name, version, author)
+- `.mcp.json`: MCP server registration (points at `mcp_server.py` via `${CLAUDE_PLUGIN_ROOT}`)
+- `commands/`: Eight slash commands (`/ai-tools-mcp:deep-research`, `:gemini-start`, `:gemini-result`, `:sessions`, `:save-session`, `:load-session`, `:update-session`, `:delete-session`)
+- `skills/using-ai-research/`: When-to-use routing skill (WebSearch vs. Perplexity vs. Gemini)
+- `skills/session-workflows/`: Save/load/rename/delete patterns
+- `hooks/hooks.json` + `hooks/preflight.sh`: `SessionStart` hook that runs `--check` and surfaces credential health to Claude
+
+Claude Desktop extension (built into `dist/ai-tools-mcp.mcpb`):
+- `mcpb/manifest.json`: DXT/MCPB v0.3 manifest (server type, tool declarations, user_config)
+- `scripts/build_mcpb.sh`: Build script — copies `mcp_server.py` into `mcpb/server/` and zips
+- `dist/ai-tools-mcp.mcpb`: Build output (gitignored)
+
 ## Installation
 
-The recommended way to install is via the included installer:
+Three options, depending on your Claude client:
+
+### A. Standalone MCP server (Claude Code via `~/.claude/.mcp.json`)
+
+The original install path — runs the bare MCP server with no plugin wrapper.
 
 ```bash
 ./install.sh
@@ -81,6 +108,30 @@ This will:
 5. Run a preflight check to verify dependencies and configuration
 
 Safe to run multiple times — updates existing config without clobbering.
+
+### B. Claude Code plugin (commands + skills + hooks + MCP server)
+
+Bundles the MCP server with slash commands (`/ai-tools-mcp:deep-research <q>`, `/ai-tools-mcp:sessions`, etc.), routing skills (when to use Perplexity vs. Gemini vs. WebSearch, session-management workflows), and a `SessionStart` preflight hook that verifies Perplexity Keychain + ADC are healthy before your first query.
+
+Test locally — Claude Code loads the plugin directly from this directory:
+
+```bash
+claude --plugin-dir /path/to/ai-tools-mcp
+```
+
+The plugin manifest lives at `.claude-plugin/plugin.json`. To make it permanently installable via `/plugin install`, publish through a marketplace (see [plugin-marketplaces](https://code.claude.com/docs/en/plugin-marketplaces)).
+
+### C. Claude Desktop extension (.mcpb, drag-to-install)
+
+Build the single-file `.mcpb` archive:
+
+```bash
+./scripts/build_mcpb.sh
+```
+
+Then drag `dist/ai-tools-mcp.mcpb` into Claude Desktop → Settings → Extensions. The extension's user-config UI exposes the `uv_path` field (defaults to `/opt/homebrew/bin/uv` for Apple-Silicon Homebrew installs).
+
+First-run note: macOS may show a one-time Keychain access prompt when the server reads your Perplexity key — approve it.
 
 ## Requirements
 

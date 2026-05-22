@@ -15,3 +15,7 @@ zshrc_debug.txt
 *.key
 *.p12
 *.pfx
+# Built Desktop extension archives and the freshly-copied server
+# payload inside the build dir (refreshed on every build_mcpb.sh run).
+dist/
+mcpb/server/

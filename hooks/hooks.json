@@ -1,0 +1,16 @@
+{
+  "description": "ai-tools-mcp session-start preflight: verify Perplexity Keychain entry + Google ADC are healthy before the user issues their first research query.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/preflight.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
