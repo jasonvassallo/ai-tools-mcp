@@ -316,6 +316,136 @@ class TestValidateInteractionId(unittest.TestCase):
             self.validate("abc def")
 
 
+class TestGeminiStartValidation(unittest.IsolatedAsyncioTestCase):
+    """Strict input validation at the gemini_deep_research_start boundary.
+
+    These checks defend against truthy-string traps (`bool("false") is True`),
+    arbitrary thinking_summaries values, and silent acceptance of an empty/
+    missing interaction id from the upstream response."""
+
+    async def _call(self, args, post_return):
+        async def _fake_post(payload):
+            self.last_payload = payload
+            return post_return
+
+        with mock.patch.object(mcp_server, "_post_gemini_interaction", _fake_post):
+            return await mcp_server.call_tool("gemini_deep_research_start", args)
+
+    async def test_collaborative_planning_string_rejected(self):
+        # `bool("false")` is True in Python — guard must catch this.
+        out = await self._call(
+            {"query": "x", "collaborative_planning": "false"},
+            {"id": "abc123"},
+        )
+        text = out[0].text
+        self.assertIn('"status": "failed"', text)
+        self.assertIn("collaborative_planning", text)
+
+    async def test_collaborative_planning_int_rejected(self):
+        out = await self._call(
+            {"query": "x", "collaborative_planning": 1},
+            {"id": "abc123"},
+        )
+        self.assertIn('"status": "failed"', out[0].text)
+
+    async def test_collaborative_planning_true_accepted(self):
+        out = await self._call(
+            {"query": "x", "collaborative_planning": True},
+            {"id": "abc123", "status": "in_progress"},
+        )
+        self.assertIn('"interaction_id": "abc123"', out[0].text)
+        self.assertTrue(self.last_payload["agent_config"]["collaborative_planning"])
+
+    async def test_thinking_summaries_invalid_value_rejected(self):
+        out = await self._call(
+            {"query": "x", "thinking_summaries": "verbose"},
+            {"id": "abc123"},
+        )
+        text = out[0].text
+        self.assertIn('"status": "failed"', text)
+        self.assertIn("thinking_summaries", text)
+
+    async def test_thinking_summaries_none_accepted(self):
+        out = await self._call(
+            {"query": "x", "thinking_summaries": "none"},
+            {"id": "abc123", "status": "in_progress"},
+        )
+        self.assertIn('"interaction_id": "abc123"', out[0].text)
+
+    async def test_missing_interaction_id_fails_loudly(self):
+        # Upstream returned no id → must raise RuntimeError so the MCP layer
+        # surfaces a tool error rather than handing back a poll id of `null`.
+        async def _fake_post(payload):
+            return {"status": "in_progress"}  # no id
+
+        with mock.patch.object(mcp_server, "_post_gemini_interaction", _fake_post):
+            with self.assertRaises(RuntimeError):
+                await mcp_server.call_tool("gemini_deep_research_start", {"query": "x"})
+
+    async def test_malformed_interaction_id_fails_loudly(self):
+        async def _fake_post(payload):
+            return {"id": "has/slash"}
+
+        with mock.patch.object(mcp_server, "_post_gemini_interaction", _fake_post):
+            with self.assertRaises(RuntimeError):
+                await mcp_server.call_tool("gemini_deep_research_start", {"query": "x"})
+
+    async def test_previous_interaction_id_validated_and_forwarded(self):
+        out = await self._call(
+            {"query": "x", "previous_interaction_id": "prev_abc-123"},
+            {"id": "abc123", "status": "in_progress"},
+        )
+        self.assertIn('"interaction_id": "abc123"', out[0].text)
+        self.assertEqual(self.last_payload["previous_interaction_id"], "prev_abc-123")
+
+    async def test_previous_interaction_id_invalid_rejected(self):
+        out = await self._call(
+            {"query": "x", "previous_interaction_id": "../etc/passwd"},
+            {"id": "abc123"},
+        )
+        self.assertIn('"status": "failed"', out[0].text)
+
+
+class TestGeminiResultTerminalStates(unittest.IsolatedAsyncioTestCase):
+    """The result handler must treat cancelled/failed/completed as terminal,
+    everything else as in-progress, and tolerate malformed step entries."""
+
+    async def _call(self, response):
+        async def _fake_get(interaction_id):
+            return response
+
+        with mock.patch.object(mcp_server, "_get_gemini_interaction", _fake_get):
+            out = await mcp_server.call_tool(
+                "gemini_deep_research_result", {"interaction_id": "abc123"}
+            )
+        return out[0].text
+
+    async def test_cancelled_is_terminal(self):
+        text = await self._call({"status": "cancelled"})
+        self.assertIn('"status": "cancelled"', text)
+        self.assertIn('"error"', text)
+        self.assertNotIn("Still running", text)
+
+    async def test_unknown_status_is_in_progress(self):
+        text = await self._call({"status": "queued"})
+        self.assertIn("Still running", text)
+
+    async def test_steps_summary_skips_non_dict_entries(self):
+        text = await self._call(
+            {
+                "status": "completed",
+                "output_text": "done",
+                "steps": [{"type": "search"}, "garbage", None, {"type": "synth"}],
+            }
+        )
+        # Non-dict entries are skipped; the two dict types remain.
+        self.assertIn('"search"', text)
+        self.assertIn('"synth"', text)
+        # steps_count includes ALL entries, not just dicts, so the upstream
+        # count is preserved for diagnostic accuracy.
+        self.assertIn('"steps_count": 4', text)
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     loader = unittest.TestLoader()
@@ -323,6 +453,8 @@ if __name__ == "__main__":
         [
             loader.loadTestsFromTestCase(TestRedactSecrets),
             loader.loadTestsFromTestCase(TestValidateInteractionId),
+            loader.loadTestsFromTestCase(TestGeminiStartValidation),
+            loader.loadTestsFromTestCase(TestGeminiResultTerminalStates),
         ]
     )
     sys.exit(0 if runner.run(suite).wasSuccessful() else 1)

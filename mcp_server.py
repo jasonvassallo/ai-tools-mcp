@@ -180,6 +180,51 @@ _gemini_credentials: Any = None
 _gemini_billing_project: str | None = None
 _gemini_token_lock = asyncio.Lock()
 
+# Terminal states for a Gemini Deep Research interaction. Anything not in this
+# set is treated as still-in-progress so the client knows to keep polling.
+# Includes "cancelled" (user-cancelled or quota-cancelled) per Gemini API docs
+# alongside the obvious "completed"/"failed". Status strings are matched
+# case-insensitively at the comparison site.
+_GEMINI_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+
+# Module-level lazy singleton httpx.AsyncClient. Created on first Gemini call
+# and reused across all subsequent calls so we get connection pooling / keep-
+# alive against the Gemini API host. Initialized under a lock so a burst of
+# concurrent tool calls doesn't race on first use.
+_http_client: httpx.AsyncClient | None = None
+_http_client_lock = asyncio.Lock()
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Return the module-level shared httpx client, creating it on first use.
+
+    follow_redirects is disabled so the ADC bearer token cannot be forwarded
+    to another host via a redirect response.
+    """
+    global _http_client
+    if _http_client is None:
+        async with _http_client_lock:
+            if _http_client is None:
+                _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return _http_client
+
+
+def _http_error_payload(exc: httpx.HTTPStatusError) -> dict[str, Any]:
+    """Build a structured failure dict from an httpx HTTPStatusError.
+
+    Keeps a short body snippet (≤500 chars) so the caller has enough context to
+    diagnose without bloating the MCP response. Runs the snippet through
+    `redact_secrets` because Gemini error bodies have, on occasion, echoed
+    request headers or query content.
+    """
+    status_code = exc.response.status_code
+    try:
+        body = exc.response.text or ""
+    except Exception:  # noqa: BLE001 - never let body extraction shadow the real error
+        body = ""
+    snippet = redact_secrets(body[:500])
+    return {"status": "failed", "error": f"{status_code}: {snippet}"}
+
 
 async def _get_bearer_token() -> str:
     """Return a fresh ADC bearer token, loading credentials on first call and
@@ -239,11 +284,14 @@ def _validate_interaction_id(interaction_id: str) -> str:
 async def _post_gemini_interaction(payload: dict[str, Any]) -> dict[str, Any]:
     """POST a Deep Research interaction. URL is fully static; no tool input.
 
-    follow_redirects is disabled so the ADC bearer token cannot be forwarded
-    to another host via a redirect response.
+    On HTTP error, returns a structured ``{"status": "failed", "error": ...}``
+    dict instead of raising so the MCP client gets a graceful error envelope
+    rather than an opaque exception. The shared httpx client gives us
+    connection pooling across calls.
     """
     headers = await _gemini_headers()
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+    client = await _get_http_client()
+    try:
         response = await client.post(
             f"{GEMINI_API_BASE}/interactions",
             headers=headers,
@@ -251,6 +299,8 @@ async def _post_gemini_interaction(payload: dict[str, Any]) -> dict[str, Any]:
         )
         response.raise_for_status()
         return response.json()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc)
 
 
 async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
@@ -258,17 +308,21 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
 
     The interaction_id MUST have already passed _validate_interaction_id; this
     helper re-validates as defense in depth so the URL cannot escape the API
-    host even if a future caller forgets.
+    host even if a future caller forgets. Same structured-error contract as
+    `_post_gemini_interaction`.
     """
     safe_id = _validate_interaction_id(interaction_id)
     headers = await _gemini_headers()
-    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+    client = await _get_http_client()
+    try:
         response = await client.get(
             f"{GEMINI_API_BASE}/interactions/{safe_id}",
             headers=headers,
         )
         response.raise_for_status()
         return response.json()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc)
 
 
 # Create MCP server
@@ -343,6 +397,13 @@ async def list_tools() -> list[Tool]:
                         "default": "auto",
                         "description": "Whether the agent should emit thinking summaries.",
                     },
+                    "previous_interaction_id": {
+                        "type": "string",
+                        "description": (
+                            "Optional ID of a prior interaction to continue from. "
+                            "Must match ^[A-Za-z0-9_-]{1,128}$."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },
@@ -353,7 +414,7 @@ async def list_tools() -> list[Tool]:
                 "Retrieve the status or final result of a Gemini Deep Research "
                 "task started with gemini_deep_research_start. Returns "
                 "{status, output_text, steps_summary} when status='completed', "
-                "{status: 'failed', error} on failure, or "
+                "{status: 'failed'|'cancelled', error} on terminal non-success, or "
                 "{status: 'in_progress', hint} while running. Poll roughly "
                 "every 30 seconds."
             ),
@@ -406,54 +467,115 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=result)]
 
     if name == "gemini_deep_research_start":
-        query = arguments["query"]
-        mode = arguments.get("mode", "fast")
-        if mode not in GEMINI_MODELS:
-            raise ValueError(
-                f"mode must be one of {sorted(GEMINI_MODELS)}; got {mode!r}"
-            )
+        try:
+            query = arguments["query"]
+            mode = arguments.get("mode", "fast")
+            if mode not in GEMINI_MODELS:
+                raise ValueError(
+                    f"mode must be one of {sorted(GEMINI_MODELS)}; got {mode!r}"
+                )
 
-        payload = {
-            "agent": GEMINI_MODELS[mode],
-            "input": query,
-            "background": True,
-            "agent_config": {
-                "type": "deep-research",
-                "thinking_summaries": arguments.get("thinking_summaries", "auto"),
-                "collaborative_planning": bool(
-                    arguments.get("collaborative_planning", False)
+            # Strict bool check — `bool("false")` is True in Python, so a
+            # JSON-stringified flag would silently flip the meaning.
+            collaborative_planning = arguments.get("collaborative_planning", False)
+            if not isinstance(collaborative_planning, bool):
+                raise ValueError(
+                    "collaborative_planning must be a JSON boolean "
+                    "(true/false), not a string or number."
+                )
+
+            thinking_summaries = arguments.get("thinking_summaries", "auto")
+            if thinking_summaries not in {"auto", "none"}:
+                raise ValueError(
+                    "thinking_summaries must be 'auto' or 'none'; "
+                    f"got {thinking_summaries!r}."
+                )
+
+            payload: dict[str, Any] = {
+                "agent": GEMINI_MODELS[mode],
+                "input": query,
+                "background": True,
+                "agent_config": {
+                    "type": "deep-research",
+                    "thinking_summaries": thinking_summaries,
+                    "collaborative_planning": collaborative_planning,
+                },
+            }
+
+            # Optional continuation. Validate with the same allowlist used for
+            # interaction_id since it's also concatenated into the request body
+            # and (more importantly) used by the upstream API for routing.
+            previous_interaction_id = arguments.get("previous_interaction_id")
+            if previous_interaction_id is not None:
+                payload["previous_interaction_id"] = _validate_interaction_id(
+                    previous_interaction_id
+                )
+
+            data = await _post_gemini_interaction(payload)
+
+            # If the helper returned a structured failure, surface it directly
+            # — no point trying to extract an id from an error envelope.
+            if data.get("status") == "failed":
+                return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+            interaction_id = data.get("id")
+            if not isinstance(interaction_id, str) or not _INTERACTION_ID_RE.fullmatch(
+                interaction_id
+            ):
+                # Fail loudly: a null/malformed id breaks the poll contract
+                # since the result tool can't be called without a valid id.
+                raise RuntimeError(
+                    "Gemini start response did not include a valid interaction id; "
+                    f"got {interaction_id!r}."
+                )
+
+            result = {
+                "interaction_id": interaction_id,
+                "status": data.get("status", "in_progress"),
+                "model": GEMINI_MODELS[mode],
+                "hint": (
+                    "Poll gemini_deep_research_result with this interaction_id. "
+                    "Tasks take several minutes; up to 60 minutes max."
                 ),
-            },
-        }
-
-        data = await _post_gemini_interaction(payload)
-
-        result = {
-            "interaction_id": data.get("id"),
-            "status": data.get("status", "in_progress"),
-            "model": GEMINI_MODELS[mode],
-            "hint": (
-                "Poll gemini_deep_research_result with this interaction_id. "
-                "Tasks take several minutes; up to 60 minutes max."
-            ),
-        }
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        except ValueError as exc:
+            err = {"status": "failed", "error": str(exc)}
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
 
     if name == "gemini_deep_research_result":
-        safe_id = _validate_interaction_id(arguments["interaction_id"])
+        try:
+            safe_id = _validate_interaction_id(arguments["interaction_id"])
+        except ValueError as exc:
+            err = {"status": "failed", "error": str(exc)}
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
         data = await _get_gemini_interaction(safe_id)
         status = data.get("status", "unknown")
         result: dict[str, Any] = {"status": status}
 
-        if status == "completed":
+        # Normalize for terminal-status comparison; the API has used mixed case
+        # historically (e.g. "Completed") — be liberal in what we accept.
+        normalized_status = status.lower() if isinstance(status, str) else "unknown"
+
+        if normalized_status == "completed":
             # Route all model-emitted text through the redactor — Deep Research
             # can lift API keys, JWTs, and private-key blocks from the open web.
             result["output_text"] = redact_secrets(data.get("output_text", ""))
             steps = data.get("steps") or []
             result["steps_count"] = len(steps)
-            result["steps_summary"] = [s.get("type") for s in steps]
-        elif status == "failed":
-            result["error"] = redact_secrets(data.get("error", "unknown error"))
+            # Some upstream payloads have included non-dict step entries (raw
+            # strings, nulls) — guard so a single malformed step doesn't crash
+            # the entire result handler.
+            result["steps_summary"] = [
+                s.get("type") for s in steps if isinstance(s, dict)
+            ]
+        elif normalized_status in _GEMINI_TERMINAL_STATUSES:
+            # "failed", "cancelled", and any future terminal status. Use
+            # whatever error/message field the upstream provided.
+            result["error"] = redact_secrets(
+                data.get("error") or data.get("message") or f"task {normalized_status}"
+            )
         else:
             result["hint"] = "Still running. Poll again in ~30 seconds."
 
