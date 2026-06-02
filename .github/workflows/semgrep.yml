@@ -1,0 +1,32 @@
+name: Semgrep
+
+# Token-connected Semgrep scan via GitHub Actions. Uses SEMGREP_APP_TOKEN
+# (stored as a repo secret, sourced from macOS Keychain) so the scan runs your
+# full configured rulesets and reports findings to your Semgrep dashboard from
+# CI. This is the single source of Semgrep truth for this repo — there is no
+# separate dashboard-managed Project (fully migrated to CI).
+#
+# Diff-aware on PRs (scans only changed files), full scan on default-branch push.
+
+on:
+  pull_request: {}
+  workflow_dispatch: {}
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  semgrep:
+    name: semgrep/ci
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    # Skip dependabot PRs (they can't access secrets / Actions context cleanly).
+    if: (github.actor != 'dependabot[bot]')
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep ci
+        env:
+          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
