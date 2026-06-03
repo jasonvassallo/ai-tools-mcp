@@ -41,6 +41,7 @@ jobs:
         uses: google-github-actions/run-gemini-cli@v0.1.22
         env:
           GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}'   # so the gh CLI is authenticated
           GEMINI_CLI_TRUST_WORKSPACE: 'true'   # headless CI: trust the checked-out workspace
           ISSUE_TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
           ISSUE_BODY: '${{ github.event.pull_request.body || github.event.issue.body }}'
@@ -62,9 +63,13 @@ jobs:
           # Explicit PR number so issue_comment triggers (which GitHub treats as
           # issues) still target the right pull request.
           github_pr_number: '${{ github.event.pull_request.number || github.event.issue.number }}'
+          # run-gemini-cli denies run_shell_command by policy, so review via the
+          # GitHub MCP server (the supported path). Expose its full toolset (no
+          # includeTools allowlist) so the model can read the PR and post a review;
+          # a too-narrow allowlist previously caused tool-not-found loops.
           settings: |-
             {
-              "model": { "maxSessionTurns": 25 },
+              "model": { "maxSessionTurns": 50 },
               "mcpServers": {
                 "github": {
                   "command": "docker",
@@ -73,26 +78,15 @@ jobs:
                     "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
                     "ghcr.io/github/github-mcp-server:v0.27.0"
                   ],
-                  "includeTools": [
-                    "add_comment_to_pending_review",
-                    "pull_request_read",
-                    "pull_request_review_write"
-                  ],
                   "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}" }
                 }
-              },
-              "tools": {
-                "core": [
-                  "run_shell_command(cat)",
-                  "run_shell_command(echo)",
-                  "run_shell_command(grep)",
-                  "run_shell_command(head)",
-                  "run_shell_command(tail)"
-                ]
               }
             }
-          extensions: |
-            [
-              "https://github.com/gemini-cli-extensions/code-review"
-            ]
-          prompt: '/pr-code-review'
+          prompt: |
+            You are a senior engineer reviewing pull request #${{ github.event.pull_request.number || github.event.issue.number }} in ${{ github.repository }}.
+
+            Use the available GitHub tools to read the pull request — its changed files / diff and its description. If GEMINI.md or CLAUDE.md are in the diff or readable, use them for conventions.
+
+            Review for correctness/bugs, security, performance, error handling, and test coverage.
+
+            Then post exactly ONE review as a PR comment using the GitHub pull-request comment/review tool. Lead with a one-line summary, then bullet the findings (most important first) with file:line. Skip purely stylistic nits; if nothing material, say so briefly.
