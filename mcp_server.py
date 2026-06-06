@@ -811,7 +811,12 @@ async def _post_gemini_interaction(payload: dict[str, Any]) -> dict[str, Any]:
     headers = await _gemini_headers()
     client = await _get_http_client()
     try:
-        response = await client.post(
+        # Auth is server-sourced (ADC bearer token via _gemini_headers), never a
+        # caller-supplied credential. The request host is the hardcoded HTTPS
+        # constant GEMINI_API_BASE and no tool parameter is interpolated into the
+        # URL, so the credential cannot be redirected to an attacker host. The
+        # mcp-auth-passthrough-taint rule cannot see that the host is static.
+        response = await client.post(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
             f"{GEMINI_API_BASE}/interactions",
             headers=headers,
             json=payload,
@@ -834,7 +839,13 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
     headers = await _gemini_headers()
     client = await _get_http_client()
     try:
-        response = await client.get(
+        # Auth is server-sourced (ADC bearer token via _gemini_headers). The only
+        # caller-influenced URL segment, safe_id, has passed _validate_interaction_id
+        # (^[A-Za-z0-9_-]{1,128}$) — re-validated here as defense in depth — so it
+        # cannot contain '/', '.', ':', a scheme, or a host. The credential cannot
+        # be redirected off GEMINI_API_BASE. The taint rule does not recognize the
+        # regex allowlist as a sanitizer.
+        response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
             f"{GEMINI_API_BASE}/interactions/{safe_id}",
             headers=headers,
         )
