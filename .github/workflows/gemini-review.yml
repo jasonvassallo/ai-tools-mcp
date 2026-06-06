@@ -49,6 +49,8 @@ jobs:
           REPOSITORY: '${{ github.repository }}'
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
         with:
+          # Pin model: run-gemini-cli default gemini-3-flash 404s on Vertex (not entitled).
+          gemini_model: "${{ vars.GEMINI_MODEL || 'gemini-flash-latest' }}"
           # --- Auth: prefers Vertex AI (your GCP project, no free-tier limits) via
           # Workload Identity Federation when these repo vars are set; otherwise
           # falls back to the GEMINI_API_KEY secret. Set via repo Variables:
