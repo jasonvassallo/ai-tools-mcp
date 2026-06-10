@@ -16,6 +16,7 @@ synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 import types
@@ -60,14 +61,19 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             pass
 
     # httpx is imported at module level by mcp_server.py for the Gemini
-    # Deep Research HTTP client. Tests never exercise the network path
-    # — TestGemini* uses mock.patch.object on the helper functions — so
-    # the fakes here just need to be classes with the right names.
+    # Deep Research HTTP client. Tests never exercise the network path —
+    # the TestGemini* tool-boundary tests mock.patch.object the helper
+    # functions, and the Test*GeminiInteractionHelper unit tests inject a
+    # fake client — so the fakes here just need to be Exception
+    # subclasses with the right names for the helpers' except clauses.
     class _FakeAsyncClient:
         def __init__(self, *a, **kw):
             pass
 
     class _FakeHTTPStatusError(Exception):
+        pass
+
+    class _FakeRequestError(Exception):
         pass
 
     class _FakeServer:
@@ -154,6 +160,7 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             "httpx",
             AsyncClient=_FakeAsyncClient,
             HTTPStatusError=_FakeHTTPStatusError,
+            RequestError=_FakeRequestError,
         ),
         "google": google_mod,
         "google.auth": auth_mod,
@@ -597,6 +604,144 @@ class TestGeminiResultTerminalStates(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"steps_count": 4', text)
 
 
+class TestPostGeminiInteractionHelper(unittest.TestCase):
+    """Unit tests for the POST HTTP helper itself (client mocked, no network).
+
+    Mirrors TestPostAgentResearchHelper in test_agent_research.py: network-
+    layer failures (httpx.RequestError) and JSON decode failures (ValueError
+    from response.json()) must return the structured
+    ``{"status": "failed", "error": ...}`` envelope — the same treatment the
+    Perplexity Agent API helpers got in PR #16 — instead of crashing the
+    MCP tool call. Credential/ADC errors stay outside the try block and
+    must keep propagating.
+    """
+
+    def _run_helper(self, fake_client):
+        async def fake_get_client():
+            return fake_client
+
+        async def fake_headers():
+            return {"Authorization": "Bearer test-token"}
+
+        with mock.patch.object(mcp_server, "_gemini_headers", side_effect=fake_headers):
+            with mock.patch.object(
+                mcp_server, "_get_http_client", side_effect=fake_get_client
+            ):
+                return asyncio.run(
+                    mcp_server._post_gemini_interaction({"input": "query"})
+                )
+
+    def test_http_error_becomes_failure_envelope(self):
+        class _FakeErrorResponse:
+            status_code = 500
+            text = "internal error"
+
+            def raise_for_status(self):
+                exc = mcp_server.httpx.HTTPStatusError("500")
+                exc.response = self
+                raise exc
+
+            def json(self):  # pragma: no cover - raise_for_status fires first
+                return {}
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                return _FakeErrorResponse()
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("500", data["error"])
+
+    def test_request_error_becomes_failure_envelope(self):
+        # Connect errors and read timeouts must return the structured
+        # envelope, not crash the tool call.
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                raise mcp_server.httpx.RequestError("connection refused")
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("connection refused", data["error"])
+
+    def test_invalid_json_becomes_failure_envelope(self):
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                return _FakeResponse()
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("JSON", data["error"])
+
+    def test_credential_errors_propagate(self):
+        # ADC/credential failures happen in _gemini_headers, outside the
+        # try block — they must raise, not be swallowed into an envelope.
+        async def failing_headers():
+            raise RuntimeError("ADC credentials unavailable")
+
+        with mock.patch.object(
+            mcp_server, "_gemini_headers", side_effect=failing_headers
+        ):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(mcp_server._post_gemini_interaction({"input": "query"}))
+
+
+class TestGetGeminiInteractionHelper(unittest.TestCase):
+    """Unit tests for the GET (poll) HTTP helper — same envelope contract
+    as TestPostGeminiInteractionHelper, mirroring TestGetAgentResponseHelper
+    in test_agent_research.py."""
+
+    def _run_helper(self, fake_client, interaction_id="abc123"):
+        async def fake_get_client():
+            return fake_client
+
+        async def fake_headers():
+            return {"Authorization": "Bearer test-token"}
+
+        with mock.patch.object(mcp_server, "_gemini_headers", side_effect=fake_headers):
+            with mock.patch.object(
+                mcp_server, "_get_http_client", side_effect=fake_get_client
+            ):
+                return asyncio.run(mcp_server._get_gemini_interaction(interaction_id))
+
+    def test_helper_revalidates_id_as_defense_in_depth(self):
+        # The validation ValueError is raised before the try block — it
+        # must propagate, never be misread as a JSON decode failure.
+        with self.assertRaises(ValueError):
+            asyncio.run(mcp_server._get_gemini_interaction("abc/../evil"))
+
+    def test_request_error_becomes_failure_envelope(self):
+        class _FakeClient:
+            async def get(self, url, **kwargs):
+                raise mcp_server.httpx.RequestError("read timeout")
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("read timeout", data["error"])
+
+    def test_invalid_json_becomes_failure_envelope(self):
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        class _FakeClient:
+            async def get(self, url, **kwargs):
+                return _FakeResponse()
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("JSON", data["error"])
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     loader = unittest.TestLoader()
@@ -606,6 +751,8 @@ if __name__ == "__main__":
             loader.loadTestsFromTestCase(TestValidateInteractionId),
             loader.loadTestsFromTestCase(TestGeminiStartValidation),
             loader.loadTestsFromTestCase(TestGeminiResultTerminalStates),
+            loader.loadTestsFromTestCase(TestPostGeminiInteractionHelper),
+            loader.loadTestsFromTestCase(TestGetGeminiInteractionHelper),
         ]
     )
     sys.exit(0 if runner.run(suite).wasSuccessful() else 1)

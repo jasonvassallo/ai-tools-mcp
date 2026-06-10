@@ -810,10 +810,11 @@ def _validate_interaction_id(interaction_id: str) -> str:
 async def _post_gemini_interaction(payload: dict[str, Any]) -> dict[str, Any]:
     """POST a Deep Research interaction. URL is fully static; no tool input.
 
-    On HTTP error, returns a structured ``{"status": "failed", "error": ...}``
-    dict instead of raising so the MCP client gets a graceful error envelope
-    rather than an opaque exception. The shared httpx client gives us
-    connection pooling across calls.
+    On HTTP, network, or JSON-decode error, returns a structured
+    ``{"status": "failed", "error": ...}`` dict instead of raising so the
+    MCP client gets a graceful error envelope rather than an opaque
+    exception. The shared httpx client gives us connection pooling across
+    calls.
     """
     headers = await _gemini_headers()
     client = await _get_http_client()
@@ -832,6 +833,21 @@ async def _post_gemini_interaction(payload: dict[str, Any]) -> dict[str, Any]:
         return response.json()
     except httpx.HTTPStatusError as exc:
         return _http_error_payload(exc)
+    except httpx.RequestError as exc:
+        # Connect errors and read timeouts must keep the structured-envelope
+        # contract instead of crashing the tool call — same treatment the
+        # Agent API helpers got in PR #16 review (Qodo bug #2 / CodeRabbit
+        # major). ADC/credential errors deliberately propagate: the
+        # _gemini_headers() lookup sits outside this try block.
+        return {"status": "failed", "error": f"request error: {exc}"}
+    except ValueError as exc:
+        # response.json() on a non-JSON 200 body (json.JSONDecodeError is a
+        # ValueError subclass). Only the json parse can raise ValueError
+        # inside this try block.
+        return {
+            "status": "failed",
+            "error": f"invalid JSON from Deep Research API: {exc}",
+        }
 
 
 async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
@@ -860,6 +876,18 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
         return response.json()
     except httpx.HTTPStatusError as exc:
         return _http_error_payload(exc)
+    except httpx.RequestError as exc:
+        # Same structured-envelope contract as _post_gemini_interaction.
+        # The validation ValueError from _validate_interaction_id and any
+        # ADC/credential error are raised before this try block and cannot
+        # be swallowed below.
+        return {"status": "failed", "error": f"request error: {exc}"}
+    except ValueError as exc:
+        # response.json() decode failure only — see above.
+        return {
+            "status": "failed",
+            "error": f"invalid JSON from Deep Research API: {exc}",
+        }
 
 
 # --- Perplexity Agent API (Search-as-Code) -------------------------------
