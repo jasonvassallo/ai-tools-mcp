@@ -17,11 +17,13 @@ MCP server providing four families of tools:
   Sonar model for fast, concise, well-scoped answers; ``deep_research``
   uses Sonar Pro for multi-source synthesis when the question spans
   sources or needs cross-referencing.
-- ``agent_research``: Perplexity Agent API with the ``sandbox`` tool
-  ("Search as Code") — the upstream agent writes and runs code in a
-  Perplexity-hosted container, searching programmatically from inside
-  that code. For bulk/enumerable research, computation over search
-  results, and structured datasets; synchronous, minutes-scale.
+- ``agent_research`` / ``agent_research_result``: Perplexity Agent API
+  with the ``sandbox`` tool ("Search as Code") — the upstream agent
+  writes and runs code in a Perplexity-hosted container, searching
+  programmatically from inside that code. For bulk/enumerable research,
+  computation over search results, and structured datasets. Runs take
+  minutes; call synchronously or pass ``background=true`` and poll
+  ``agent_research_result`` by response_id.
 - ``gemini_deep_research_start`` / ``_result``: Gemini Deep Research —
   long-running (minutes, up to 60), citation-dense reports via
   Google's hosted research agent. Asynchronous: ``_start`` returns an
@@ -938,6 +940,134 @@ async def _post_agent_research(payload: dict[str, Any]) -> dict[str, Any]:
         return _http_error_payload(exc)
 
 
+# Same allowlist shape as _INTERACTION_ID_RE and for the same reason: the
+# response id is interpolated into the URL of an authenticated GET, so a
+# value containing '/', '..', or a scheme could redirect the Perplexity
+# key to an unintended host. Live ids look like
+# "resp_79b0f91b-e4c6-44e9-86cf-8ab09e9c88d0" — well within the pattern.
+_AGENT_RESPONSE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _validate_agent_response_id(response_id: str) -> str:
+    """Reject response IDs that could redirect the authenticated request."""
+    if not isinstance(response_id, str) or not _AGENT_RESPONSE_ID_RE.fullmatch(
+        response_id
+    ):
+        raise ValueError(
+            "response_id must match ^[A-Za-z0-9_-]{1,128}$ — refusing to "
+            "send authenticated request with untrusted path segment."
+        )
+    return response_id
+
+
+async def _get_agent_response(response_id: str) -> dict[str, Any]:
+    """GET an Agent API response by ID (poll for background runs).
+
+    The response_id MUST have already passed _validate_agent_response_id;
+    this helper re-validates as defense in depth so the URL cannot escape
+    the API host even if a future caller forgets. Same structured-error
+    contract as `_post_agent_research`.
+    """
+    safe_id = _validate_agent_response_id(response_id)
+    api_key = await asyncio.to_thread(
+        get_api_key_from_keychain, "api_tokens", "perplexity"
+    )
+    client = await _get_http_client()
+    try:
+        # Auth is server-sourced (Keychain). The only caller-influenced URL
+        # segment, safe_id, has passed _validate_agent_response_id
+        # (^[A-Za-z0-9_-]{1,128}$) — re-validated here as defense in depth —
+        # so it cannot contain '/', '.', ':', a scheme, or a host. The taint
+        # rule does not recognize the regex allowlist as a sanitizer.
+        response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+            f"{_AGENT_RESEARCH_URL}/{safe_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc)
+
+
+def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
+    """Format a completed Agent API response as the agent_research result.
+
+    Shared by the synchronous agent_research path and the
+    agent_research_result poll tool so both render identically.
+
+    Response shape (verified against a live request on 2026-06-09):
+    output[] mixes `sandbox_results` items (code, per-command results with
+    exit_code/stdout/stderr) and `message` items (content[] of output_text).
+    usage.cost carries an itemized USD breakdown.
+    """
+    output_items = data.get("output") or []
+    answer_parts: list[str] = []
+    sandbox_runs = 0
+    failed_execs: list[str] = []
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for chunk in item.get("content") or []:
+                if (
+                    isinstance(chunk, dict)
+                    and chunk.get("type") == "output_text"
+                    and chunk.get("text")
+                ):
+                    answer_parts.append(chunk["text"])
+        elif item.get("type") == "sandbox_results":
+            sandbox_runs += 1
+            for exec_result in item.get("results") or []:
+                if not isinstance(exec_result, dict):
+                    continue
+                exit_code = exec_result.get("exit_code")
+                if exit_code not in (0, None):
+                    stderr = str(exec_result.get("stderr") or "")
+                    snippet = stderr[:_SANDBOX_STDERR_SNIPPET_LEN]
+                    if len(stderr) > _SANDBOX_STDERR_SNIPPET_LEN:
+                        snippet += "…"
+                    failed_execs.append(f"exit_code={exit_code} — {snippet}")
+
+    if not answer_parts:
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "Error: Agent API returned no assistant message for agent_research"
+                ),
+            )
+        ]
+
+    # Redact secret-shape patterns: the answer synthesizes scraped web
+    # content, and failed-execution stderr is sandbox output over that
+    # same untrusted content.
+    answer = redact_secrets("\n\n".join(answer_parts))
+
+    usage = data.get("usage") or {}
+    cost = usage.get("cost") or {}
+    total_cost = cost.get("total_cost")
+    currency = cost.get("currency", "USD")
+    meta_bits = [
+        f"model: {data.get('model', 'unknown')}",
+        f"sandbox executions: {sandbox_runs}",
+    ]
+    if total_cost is not None:
+        meta_bits.append(f"cost: {total_cost} {currency}")
+
+    lines = ["## Agent Research (Search-as-Code)", ""]
+    status = data.get("status", "unknown")
+    if status != "completed":
+        # e.g. "incomplete" when max_output_tokens truncated the run —
+        # surface it so the caller knows coverage may be partial.
+        lines.extend([f"> ⚠️ upstream status: {status}", ""])
+    lines.extend([answer, "", "---", f"*{' · '.join(meta_bits)}*"])
+    if failed_execs:
+        lines.extend(["", "### Sandbox execution warnings", ""])
+        lines.extend(f"- {redact_secrets(detail)}" for detail in failed_execs)
+
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
 # Create MCP server
 server = Server("ai-tools-mcp")
 
@@ -1016,10 +1146,12 @@ async def list_tools() -> list[Tool]:
                 "a structured dataset — code loops cover every item where chat "
                 "synthesis samples a few and generalizes. For a single research "
                 "question use `deep_research` instead (faster, cheaper); for "
-                "quick lookups use `quick_research`. Synchronous: expect runs of "
-                "one to several minutes. Costs include a per-container fee plus "
-                "per-search charges, so per-request cost is higher and less "
-                "predictable than deep_research."
+                "quick lookups use `quick_research`. Runs take one to several "
+                "minutes: call synchronously (default) to wait inline, or pass "
+                "background=true to get a response_id immediately and poll "
+                "`agent_research_result`. Costs include a per-container fee "
+                "plus per-search charges, so per-request cost is higher and "
+                "less predictable than deep_research."
             ),
             inputSchema={
                 "type": "object",
@@ -1051,8 +1183,42 @@ async def list_tools() -> list[Tool]:
                             f"{_AGENT_MAX_OUTPUT_TOKENS_DEFAULT})"
                         ),
                     },
+                    "background": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Run in the background: returns a response_id "
+                            "immediately; poll agent_research_result for the "
+                            "answer. Use for large fan-outs that would "
+                            "otherwise block the session for minutes."
+                        ),
+                    },
                 },
                 "required": ["query"],
+            },
+        ),
+        Tool(
+            name="agent_research_result",
+            description=(
+                "Poll a background agent_research task by response_id. Returns "
+                "the formatted answer when the task completes, a poll-again "
+                "hint while it is queued or in progress, and a structured "
+                "error if the task failed or was cancelled. Poll roughly every "
+                "30 seconds — sandbox runs typically take one to several "
+                "minutes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "response_id": {
+                        "type": "string",
+                        "description": (
+                            "The response_id returned by agent_research with "
+                            "background=true."
+                        ),
+                    },
+                },
+                "required": ["response_id"],
             },
         ),
         Tool(
@@ -1374,6 +1540,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     f"[{_AGENT_MAX_OUTPUT_TOKENS_MIN}, "
                     f"{_AGENT_MAX_OUTPUT_TOKENS_MAX}]; got {max_output_tokens!r}."
                 )
+
+            # Strict bool check — `bool("false")` is True in Python, so a
+            # JSON-stringified flag would silently flip the meaning (same
+            # contract as collaborative_planning on gemini_deep_research_start).
+            background = arguments.get("background", False)
+            if not isinstance(background, bool):
+                raise ValueError(
+                    "background must be a JSON boolean (true/false), "
+                    "not a string or number."
+                )
         except ValueError as exc:
             err = {"status": "failed", "error": str(exc)}
             return [TextContent(type="text", text=json.dumps(err, indent=2))]
@@ -1385,81 +1561,74 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "max_output_tokens": max_output_tokens,
             "instructions": _AGENT_RESEARCH_INSTRUCTIONS,
         }
+        if background:
+            payload["background"] = True
+
         data = await _post_agent_research(payload)
         if data.get("status") == "failed":
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
-        # Response shape (verified against a live request on 2026-06-09):
-        # output[] mixes `sandbox_results` items (code, per-command results
-        # with exit_code/stdout/stderr) and `message` items (content[] of
-        # output_text). usage.cost carries an itemized USD breakdown.
-        output_items = data.get("output") or []
-        answer_parts: list[str] = []
-        sandbox_runs = 0
-        failed_execs: list[str] = []
-        for item in output_items:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "message":
-                for chunk in item.get("content") or []:
-                    if (
-                        isinstance(chunk, dict)
-                        and chunk.get("type") == "output_text"
-                        and chunk.get("text")
-                    ):
-                        answer_parts.append(chunk["text"])
-            elif item.get("type") == "sandbox_results":
-                sandbox_runs += 1
-                for exec_result in item.get("results") or []:
-                    if not isinstance(exec_result, dict):
-                        continue
-                    exit_code = exec_result.get("exit_code")
-                    if exit_code not in (0, None):
-                        stderr = str(exec_result.get("stderr") or "")
-                        snippet = stderr[:_SANDBOX_STDERR_SNIPPET_LEN]
-                        if len(stderr) > _SANDBOX_STDERR_SNIPPET_LEN:
-                            snippet += "…"
-                        failed_execs.append(f"exit_code={exit_code} — {snippet}")
-
-        if not answer_parts:
-            return [
-                TextContent(
-                    type="text",
-                    text=(
-                        "Error: Agent API returned no assistant message for "
-                        "agent_research"
-                    ),
+        if background:
+            response_id = data.get("id")
+            if not isinstance(response_id, str) or not _AGENT_RESPONSE_ID_RE.fullmatch(
+                response_id
+            ):
+                # Fail loudly: a null/malformed id breaks the poll contract
+                # since the result tool can't be called without a valid id.
+                raise RuntimeError(
+                    "Agent API background start did not include a valid "
+                    f"response id; got {response_id!r}."
                 )
-            ]
+            result = {
+                "response_id": response_id,
+                "status": data.get("status", "queued"),
+                "model": model,
+                "hint": (
+                    "Poll agent_research_result with this response_id. "
+                    "Sandbox runs typically take one to several minutes."
+                ),
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
-        # Redact secret-shape patterns: the answer synthesizes scraped web
-        # content, and failed-execution stderr is sandbox output over that
-        # same untrusted content.
-        answer = redact_secrets("\n\n".join(answer_parts))
+        return _render_agent_research(data)
 
-        usage = data.get("usage") or {}
-        cost = usage.get("cost") or {}
-        total_cost = cost.get("total_cost")
-        currency = cost.get("currency", "USD")
-        meta_bits = [
-            f"model: {data.get('model', model)}",
-            f"sandbox executions: {sandbox_runs}",
-        ]
-        if total_cost is not None:
-            meta_bits.append(f"cost: {total_cost} {currency}")
+    if name == "agent_research_result":
+        try:
+            safe_id = _validate_agent_response_id(arguments.get("response_id"))
+        except ValueError as exc:
+            err = {"status": "failed", "error": str(exc)}
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
 
-        lines = ["## Agent Research (Search-as-Code)", ""]
+        data = await _get_agent_response(safe_id)
+        if data.get("status") == "failed" and "output" not in data:
+            # Either the HTTP-failure envelope from the helper or an
+            # upstream terminal failure with no output to render.
+            err = {
+                "status": "failed",
+                "error": redact_secrets(str(data.get("error") or "agent task failed")),
+            }
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
         status = data.get("status", "unknown")
-        if status != "completed":
-            # e.g. "incomplete" when max_output_tokens truncated the run —
-            # surface it so the caller knows coverage may be partial.
-            lines.extend([f"> ⚠️ upstream status: {status}", ""])
-        lines.extend([answer, "", "---", f"*{' · '.join(meta_bits)}*"])
-        if failed_execs:
-            lines.extend(["", "### Sandbox execution warnings", ""])
-            lines.extend(f"- {redact_secrets(detail)}" for detail in failed_execs)
+        if status in ("queued", "in_progress"):
+            result = {
+                "status": status,
+                "hint": "Still running. Poll again in ~30 seconds.",
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
-        return [TextContent(type="text", text="\n".join(lines))]
+        if status in ("cancelled", "failed"):
+            err = {
+                "status": "failed",
+                "error": redact_secrets(
+                    str(data.get("error") or f"agent task {status}")
+                ),
+            }
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+        # "completed", and "incomplete" with partial output — the renderer
+        # flags any non-completed status inline.
+        return _render_agent_research(data)
 
     if name == "gemini_deep_research_start":
         try:

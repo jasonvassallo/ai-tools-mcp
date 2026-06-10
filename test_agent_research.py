@@ -432,6 +432,167 @@ class TestAgentResearchFailures(unittest.TestCase):
         self.assertIn("no assistant message", result[0].text)
 
 
+class TestAgentResearchBackgroundStart(unittest.TestCase):
+    def test_background_true_returns_response_id_envelope(self):
+        queued = {
+            "id": "resp_abc-123",
+            "status": "queued",
+            "model": "anthropic/claude-sonnet-4-6",
+        }
+        with mock.patch.object(
+            mcp_server, "_post_agent_research", return_value=queued
+        ) as post:
+            result = _call("agent_research", {"query": "q", "background": True})
+        payload = post.call_args.args[0]
+        self.assertIs(payload["background"], True)
+        env = json.loads(result[0].text)
+        self.assertEqual(env["response_id"], "resp_abc-123")
+        self.assertEqual(env["status"], "queued")
+        self.assertIn("agent_research_result", env["hint"])
+
+    def test_background_must_be_json_boolean(self):
+        # `bool("false")` is True in Python — a JSON-stringified flag must
+        # be rejected, not silently coerced (same contract as the
+        # collaborative_planning flag on gemini_deep_research_start).
+        with mock.patch.object(mcp_server, "_post_agent_research") as post:
+            result = _call("agent_research", {"query": "q", "background": "true"})
+        post.assert_not_called()
+        payload = json.loads(result[0].text)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("background", payload["error"])
+
+    def test_background_false_behaves_synchronously(self):
+        with mock.patch.object(
+            mcp_server, "_post_agent_research", return_value=_sample_response()
+        ) as post:
+            result = _call("agent_research", {"query": "q", "background": False})
+        self.assertNotIn("background", post.call_args.args[0])
+        self.assertIn("28", result[0].text)
+
+    def test_http_failure_on_start_is_surfaced(self):
+        failure = {"status": "failed", "error": "429: rate limited"}
+        with mock.patch.object(
+            mcp_server, "_post_agent_research", return_value=failure
+        ):
+            result = _call("agent_research", {"query": "q", "background": True})
+        payload = json.loads(result[0].text)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("429", payload["error"])
+
+    def test_malformed_response_id_fails_loudly(self):
+        # A null/malformed id breaks the poll contract — fail loudly rather
+        # than hand the caller an envelope they can never poll (mirrors the
+        # gemini_deep_research_start contract).
+        queued = {"id": "resp/../evil", "status": "queued"}
+        with mock.patch.object(mcp_server, "_post_agent_research", return_value=queued):
+            with self.assertRaises(RuntimeError):
+                _call("agent_research", {"query": "q", "background": True})
+
+
+class TestAgentResearchResult(unittest.TestCase):
+    def test_tool_is_listed_with_response_id_required(self):
+        tools = asyncio.run(mcp_server.list_tools())
+        by_name = {t.name: t for t in tools}
+        self.assertIn("agent_research_result", by_name)
+        self.assertEqual(
+            by_name["agent_research_result"].inputSchema["required"],
+            ["response_id"],
+        )
+
+    def test_invalid_response_id_fails_without_network(self):
+        with mock.patch.object(mcp_server, "_get_agent_response") as get:
+            result = _call(
+                "agent_research_result", {"response_id": "resp/../../etc/passwd"}
+            )
+        get.assert_not_called()
+        payload = json.loads(result[0].text)
+        self.assertEqual(payload["status"], "failed")
+
+    def test_missing_response_id_fails_without_network(self):
+        with mock.patch.object(mcp_server, "_get_agent_response") as get:
+            result = _call("agent_research_result", {})
+        get.assert_not_called()
+        self.assertEqual(json.loads(result[0].text)["status"], "failed")
+
+    def test_in_progress_returns_poll_hint(self):
+        for pending_status in ("queued", "in_progress"):
+            with self.subTest(status=pending_status):
+                data = {"id": "resp_abc", "status": pending_status}
+                with mock.patch.object(
+                    mcp_server, "_get_agent_response", return_value=data
+                ):
+                    result = _call("agent_research_result", {"response_id": "resp_abc"})
+                payload = json.loads(result[0].text)
+                self.assertEqual(payload["status"], pending_status)
+                self.assertIn("Poll", payload["hint"])
+
+    def test_completed_returns_formatted_answer(self):
+        with mock.patch.object(
+            mcp_server, "_get_agent_response", return_value=_sample_response()
+        ):
+            result = _call("agent_research_result", {"response_id": "resp_abc"})
+        text = result[0].text
+        self.assertIn("28", text)
+        self.assertIn("0.00149", text)
+        self.assertIn("sandbox executions: 1", text)
+
+    def test_terminal_failure_status_is_surfaced(self):
+        data = {"id": "resp_abc", "status": "cancelled", "error": "user cancelled"}
+        with mock.patch.object(mcp_server, "_get_agent_response", return_value=data):
+            result = _call("agent_research_result", {"response_id": "resp_abc"})
+        payload = json.loads(result[0].text)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("cancelled", payload["error"])
+
+    def test_http_failure_envelope_is_surfaced(self):
+        failure = {"status": "failed", "error": "404: not found"}
+        with mock.patch.object(mcp_server, "_get_agent_response", return_value=failure):
+            result = _call("agent_research_result", {"response_id": "resp_abc"})
+        payload = json.loads(result[0].text)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("404", payload["error"])
+
+
+class TestGetAgentResponseHelper(unittest.TestCase):
+    def test_gets_response_by_id_with_bearer(self):
+        captured: dict = {}
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"ok": 1}
+
+        class _FakeClient:
+            async def get(self, url, **kwargs):
+                captured["url"] = url
+                captured["kwargs"] = kwargs
+                return _FakeResponse()
+
+        async def fake_get_client():
+            return _FakeClient()
+
+        with mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", return_value="test-key"
+        ):
+            with mock.patch.object(
+                mcp_server, "_get_http_client", side_effect=fake_get_client
+            ):
+                data = asyncio.run(mcp_server._get_agent_response("resp_abc-123"))
+        self.assertEqual(data, {"ok": 1})
+        self.assertEqual(
+            captured["url"], "https://api.perplexity.ai/v1/responses/resp_abc-123"
+        )
+        self.assertEqual(
+            captured["kwargs"]["headers"]["Authorization"], "Bearer test-key"
+        )
+
+    def test_helper_revalidates_id_as_defense_in_depth(self):
+        with self.assertRaises(ValueError):
+            asyncio.run(mcp_server._get_agent_response("resp/../evil"))
+
+
 class TestPostAgentResearchHelper(unittest.TestCase):
     """Unit tests for the HTTP helper itself (client mocked, no network)."""
 

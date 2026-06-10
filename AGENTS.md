@@ -16,6 +16,7 @@ This repository contains a small MCP server for hosted AI APIs. It is not a loca
   - `quick_research`
   - `deep_research`
   - `agent_research`
+  - `agent_research_result`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
 - Tool names (session management):
@@ -43,10 +44,10 @@ The same `mcp_server.py` is wrapped three ways. When making changes, update all 
 - `deep_research`:
   - Provider: Perplexity
   - Model: `sonar-pro`
-- `agent_research`:
+- `agent_research` / `agent_research_result`:
   - Provider: Perplexity Agent API (`/v1/responses`) with the `sandbox` tool
-  - Models: `anthropic/claude-sonnet-4-6` (default) or `perplexity/sonar` — server-side allowlist
-  - Synchronous; runs take one to several minutes; billed per-model tokens + per-container fee + per-search charges.
+  - Models: `anthropic/claude-sonnet-4-6` (default) or `perplexity/sonar` — server-side allowlist (the Agent API does not offer `sonar-pro`)
+  - Synchronous by default (runs take one to several minutes), or `background=true` returns a `response_id` to poll via `agent_research_result`; billed per-model tokens + per-container fee + per-search charges.
 - `gemini_deep_research_start` / `gemini_deep_research_result`:
   - Provider: Google Gemini Deep Research (`/v1beta/interactions`)
   - Models: `deep-research-preview-04-2026` (fast), `deep-research-max-preview-04-2026` (max)

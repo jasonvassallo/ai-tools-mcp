@@ -26,7 +26,9 @@ Is the task bulk/enumerable — "for each of these N CVEs/packages/vendors,
   structured dataset (CSV/JSON-shaped answer)?
   → Use agent_research (Perplexity Agent API, Search-as-Code). A hosted
     sandbox agent writes code that searches per item, so every item gets
-    resolved instead of a sampled few. Synchronous, takes minutes.
+    resolved instead of a sampled few. Takes minutes: call synchronously
+    for small fan-outs, or pass background=true and poll
+    agent_research_result (~every 30s) for large ones.
 
 Is the report itself the deliverable — a multi-page citation-dense document
   the user will read or share, not just background for the conversation?
