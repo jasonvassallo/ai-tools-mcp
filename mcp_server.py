@@ -962,8 +962,12 @@ async def _post_agent_research(payload: dict[str, Any]) -> dict[str, Any]:
 _AGENT_RESPONSE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
-def _validate_agent_response_id(response_id: str) -> str:
+def _validate_agent_response_id(response_id: str | None) -> str:
     """Reject response IDs that could redirect the authenticated request."""
+    if response_id is None:
+        # Distinct message for the common caller mistake — the regex
+        # contract below would be confusing for a simply-missing argument.
+        raise ValueError("response_id is required.")
     if not isinstance(response_id, str) or not _AGENT_RESPONSE_ID_RE.fullmatch(
         response_id
     ):
@@ -993,6 +997,9 @@ async def _get_agent_response(response_id: str) -> dict[str, Any]:
         # (^[A-Za-z0-9_-]{1,128}$) — re-validated here as defense in depth —
         # so it cannot contain '/', '.', ':', a scheme, or a host. The taint
         # rule does not recognize the regex allowlist as a sanitizer.
+        # No explicit timeout (unlike the POST helper's 600s): this GET is
+        # a status poll that returns immediately whatever the run's state,
+        # so the shared client's 30s default is correct here.
         response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
             f"{_AGENT_RESEARCH_URL}/{safe_id}",
             headers={"Authorization": f"Bearer {api_key}"},
@@ -1031,10 +1038,14 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
             continue
         if item.get("type") == "message":
             for chunk in item.get("content") or []:
+                # isinstance(str) guard, not just truthiness: the response
+                # is untrusted input, and a non-string `text` would crash
+                # the "\n\n".join below (per PR #16 review, Qodo bug #3).
                 if (
                     isinstance(chunk, dict)
                     and chunk.get("type") == "output_text"
-                    and chunk.get("text")
+                    and isinstance(chunk.get("text"), str)
+                    and chunk["text"]
                 ):
                     answer_parts.append(chunk["text"])
         elif item.get("type") == "sandbox_results":
@@ -1069,8 +1080,10 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
     cost = usage.get("cost") or {}
     total_cost = cost.get("total_cost")
     currency = cost.get("currency", "USD")
+    # `model` and `status` are API-emitted strings rendered verbatim —
+    # redact like every other response field (per PR #16 review).
     meta_bits = [
-        f"model: {data.get('model', 'unknown')}",
+        f"model: {redact_secrets(str(data.get('model', 'unknown')))}",
         f"sandbox executions: {sandbox_runs}",
     ]
     if total_cost is not None:
@@ -1081,7 +1094,7 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
     if status != "completed":
         # e.g. "incomplete" when max_output_tokens truncated the run —
         # surface it so the caller knows coverage may be partial.
-        lines.extend([f"> ⚠️ upstream status: {status}", ""])
+        lines.extend([f"> ⚠️ upstream status: {redact_secrets(str(status))}", ""])
     lines.extend([answer, "", "---", f"*{' · '.join(meta_bits)}*"])
     if failed_execs:
         lines.extend(["", "### Sandbox execution warnings", ""])
@@ -1640,6 +1653,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
         if status in ("cancelled", "failed"):
+            # Also catches a terminal "failed" that arrived WITH an output
+            # key and therefore fell through the no-output guard above —
+            # the two checks together cover both upstream failure shapes.
             err = {
                 "status": "failed",
                 "error": redact_secrets(

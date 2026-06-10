@@ -353,6 +353,55 @@ class TestAgentResearchSuccess(unittest.TestCase):
         self.assertNotIn(FAKE_JWT, text)
         self.assertIn("[REDACTED_JWT]", text)
 
+    def test_non_string_output_text_is_skipped_not_crashed(self):
+        # The Agent API response is untrusted input — a truthy non-string
+        # `text` (e.g. a dict) must be skipped, not crash the join (per
+        # PR #16 review, Qodo bug #3).
+        output = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {"type": "output_text", "text": {"malformed": "dict"}},
+                    {"type": "output_text", "text": "real answer"},
+                ],
+            },
+        ]
+        with mock.patch.object(
+            mcp_server,
+            "_post_agent_research",
+            return_value=_sample_response(output=output),
+        ):
+            result = _call("agent_research", {"query": "q"})
+        self.assertIn("real answer", result[0].text)
+        self.assertNotIn("malformed", result[0].text)
+
+    def test_model_and_status_from_response_are_redacted(self):
+        # `model` and `status` are API-emitted strings rendered into the
+        # output — route them through the redactor like everything else
+        # (per PR #16 review, Claude bot).
+        response = _sample_response(status=f"weird-{FAKE_JWT}")
+        response["model"] = f"perplexity/{FAKE_JWT}"
+        with mock.patch.object(
+            mcp_server, "_post_agent_research", return_value=response
+        ):
+            result = _call("agent_research", {"query": "q"})
+        text = result[0].text
+        self.assertNotIn(FAKE_JWT, text)
+        self.assertIn("[REDACTED_JWT]", text)
+
+    def test_missing_cost_block_omits_cost_line(self):
+        response = _sample_response()
+        response["usage"] = {}
+        with mock.patch.object(
+            mcp_server, "_post_agent_research", return_value=response
+        ):
+            result = _call("agent_research", {"query": "q"})
+        text = result[0].text
+        self.assertNotIn("cost:", text)
+        self.assertIn("sandbox executions: 1", text)
+
     def test_multiple_message_items_are_joined(self):
         output = [
             {
@@ -516,7 +565,11 @@ class TestAgentResearchResult(unittest.TestCase):
         with mock.patch.object(mcp_server, "_get_agent_response") as get:
             result = _call("agent_research_result", {})
         get.assert_not_called()
-        self.assertEqual(json.loads(result[0].text)["status"], "failed")
+        payload = json.loads(result[0].text)
+        self.assertEqual(payload["status"], "failed")
+        # A missing id should say "required", not dump the regex contract
+        # (per PR #16 review, Claude bot).
+        self.assertIn("required", payload["error"])
 
     def test_in_progress_returns_poll_hint(self):
         for pending_status in ("queued", "in_progress"):
