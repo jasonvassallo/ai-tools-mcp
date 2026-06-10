@@ -663,6 +663,21 @@ class TestPostGeminiInteractionHelper(unittest.TestCase):
         self.assertEqual(data["status"], "failed")
         self.assertIn("connection refused", data["error"])
 
+    def test_request_error_message_is_redacted(self):
+        # Exception text is untrusted and must pass through redact_secrets
+        # before reaching the envelope — same "never emit secret-shapes"
+        # contract as _http_error_payload (per Qodo review on PR #17).
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                raise mcp_server.httpx.RequestError(
+                    f"proxy rejected key {FAKE_GOOG_API_KEY}"
+                )
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", data["error"])
+        self.assertNotIn(_GOOG_API_KEY_PREFIX + "Sy", data["error"])
+
     def test_invalid_json_becomes_failure_envelope(self):
         class _FakeResponse:
             def raise_for_status(self):
@@ -724,6 +739,20 @@ class TestGetGeminiInteractionHelper(unittest.TestCase):
         data = self._run_helper(_FakeClient())
         self.assertEqual(data["status"], "failed")
         self.assertIn("read timeout", data["error"])
+
+    def test_request_error_message_is_redacted(self):
+        # Same redaction contract as the POST helper — see
+        # TestPostGeminiInteractionHelper.test_request_error_message_is_redacted.
+        class _FakeClient:
+            async def get(self, url, **kwargs):
+                raise mcp_server.httpx.RequestError(
+                    f"DNS failure for {FAKE_GOOG_ACCESS}"
+                )
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("[REDACTED_GOOGLE_OAUTH_ACCESS]", data["error"])
+        self.assertNotIn(_GOOG_OAUTH_ACCESS_PREFIX, data["error"])
 
     def test_invalid_json_becomes_failure_envelope(self):
         class _FakeResponse:
