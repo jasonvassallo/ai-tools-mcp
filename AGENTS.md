@@ -5,8 +5,9 @@ This repository contains a small MCP server for hosted AI APIs. It is not a loca
 ## Purpose
 
 - Expose `deep_research` for Perplexity Sonar Pro deep research with multi-source synthesis and citations.
+- Expose `agent_research` for Perplexity Agent API Search-as-Code — a hosted sandbox agent that searches programmatically for bulk/enumerable research tasks.
 - Expose `gemini_deep_research_start` / `_result` for Google Gemini Deep Research — long-running, citation-dense reports drawn from many sources.
-- Complement Claude's built-in WebSearch (quick lookups) with two thorough-research tiers (fast inline via Perplexity, multi-minute report via Gemini).
+- Complement Claude's built-in WebSearch (quick lookups) with thorough-research tiers (fast inline via Perplexity, programmatic bulk via the Agent API sandbox, multi-minute report via Gemini).
 
 ## Stable Public Surface
 
@@ -14,6 +15,7 @@ This repository contains a small MCP server for hosted AI APIs. It is not a loca
 - Tool names (research):
   - `quick_research`
   - `deep_research`
+  - `agent_research`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
 - Tool names (session management):
@@ -41,6 +43,10 @@ The same `mcp_server.py` is wrapped three ways. When making changes, update all 
 - `deep_research`:
   - Provider: Perplexity
   - Model: `sonar-pro`
+- `agent_research`:
+  - Provider: Perplexity Agent API (`/v1/responses`) with the `sandbox` tool
+  - Models: `anthropic/claude-sonnet-4-6` (default) or `perplexity/sonar` — server-side allowlist
+  - Synchronous; runs take one to several minutes; billed per-model tokens + per-container fee + per-search charges.
 - `gemini_deep_research_start` / `gemini_deep_research_result`:
   - Provider: Google Gemini Deep Research (`/v1beta/interactions`)
   - Models: `deep-research-preview-04-2026` (fast), `deep-research-max-preview-04-2026` (max)
