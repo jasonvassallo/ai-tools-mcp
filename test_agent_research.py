@@ -503,6 +503,16 @@ class TestAgentResearchBackgroundStart(unittest.TestCase):
         self.assertEqual(env["status"], "queued")
         self.assertIn("agent_research_result", env["hint"])
 
+    def test_background_start_status_is_redacted(self):
+        # The renderer redacts API-emitted `status`; the background-start
+        # envelope must do the same (per PR #16 review, Claude bot round 3).
+        queued = {"id": "resp_abc-123", "status": f"weird-{FAKE_JWT}"}
+        with mock.patch.object(mcp_server, "_post_agent_research", return_value=queued):
+            result = _call("agent_research", {"query": "q", "background": True})
+        env = json.loads(result[0].text)
+        self.assertNotIn(FAKE_JWT, env["status"])
+        self.assertIn("[REDACTED_JWT]", env["status"])
+
     def test_background_must_be_json_boolean(self):
         # `bool("false")` is True in Python — a JSON-stringified flag must
         # be rejected, not silently coerced (same contract as the

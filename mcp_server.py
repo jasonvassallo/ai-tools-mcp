@@ -1616,7 +1616,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             result = {
                 "response_id": response_id,
-                "status": data.get("status", "queued"),
+                # API-emitted string — redact like the renderer does for
+                # the same field (per PR #16 review).
+                "status": redact_secrets(str(data.get("status", "queued"))),
                 "model": model,
                 "hint": (
                     "Poll agent_research_result with this response_id. "

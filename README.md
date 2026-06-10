@@ -263,7 +263,10 @@ Input schema:
 - `max_output_tokens`: optional integer in `[256, 8192]`, default `4096`
 - `background`: optional boolean, default `false` — when `true`, returns
   `{response_id, status, hint}` immediately instead of waiting; poll with
-  `agent_research_result`
+  `agent_research_result`. Prefer `background=true` for large fan-outs:
+  synchronous calls block for up to 10 minutes, and MCP clients that enforce
+  their own shorter tool-call timeouts will kill the call before the server's
+  600s ceiling — background mode is the safe path, not just an optimization
 
 Output behavior (synchronous, and `agent_research_result` on completion):
 
