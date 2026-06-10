@@ -725,6 +725,27 @@ class TestGetGeminiInteractionHelper(unittest.TestCase):
             ):
                 return asyncio.run(mcp_server._get_gemini_interaction(interaction_id))
 
+    def test_http_error_becomes_failure_envelope(self):
+        class _FakeErrorResponse:
+            status_code = 404
+            text = "not found"
+
+            def raise_for_status(self):
+                exc = mcp_server.httpx.HTTPStatusError("404")
+                exc.response = self
+                raise exc
+
+            def json(self):  # pragma: no cover - raise_for_status fires first
+                return {}
+
+        class _FakeClient:
+            async def get(self, url, **kwargs):
+                return _FakeErrorResponse()
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("404", data["error"])
+
     def test_helper_revalidates_id_as_defense_in_depth(self):
         # The validation ValueError is raised before the try block — it
         # must propagate, never be misread as a JSON decode failure.
