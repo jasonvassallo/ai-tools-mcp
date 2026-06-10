@@ -56,6 +56,9 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     class _FakeHTTPStatusError(Exception):
         pass
 
+    class _FakeRequestError(Exception):
+        pass
+
     class _FakeServer:
         def __init__(self, name):
             self.name = name
@@ -132,6 +135,7 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             "httpx",
             AsyncClient=_FakeAsyncClient,
             HTTPStatusError=_FakeHTTPStatusError,
+            RequestError=_FakeRequestError,
         ),
         "google": google_mod,
         "google.auth": auth_mod,
@@ -592,6 +596,24 @@ class TestGetAgentResponseHelper(unittest.TestCase):
         with self.assertRaises(ValueError):
             asyncio.run(mcp_server._get_agent_response("resp/../evil"))
 
+    def test_request_error_becomes_failure_envelope(self):
+        class _FakeClient:
+            async def get(self, url, **kwargs):
+                raise mcp_server.httpx.RequestError("connection timed out")
+
+        async def fake_get_client():
+            return _FakeClient()
+
+        with mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", return_value="test-key"
+        ):
+            with mock.patch.object(
+                mcp_server, "_get_http_client", side_effect=fake_get_client
+            ):
+                data = asyncio.run(mcp_server._get_agent_response("resp_abc"))
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("connection timed out", data["error"])
+
 
 class TestPostAgentResearchHelper(unittest.TestCase):
     """Unit tests for the HTTP helper itself (client mocked, no network)."""
@@ -657,6 +679,34 @@ class TestPostAgentResearchHelper(unittest.TestCase):
         data = self._run_helper(_FakeClient())
         self.assertEqual(data["status"], "failed")
         self.assertIn("500", data["error"])
+
+    def test_request_error_becomes_failure_envelope(self):
+        # Network-layer failures (connect errors, timeouts) are the most
+        # likely failure mode on minutes-long sandbox runs — they must
+        # return the structured envelope, not crash the tool call.
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                raise mcp_server.httpx.RequestError("read timeout after 600s")
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("read timeout after 600s", data["error"])
+
+    def test_invalid_json_becomes_failure_envelope(self):
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                return _FakeResponse()
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("JSON", data["error"])
 
 
 if __name__ == "__main__":

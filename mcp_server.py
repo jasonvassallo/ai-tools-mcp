@@ -938,6 +938,20 @@ async def _post_agent_research(payload: dict[str, Any]) -> dict[str, Any]:
         return response.json()
     except httpx.HTTPStatusError as exc:
         return _http_error_payload(exc)
+    except httpx.RequestError as exc:
+        # Connect errors and read timeouts are the most likely failure mode
+        # on minutes-long sandbox runs — keep the structured-envelope
+        # contract instead of crashing the tool call (per PR #16 review,
+        # Qodo bug #2 / CodeRabbit major). The keychain ValueError
+        # deliberately propagates: credential-setup errors raise across all
+        # tool families (_get_perplexity_client and _gemini_headers behave
+        # the same) and the lookup sits outside this try block.
+        return {"status": "failed", "error": f"request error: {exc}"}
+    except ValueError as exc:
+        # response.json() on a non-JSON 200 body (json.JSONDecodeError is a
+        # ValueError subclass). Only the json parse can raise ValueError
+        # inside this try block.
+        return {"status": "failed", "error": f"invalid JSON from Agent API: {exc}"}
 
 
 # Same allowlist shape as _INTERACTION_ID_RE and for the same reason: the
@@ -987,6 +1001,14 @@ async def _get_agent_response(response_id: str) -> dict[str, Any]:
         return response.json()
     except httpx.HTTPStatusError as exc:
         return _http_error_payload(exc)
+    except httpx.RequestError as exc:
+        # Same structured-envelope contract as _post_agent_research (per
+        # PR #16 review). Keychain/validation ValueErrors are raised before
+        # this try block and cannot be swallowed below.
+        return {"status": "failed", "error": f"request error: {exc}"}
+    except ValueError as exc:
+        # response.json() decode failure only — see above.
+        return {"status": "failed", "error": f"invalid JSON from Agent API: {exc}"}
 
 
 def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
