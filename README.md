@@ -6,8 +6,8 @@ This repository is intentionally narrow in scope:
 
 - It is for hosted API-backed MCP tooling.
 - It is not a local-model repo.
-- It currently exposes nine tools across two families:
-  - Research: `quick_research` (Perplexity Sonar), `deep_research` (Perplexity Sonar Pro), `gemini_deep_research_start`, `gemini_deep_research_result`
+- It currently exposes eleven tools across two families:
+  - Research: `quick_research` (Perplexity Sonar), `deep_research` (Perplexity Sonar Pro), `agent_research` / `agent_research_result` (Perplexity Agent API, Search-as-Code), `gemini_deep_research_start`, `gemini_deep_research_result`
   - Sessions: `list_sessions`, `save_session`, `load_session`, `update_session`, `delete_session`
 
 The same `mcp_server.py` is shipped three ways: standalone MCP server (installer registers it directly in `~/.claude/.mcp.json`), Claude Code plugin (`.claude-plugin/` + commands/skills/hooks), and Claude Desktop extension (`.mcpb` archive). Pick whichever fits your client.
@@ -20,6 +20,8 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Tool names (research):
   - `quick_research`
   - `deep_research`
+  - `agent_research`
+  - `agent_research_result`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
 - Tool names (sessions):
@@ -47,6 +49,15 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Latency: seconds (synchronous)
 - Use when: the answer should come back inline in the current session and spans multiple sources
 
+### `agent_research` / `agent_research_result`
+
+- Provider: Perplexity Agent API (`/v1/responses`) with the `sandbox` tool ("Search as Code")
+- Models: `anthropic/claude-sonnet-4-6` (default) or `perplexity/sonar`, server-side allowlist (the Agent API does not offer `sonar-pro`)
+- Purpose: bulk/enumerable research — the upstream agent writes and runs code in a Perplexity-hosted container, searching programmatically so every item in a list gets resolved (chat synthesis samples a few and generalizes)
+- Latency: one to several minutes; synchronous by default, or pass `background=true` to get a `response_id` immediately and poll `agent_research_result`
+- Cost: per-model tokens + $0.03 per sandbox container + per-invocation charges for searches made inside the sandbox; higher and less predictable per request than `deep_research`
+- Use when: the task is "for each of these N items, find X", needs computation over search results, or must produce a structured dataset. For a single research question use `deep_research` instead.
+
 ### `gemini_deep_research_start` / `gemini_deep_research_result`
 
 - Provider: Google Gemini Deep Research (`/v1beta/interactions`)
@@ -56,7 +67,8 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Use when: you need a standalone, multi-page report — not a quick answer
 
 Together these complement Claude's built-in `WebSearch`: use `WebSearch` for
-quick lookups, `deep_research` for thorough inline investigation, and the
+quick lookups, `deep_research` for thorough inline investigation,
+`agent_research` for bulk/enumerable tasks where coverage matters, and the
 `gemini_deep_research_*` pair when the deliverable IS the report.
 
 ## How It Works
@@ -236,6 +248,52 @@ Output behavior:
 - relies on Perplexity response content to include citations
 - response is routed through a redactor that masks secret-shape strings
   (Google API keys, OAuth tokens, JWTs, private-key blocks)
+
+### `agent_research`
+
+Input schema:
+
+- `query`: required string — the bulk research task, with items and per-item
+  fields stated explicitly
+- `model`: optional `"anthropic/claude-sonnet-4-6" | "perplexity/sonar"`
+  (default `"anthropic/claude-sonnet-4-6"`; server-side allowlist — the Agent
+  API can route to many third-party models, but this tool refuses anything
+  outside the allowlist so a malformed or injected request cannot select an
+  arbitrary upstream model)
+- `max_output_tokens`: optional integer in `[256, 8192]`, default `4096`
+- `background`: optional boolean, default `false` — when `true`, returns
+  `{response_id, status, hint}` immediately instead of waiting; poll with
+  `agent_research_result`. Prefer `background=true` for large fan-outs:
+  synchronous calls block for up to 10 minutes, and MCP clients that enforce
+  their own shorter tool-call timeouts will kill the call before the server's
+  600s ceiling — background mode is the safe path, not just an optimization
+
+Output behavior (synchronous, and `agent_research_result` on completion):
+
+- returns a formatted text block: the agent's answer, then a metadata footer
+  (model, sandbox execution count, itemized cost in USD as reported by the API)
+- failed sandbox executions (non-zero exit codes) are listed with truncated
+  stderr snippets for diagnosis
+- a non-`completed` upstream status (e.g. truncation) is flagged inline
+- all model-emitted text is routed through the same secret-redactor as
+  `deep_research`
+
+### `agent_research_result`
+
+Input schema:
+
+- `response_id`: required string (must match `^[A-Za-z0-9_-]{1,128}$`;
+  enforced at the tool boundary — and re-validated inside the HTTP helper —
+  to prevent the authenticated request from being redirected to an
+  attacker-controlled host)
+
+Output behavior:
+
+- the formatted answer block (above) when `status` is `completed` (or
+  `incomplete` with partial output, flagged inline)
+- `{status, hint}` while `queued` / `in_progress` — poll again in ~30s
+- `{status: "failed", error}` when the task failed, was cancelled, or the
+  HTTP call errored
 
 ### `gemini_deep_research_start`
 

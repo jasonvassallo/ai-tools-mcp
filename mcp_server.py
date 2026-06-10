@@ -10,13 +10,20 @@
 # ]
 # ///
 """
-MCP server providing three families of tools:
+MCP server providing four families of tools:
 
 - ``quick_research`` / ``deep_research``: Perplexity Sonar / Sonar Pro
   — inline research with citations. ``quick_research`` uses the smaller
   Sonar model for fast, concise, well-scoped answers; ``deep_research``
   uses Sonar Pro for multi-source synthesis when the question spans
   sources or needs cross-referencing.
+- ``agent_research`` / ``agent_research_result``: Perplexity Agent API
+  with the ``sandbox`` tool ("Search as Code") — the upstream agent
+  writes and runs code in a Perplexity-hosted container, searching
+  programmatically from inside that code. For bulk/enumerable research,
+  computation over search results, and structured datasets. Runs take
+  minutes; call synchronously or pass ``background=true`` and poll
+  ``agent_research_result`` by response_id.
 - ``gemini_deep_research_start`` / ``_result``: Gemini Deep Research —
   long-running (minutes, up to 60), citation-dense reports via
   Google's hosted research agent. Asynchronous: ``_start`` returns an
@@ -855,6 +862,247 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
         return _http_error_payload(exc)
 
 
+# --- Perplexity Agent API (Search-as-Code) -------------------------------
+#
+# agent_research drives Perplexity's Agent API with the `sandbox` tool
+# enabled: the upstream model writes and executes code in a Perplexity-
+# hosted container, calling search programmatically from inside that
+# code. This wins on bulk/enumerable research ("for each of N items,
+# find X") where one-shot synthesis (quick_research / deep_research)
+# under-covers the item list; it loses on single questions, where the
+# fixed per-container fee and orchestration latency are pure overhead.
+
+_AGENT_RESEARCH_URL = "https://api.perplexity.ai/v1/responses"
+
+# Server-side model allowlist. The Agent API can route to third-party
+# frontier models; the `model` argument is an enum over this tuple so a
+# prompt-injected or malformed request cannot select an arbitrary
+# (expensive) upstream model. Default is the strongest allowlisted
+# orchestrator: the sandbox agent writes code against scraped web
+# content, and weaker models are more susceptible to prompt injection.
+AGENT_RESEARCH_MODELS: tuple[str, ...] = (
+    "anthropic/claude-sonnet-4-6",
+    "perplexity/sonar",
+)
+AGENT_RESEARCH_DEFAULT_MODEL = AGENT_RESEARCH_MODELS[0]
+
+_AGENT_MAX_OUTPUT_TOKENS_MIN = 256
+_AGENT_MAX_OUTPUT_TOKENS_MAX = 8192
+_AGENT_MAX_OUTPUT_TOKENS_DEFAULT = 4096
+
+# Sandbox runs routinely take minutes (container spin-up + iterative
+# code execution + per-item searches) — far beyond the shared client's
+# 30s default, so the POST passes an explicit per-request timeout.
+_AGENT_API_TIMEOUT_SECONDS = 600.0
+
+# stderr from failed sandbox executions is surfaced for diagnosis but
+# truncated: it is model-generated-code output over scraped web content,
+# i.e. doubly untrusted, and must not flood the MCP response.
+_SANDBOX_STDERR_SNIPPET_LEN = 300
+
+_AGENT_RESEARCH_INSTRUCTIONS = (
+    "You are a research agent with a code sandbox. When the task involves "
+    "many items, calculations, or structured output, write code in the "
+    "sandbox to enumerate every item and search programmatically rather "
+    "than sampling a few and generalizing. Cite sources for factual claims "
+    "and state clearly when an item could not be resolved."
+)
+
+
+async def _post_agent_research(payload: dict[str, Any]) -> dict[str, Any]:
+    """POST to the Perplexity Agent API responses endpoint.
+
+    Same structured-error contract as `_post_gemini_interaction`: on HTTP
+    error returns ``{"status": "failed", "error": ...}`` instead of raising
+    so the MCP client gets a graceful envelope. The Keychain lookup runs on
+    a worker thread because `security` is a blocking subprocess call.
+    """
+    api_key = await asyncio.to_thread(
+        get_api_key_from_keychain, "api_tokens", "perplexity"
+    )
+    client = await _get_http_client()
+    try:
+        # Auth is server-sourced (Keychain lookup above), never a caller-
+        # supplied credential. The request host is the hardcoded HTTPS
+        # constant _AGENT_RESEARCH_URL and no tool parameter is interpolated
+        # into the URL, so the credential cannot be redirected to an
+        # attacker host. The mcp-auth-passthrough-taint rule cannot see
+        # that the host is static.
+        response = await client.post(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+            _AGENT_RESEARCH_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+            timeout=_AGENT_API_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc)
+    except httpx.RequestError as exc:
+        # Connect errors and read timeouts are the most likely failure mode
+        # on minutes-long sandbox runs — keep the structured-envelope
+        # contract instead of crashing the tool call (per PR #16 review,
+        # Qodo bug #2 / CodeRabbit major). The keychain ValueError
+        # deliberately propagates: credential-setup errors raise across all
+        # tool families (_get_perplexity_client and _gemini_headers behave
+        # the same) and the lookup sits outside this try block.
+        return {"status": "failed", "error": f"request error: {exc}"}
+    except ValueError as exc:
+        # response.json() on a non-JSON 200 body (json.JSONDecodeError is a
+        # ValueError subclass). Only the json parse can raise ValueError
+        # inside this try block.
+        return {"status": "failed", "error": f"invalid JSON from Agent API: {exc}"}
+
+
+# Same allowlist shape as _INTERACTION_ID_RE and for the same reason: the
+# response id is interpolated into the URL of an authenticated GET, so a
+# value containing '/', '..', or a scheme could redirect the Perplexity
+# key to an unintended host. Live ids look like
+# "resp_79b0f91b-e4c6-44e9-86cf-8ab09e9c88d0" — well within the pattern.
+_AGENT_RESPONSE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _validate_agent_response_id(response_id: str | None) -> str:
+    """Reject response IDs that could redirect the authenticated request."""
+    if response_id is None:
+        # Distinct message for the common caller mistake — the regex
+        # contract below would be confusing for a simply-missing argument.
+        raise ValueError("response_id is required.")
+    if not isinstance(response_id, str) or not _AGENT_RESPONSE_ID_RE.fullmatch(
+        response_id
+    ):
+        raise ValueError(
+            "response_id must match ^[A-Za-z0-9_-]{1,128}$ — refusing to "
+            "send authenticated request with untrusted path segment."
+        )
+    return response_id
+
+
+async def _get_agent_response(response_id: str) -> dict[str, Any]:
+    """GET an Agent API response by ID (poll for background runs).
+
+    The response_id MUST have already passed _validate_agent_response_id;
+    this helper re-validates as defense in depth so the URL cannot escape
+    the API host even if a future caller forgets. Same structured-error
+    contract as `_post_agent_research`.
+    """
+    safe_id = _validate_agent_response_id(response_id)
+    api_key = await asyncio.to_thread(
+        get_api_key_from_keychain, "api_tokens", "perplexity"
+    )
+    client = await _get_http_client()
+    try:
+        # Auth is server-sourced (Keychain). The only caller-influenced URL
+        # segment, safe_id, has passed _validate_agent_response_id
+        # (^[A-Za-z0-9_-]{1,128}$) — re-validated here as defense in depth —
+        # so it cannot contain '/', '.', ':', a scheme, or a host. The taint
+        # rule does not recognize the regex allowlist as a sanitizer.
+        # No explicit timeout (unlike the POST helper's 600s): this GET is
+        # a status poll that returns immediately whatever the run's state,
+        # so the shared client's 30s default is correct here.
+        response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+            f"{_AGENT_RESEARCH_URL}/{safe_id}",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc)
+    except httpx.RequestError as exc:
+        # Same structured-envelope contract as _post_agent_research (per
+        # PR #16 review). Keychain/validation ValueErrors are raised before
+        # this try block and cannot be swallowed below.
+        return {"status": "failed", "error": f"request error: {exc}"}
+    except ValueError as exc:
+        # response.json() decode failure only — see above.
+        return {"status": "failed", "error": f"invalid JSON from Agent API: {exc}"}
+
+
+def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
+    """Format a completed Agent API response as the agent_research result.
+
+    Shared by the synchronous agent_research path and the
+    agent_research_result poll tool so both render identically.
+
+    Response shape (verified against a live request on 2026-06-09):
+    output[] mixes `sandbox_results` items (code, per-command results with
+    exit_code/stdout/stderr) and `message` items (content[] of output_text).
+    usage.cost carries an itemized USD breakdown.
+    """
+    output_items = data.get("output") or []
+    answer_parts: list[str] = []
+    sandbox_runs = 0
+    failed_execs: list[str] = []
+    for item in output_items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") == "message":
+            for chunk in item.get("content") or []:
+                # isinstance(str) guard, not just truthiness: the response
+                # is untrusted input, and a non-string `text` would crash
+                # the "\n\n".join below (per PR #16 review, Qodo bug #3).
+                if (
+                    isinstance(chunk, dict)
+                    and chunk.get("type") == "output_text"
+                    and isinstance(chunk.get("text"), str)
+                    and chunk["text"]
+                ):
+                    answer_parts.append(chunk["text"])
+        elif item.get("type") == "sandbox_results":
+            sandbox_runs += 1
+            for exec_result in item.get("results") or []:
+                if not isinstance(exec_result, dict):
+                    continue
+                exit_code = exec_result.get("exit_code")
+                if exit_code not in (0, None):
+                    stderr = str(exec_result.get("stderr") or "")
+                    snippet = stderr[:_SANDBOX_STDERR_SNIPPET_LEN]
+                    if len(stderr) > _SANDBOX_STDERR_SNIPPET_LEN:
+                        snippet += "…"
+                    failed_execs.append(f"exit_code={exit_code} — {snippet}")
+
+    if not answer_parts:
+        return [
+            TextContent(
+                type="text",
+                text=(
+                    "Error: Agent API returned no assistant message for agent_research"
+                ),
+            )
+        ]
+
+    # Redact secret-shape patterns: the answer synthesizes scraped web
+    # content, and failed-execution stderr is sandbox output over that
+    # same untrusted content.
+    answer = redact_secrets("\n\n".join(answer_parts))
+
+    usage = data.get("usage") or {}
+    cost = usage.get("cost") or {}
+    total_cost = cost.get("total_cost")
+    currency = cost.get("currency", "USD")
+    # `model` and `status` are API-emitted strings rendered verbatim —
+    # redact like every other response field (per PR #16 review).
+    meta_bits = [
+        f"model: {redact_secrets(str(data.get('model', 'unknown')))}",
+        f"sandbox executions: {sandbox_runs}",
+    ]
+    if total_cost is not None:
+        meta_bits.append(f"cost: {total_cost} {currency}")
+
+    lines = ["## Agent Research (Search-as-Code)", ""]
+    status = data.get("status", "unknown")
+    if status != "completed":
+        # e.g. "incomplete" when max_output_tokens truncated the run —
+        # surface it so the caller knows coverage may be partial.
+        lines.extend([f"> ⚠️ upstream status: {redact_secrets(str(status))}", ""])
+    lines.extend([answer, "", "---", f"*{' · '.join(meta_bits)}*"])
+    if failed_execs:
+        lines.extend(["", "### Sandbox execution warnings", ""])
+        lines.extend(f"- {redact_secrets(detail)}" for detail in failed_execs)
+
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
 # Create MCP server
 server = Server("ai-tools-mcp")
 
@@ -920,6 +1168,92 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["query"],
+            },
+        ),
+        Tool(
+            name="agent_research",
+            description=(
+                "Search-as-Code research via the Perplexity Agent API: an agent "
+                "writes and runs code in a hosted sandbox, searching the web "
+                "programmatically from inside that code. Use ONLY when the task "
+                "is bulk/enumerable ('for each of these N CVEs/packages/vendors, "
+                "find X'), needs computation over search results, or must produce "
+                "a structured dataset — code loops cover every item where chat "
+                "synthesis samples a few and generalizes. For a single research "
+                "question use `deep_research` instead (faster, cheaper); for "
+                "quick lookups use `quick_research`. Runs take one to several "
+                "minutes: call synchronously (default) to wait inline, or pass "
+                "background=true to get a response_id immediately and poll "
+                "`agent_research_result`. Costs include a per-container fee "
+                "plus per-search charges, so per-request cost is higher and "
+                "less predictable than deep_research."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "The bulk research task. Enumerate the items and the "
+                            "fields to resolve per item explicitly."
+                        ),
+                    },
+                    "model": {
+                        "type": "string",
+                        "enum": list(AGENT_RESEARCH_MODELS),
+                        "default": AGENT_RESEARCH_DEFAULT_MODEL,
+                        "description": (
+                            "Orchestrator model (server-side allowlist). Default "
+                            "is the strongest option; perplexity/sonar is the "
+                            "cheap alternative for simple enumerations."
+                        ),
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "minimum": _AGENT_MAX_OUTPUT_TOKENS_MIN,
+                        "maximum": _AGENT_MAX_OUTPUT_TOKENS_MAX,
+                        "default": _AGENT_MAX_OUTPUT_TOKENS_DEFAULT,
+                        "description": (
+                            "Maximum output tokens (default: "
+                            f"{_AGENT_MAX_OUTPUT_TOKENS_DEFAULT})"
+                        ),
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Run in the background: returns a response_id "
+                            "immediately; poll agent_research_result for the "
+                            "answer. Use for large fan-outs that would "
+                            "otherwise block the session for minutes."
+                        ),
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="agent_research_result",
+            description=(
+                "Poll a background agent_research task by response_id. Returns "
+                "the formatted answer when the task completes, a poll-again "
+                "hint while it is queued or in progress, and a structured "
+                "error if the task failed or was cancelled. Poll roughly every "
+                "30 seconds — sandbox runs typically take one to several "
+                "minutes."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "response_id": {
+                        "type": "string",
+                        "description": (
+                            "The response_id returned by agent_research with "
+                            "background=true."
+                        ),
+                    },
+                },
+                "required": ["response_id"],
             },
         ),
         Tool(
@@ -1204,6 +1538,147 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = f"## Research Results\n\n{content}"
 
         return [TextContent(type="text", text=result)]
+
+    if name == "agent_research":
+        # Fail-closed validation before any network traffic, mirroring the
+        # gemini_* handlers: a structured {"status": "failed"} envelope so
+        # the MCP client gets a parseable error rather than an exception.
+        try:
+            query = arguments.get("query")
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("query must be a non-empty string.")
+
+            model = arguments.get("model", AGENT_RESEARCH_DEFAULT_MODEL)
+            if model not in AGENT_RESEARCH_MODELS:
+                raise ValueError(
+                    f"model must be one of {sorted(AGENT_RESEARCH_MODELS)}; "
+                    f"got {model!r}."
+                )
+
+            max_output_tokens = arguments.get(
+                "max_output_tokens", _AGENT_MAX_OUTPUT_TOKENS_DEFAULT
+            )
+            # Strict type check — bool is an int subclass in Python, so
+            # `True` would otherwise slip through as 1 (same trap as the
+            # collaborative_planning flag in gemini_deep_research_start).
+            if (
+                not isinstance(max_output_tokens, int)
+                or isinstance(max_output_tokens, bool)
+                or not (
+                    _AGENT_MAX_OUTPUT_TOKENS_MIN
+                    <= max_output_tokens
+                    <= _AGENT_MAX_OUTPUT_TOKENS_MAX
+                )
+            ):
+                raise ValueError(
+                    "max_output_tokens must be an integer in "
+                    f"[{_AGENT_MAX_OUTPUT_TOKENS_MIN}, "
+                    f"{_AGENT_MAX_OUTPUT_TOKENS_MAX}]; got {max_output_tokens!r}."
+                )
+
+            # Strict bool check — `bool("false")` is True in Python, so a
+            # JSON-stringified flag would silently flip the meaning (same
+            # contract as collaborative_planning on gemini_deep_research_start).
+            background = arguments.get("background", False)
+            if not isinstance(background, bool):
+                raise ValueError(
+                    "background must be a JSON boolean (true/false), "
+                    "not a string or number."
+                )
+        except ValueError as exc:
+            err = {"status": "failed", "error": str(exc)}
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+        payload: dict[str, Any] = {
+            "model": model,
+            "input": query,
+            "tools": [{"type": "sandbox"}],
+            "max_output_tokens": max_output_tokens,
+            "instructions": _AGENT_RESEARCH_INSTRUCTIONS,
+        }
+        if background:
+            payload["background"] = True
+
+        data = await _post_agent_research(payload)
+        # "failed" covers both the helper's HTTP-failure envelope and an
+        # upstream terminal failure; "cancelled" gets the same envelope so
+        # the sync path matches agent_research_result for that status.
+        post_status = data.get("status")
+        if post_status in ("failed", "cancelled"):
+            err = {
+                "status": "failed",
+                "error": redact_secrets(
+                    str(data.get("error") or f"agent task {post_status}")
+                ),
+            }
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+        if background:
+            response_id = data.get("id")
+            if not isinstance(response_id, str) or not _AGENT_RESPONSE_ID_RE.fullmatch(
+                response_id
+            ):
+                # Fail loudly: a null/malformed id breaks the poll contract
+                # since the result tool can't be called without a valid id.
+                raise RuntimeError(
+                    "Agent API background start did not include a valid "
+                    f"response id; got {response_id!r}."
+                )
+            result = {
+                "response_id": response_id,
+                # API-emitted string — redact like the renderer does for
+                # the same field (per PR #16 review).
+                "status": redact_secrets(str(data.get("status", "queued"))),
+                "model": model,
+                "hint": (
+                    "Poll agent_research_result with this response_id. "
+                    "Sandbox runs typically take one to several minutes."
+                ),
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        return _render_agent_research(data)
+
+    if name == "agent_research_result":
+        try:
+            safe_id = _validate_agent_response_id(arguments.get("response_id"))
+        except ValueError as exc:
+            err = {"status": "failed", "error": str(exc)}
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+        data = await _get_agent_response(safe_id)
+        if data.get("status") == "failed" and "output" not in data:
+            # Either the HTTP-failure envelope from the helper or an
+            # upstream terminal failure with no output to render.
+            err = {
+                "status": "failed",
+                "error": redact_secrets(str(data.get("error") or "agent task failed")),
+            }
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+        status = data.get("status", "unknown")
+        if status in ("queued", "in_progress"):
+            result = {
+                "status": status,
+                "hint": "Still running. Poll again in ~30 seconds.",
+            }
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        if status in ("cancelled", "failed"):
+            # Also catches a terminal "failed" that arrived WITH an output
+            # key and therefore fell through the no-output guard above —
+            # the two checks together cover both upstream failure shapes.
+            err = {
+                "status": "failed",
+                "error": redact_secrets(
+                    str(data.get("error") or f"agent task {status}")
+                ),
+            }
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
+
+        # "completed", and "incomplete" with partial output — the renderer
+        # flags any non-completed status inline.
+        return _render_agent_research(data)
 
     if name == "gemini_deep_research_start":
         try:
