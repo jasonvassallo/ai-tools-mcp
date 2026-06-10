@@ -1600,8 +1600,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             payload["background"] = True
 
         data = await _post_agent_research(payload)
-        if data.get("status") == "failed":
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+        # "failed" covers both the helper's HTTP-failure envelope and an
+        # upstream terminal failure; "cancelled" gets the same envelope so
+        # the sync path matches agent_research_result for that status.
+        post_status = data.get("status")
+        if post_status in ("failed", "cancelled"):
+            err = {
+                "status": "failed",
+                "error": redact_secrets(
+                    str(data.get("error") or f"agent task {post_status}")
+                ),
+            }
+            return [TextContent(type="text", text=json.dumps(err, indent=2))]
 
         if background:
             response_id = data.get("id")

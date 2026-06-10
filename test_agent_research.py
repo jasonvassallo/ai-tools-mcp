@@ -439,6 +439,19 @@ class TestAgentResearchFailures(unittest.TestCase):
         self.assertEqual(payload["status"], "failed")
         self.assertIn("403", payload["error"])
 
+    def test_sync_cancelled_status_returns_failure_envelope(self):
+        # The poll tool returns a failure envelope for "cancelled" — the
+        # sync path must do the same instead of rendering an answer (per
+        # PR #16 review, Claude bot round 4).
+        response = _sample_response(status="cancelled")
+        with mock.patch.object(
+            mcp_server, "_post_agent_research", return_value=response
+        ):
+            result = _call("agent_research", {"query": "q"})
+        payload = json.loads(result[0].text)
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("cancelled", payload["error"])
+
     def test_non_completed_status_is_flagged(self):
         response = _sample_response(status="incomplete")
         with mock.patch.object(
