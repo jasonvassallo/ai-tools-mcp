@@ -106,7 +106,9 @@ app-level. No auth headers in v1.
 collected via `local_delegate_result` as above.
 
 Uses the existing shared async httpx client (`_get_http_client()`); no new
-dependencies.
+dependencies. The shared client's default timeout is 30 s, so delegate calls
+pass an **explicit per-request timeout** (`timeout_s`, or the 30-min ceiling
+for background jobs) — same mechanism the agent-research POST already uses.
 
 ## Error handling (fail-closed, matching existing patterns)
 
@@ -154,7 +156,13 @@ files); all network mocked, no live Ollama in CI:
 - `commands/local-delegate.md` slash command.
 - `skills/using-ai-research/`: routing updated — when to keep work local
   (privacy/cheap/second-opinion/batch) vs. Perplexity/Gemini (needs web).
-- `mcpb/manifest.json`: declare the two new tools.
+- `mcpb/manifest.json`: declare the two new tools **and** update the
+  `description`/`long_description` prose ("11 MCP tools", "Four families")
+  to match the new counts.
+- `run_check()` (`--check`): add a **non-fatal** Ollama reachability line
+  (`ok:`/`warn:`, never counted in `errors`) — Ollama being down must not
+  fail installs or preflights of the hosted tool families. Surfaced at
+  SessionStart automatically via the existing `hooks/preflight.sh`.
 
 ## Out of scope (v1)
 
