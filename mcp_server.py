@@ -1225,8 +1225,9 @@ async def _post_ollama_chat(
 
     Same structured-error contract as _post_agent_research: network, HTTP,
     and parse failures return {"status": "failed", "error": ...} instead of
-    raising. No auth header — the endpoint is localhost by default; a remote
-    endpoint's auth story is transport-level (Tailscale ACLs), not app-level.
+    raising. No auth header yet — localhost needs none; Cloudflare Access
+    service-token headers for remote https endpoints arrive with the v1.1
+    endpoint-chain amendment (see the design doc).
     No retries: a local server is either up or not.
     """
     try:
@@ -1253,7 +1254,7 @@ async def _post_ollama_chat(
         return {
             "status": "failed",
             "error": (
-                f"Ollama not running at {base_url} — is the LaunchAgent up? "
+                f"Ollama not running at {redact_secrets(base_url)} — is the LaunchAgent up? "
                 "(launchctl kickstart -k gui/$UID/com.jasonvassallo.ollama)"
             ),
         }
