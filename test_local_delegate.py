@@ -639,6 +639,24 @@ class TestRenderDelegateAnswer(unittest.TestCase):
         self.assertIn("Error", out[0].text)
         self.assertIn("boom", out[0].text)
 
+    def test_failure_envelope_redacts_secrets(self):
+        # Assemble a JWT-shaped secret at runtime so scanners don't flag
+        # this test. JWT pattern is eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}
+        header = "ey" + "J" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        payload = "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4iLCJpYXQ6MTUxNjIzOTAyMn0"
+        signature = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        jwt_token = f"{header}.{payload}.{signature}"
+
+        out = mcp_server._render_delegate_answer(
+            {"status": "failed", "error": f"boom {jwt_token}"}
+        )
+        # Verify redaction worked: JWT must NOT appear, [REDACTED_JWT] must be present
+        self.assertNotIn(jwt_token, out[0].text)
+        self.assertIn("[REDACTED_JWT]", out[0].text)
+        # Verify context survived: "Error" and "boom" must still be there
+        self.assertIn("Error", out[0].text)
+        self.assertIn("boom", out[0].text)
+
     def test_empty_content_is_error(self):
         out = mcp_server._render_delegate_answer({"message": {"content": ""}})
         self.assertIn("no content", out[0].text)

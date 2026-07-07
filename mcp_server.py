@@ -1448,7 +1448,8 @@ def _render_delegate_answer(data: dict[str, Any]) -> list[TextContent]:
     if data.get("status") == "failed":
         return [
             TextContent(
-                type="text", text=f"Error: {data.get('error', 'unknown failure')}"
+                type="text",
+                text=f"Error: {redact_secrets(str(data.get('error', 'unknown failure')))}",
             )
         ]
     message = data.get("message")
