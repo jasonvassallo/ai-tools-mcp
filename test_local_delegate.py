@@ -21,6 +21,7 @@ import io
 import json
 import os
 import sys
+import time
 import types
 import unittest
 from pathlib import Path
@@ -28,6 +29,22 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 SERVER_PATH = HERE / "mcp_server.py"
+
+
+async def _settle(predicate, timeout: float = 2.0) -> None:
+    """Poll until predicate() is true or fail the test after `timeout`s.
+
+    Replaces bare ``await asyncio.sleep(N)`` settle-waits for
+    ``wait_for``-wrapped background tasks: fixed sleeps are either too
+    short (flaky on a loaded CI box) or wastefully long. Polling on a
+    tight interval settles as soon as the condition is met.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("condition not met within settle timeout")
 
 
 def _build_stub_modules() -> dict[str, types.ModuleType]:
@@ -754,7 +771,8 @@ class TestDelegateJobs(unittest.TestCase):
                 self.assertEqual(running["status"], "running")
                 self.assertIsInstance(running["elapsed_s"], int)
                 gate.set()
-                await asyncio.sleep(0.05)  # let the wait_for-wrapped task finish
+                task = mcp_server._delegate_jobs[job_id]["task"]
+                await _settle(task.done)  # let the wait_for-wrapped task finish
                 done = mcp_server._collect_delegate_job(job_id)
                 self.assertEqual(done["message"]["content"], "done!")
                 with self.assertRaises(ValueError):
@@ -774,8 +792,9 @@ class TestDelegateJobs(unittest.TestCase):
                 ids = [mcp_server._start_delegate_job({}) for _ in range(4)]
                 with self.assertRaises(ValueError):
                     mcp_server._start_delegate_job({})
+                tasks = [mcp_server._delegate_jobs[job_id]["task"] for job_id in ids]
                 gate.set()
-                await asyncio.sleep(0.05)
+                await _settle(lambda: all(t.done() for t in tasks))
                 for job_id in ids:  # drain so no pending tasks leak
                     mcp_server._collect_delegate_job(job_id)
 
@@ -1015,7 +1034,11 @@ class TestRunCheckOllamaLine(unittest.TestCase):
                     mcp_server, "_load_adc", side_effect=ValueError("no adc")
                 ):
                     with mock.patch.dict(
-                        os.environ, {"AI_TOOLS_OLLAMA_URL": "http://localhost:11434"}
+                        os.environ,
+                        {
+                            "AI_TOOLS_OLLAMA_URL": "http://localhost:11434",
+                            "AI_TOOLS_OLLAMA_URLS": "",
+                        },
                     ):
                         with contextlib.redirect_stdout(buf):
                             with self.assertRaises(SystemExit) as ctx:
