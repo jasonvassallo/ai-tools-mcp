@@ -16,8 +16,9 @@
 - Specific exception types only — never bare `except Exception`.
 - Everything logged or embedded in an error payload passes through `redact_secrets`.
 - Model allowlist (exact strings): `qwen3.6:35b-a3b-coding-nvfp4` (default), `qwen3.6:35b-a3b-coding-nvfp4-32k`, `qwen3.6:35b-a3b-coding-nvfp4-256k`.
-- Endpoint resolution order: env `AI_TOOLS_OLLAMA_URL` → Keychain service `OLLAMA_URL` (account = current user) → `http://localhost:11434`. http/https only.
-- Sync timeout default 300 s, cap 600 s; background ceiling 1800 s; job cap 4; `keep_alive` default `"5m"`, pattern `^(0|[1-9][0-9]{0,3}(s|m|h))$`.
+- **[v1.1]** Endpoint resolution: ordered **chain** — env `AI_TOOLS_OLLAMA_URLS` (comma-separated; singular `AI_TOOLS_OLLAMA_URL` honored as a one-item chain for compat), else default chain `http://localhost:11434`, `https://ollama-mbp.djvassallo.com`; Keychain service `OLLAMA_URL` (account = current user) appended if set. Per-call: probe each endpoint's `GET /api/tags` (2 s timeout), pick the first serving the requested tag; cache (model → endpoint) 60 s. Localhost may be http; **non-localhost must be https** (rejected at parse). Remote endpoints authenticate with Cloudflare Access service-token headers from Keychain (`OLLAMA_CF_ACCESS_CLIENT_ID` / `OLLAMA_CF_ACCESS_CLIENT_SECRET`); creds absent → endpoint **skipped**, never called bare.
+- Sync timeout default 300 s, cap 600 s; background ceiling 1800 s; job cap 4; **[v1.1]** `keep_alive` default **omitted** (inherit the server's `OLLAMA_KEEP_ALIVE`); when provided it must match `^(0|[1-9][0-9]{0,3}(s|m|h))$`.
+- **[v1.1] Execution order:** Tasks 1, 2 were built to v1.0 and already landed. Remaining order: **Task 8 → Task 9 → Task 3 → Task 4 → Task 5 → Task 6 → Task 7.** Tasks 8/9 (appended at the end of this file) retrofit the v1.1 amendment onto Tasks 1/2's code; Tasks 4/5/6 below are already edited to v1.1.
 - Run tests with: `uv run --with pytest pytest test_local_delegate.py -q` (matches `.github/workflows/tests.yml`). Format-check with `uv tool run ruff format --check <files>`.
 - Every commit message ends with:
   `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>` (and the Claude-Session URL line if the executor has one).
@@ -620,7 +621,7 @@ git commit -m "feat: delegate answer rendering + in-memory background job regist
 - Modify: `test_local_delegate.py`
 
 **Interfaces:**
-- Consumes: everything produced by Tasks 1–3 (exact names/signatures as defined there)
+- Consumes: everything produced by Tasks 1–3 (exact names/signatures as defined there), plus Task 8's `_delegate_default_model() -> str`
 - Produces: MCP tools `local_delegate`, `local_delegate_result` (the stable public surface)
 
 - [ ] **Step 1: Add failing tests**
@@ -695,7 +696,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         self.assertEqual(payload["messages"], [{"role": "user", "content": "do the thing"}])
         self.assertIs(payload["think"], False)
         self.assertIs(payload["stream"], False)
-        self.assertEqual(payload["keep_alive"], "5m")
+        self.assertNotIn("keep_alive", payload)  # v1.1: omitted → inherit server OLLAMA_KEEP_ALIVE
         self.assertEqual(timeout_s, 300.0)
         self.assertIn("ok", out[0].text)
 
@@ -839,12 +840,15 @@ Insert after the `gemini_deep_research_result` Tool entry in `list_tools()`:
                     "model": {
                         "type": "string",
                         "enum": list(OLLAMA_DELEGATE_MODELS),
-                        "default": OLLAMA_DELEGATE_DEFAULT_MODEL,
+                        "default": _delegate_default_model(),
                         "description": (
-                            "Server-side allowlist. Default tag inherits the "
-                            "host's tuned context; -32k/-256k pin explicit "
-                            "context windows (-256k only for genuinely huge "
-                            "inputs — it costs several GB of KV cache)."
+                            "Server-side allowlist. The default (base tag) "
+                            "inherits each serving host's context window "
+                            "(64k on JVMBPro, 32k on jvmacmini); -32k/-256k "
+                            "pin explicit windows (-256k = several GB of KV "
+                            "cache, JVMBPro only). The endpoint chain is "
+                            "probed per call; the first endpoint serving "
+                            "the tag wins."
                         ),
                     },
                     "think": {
@@ -865,11 +869,12 @@ Insert after the `gemini_deep_research_result` Tool entry in `list_tools()`:
                     },
                     "keep_alive": {
                         "type": "string",
-                        "default": "5m",
                         "description": (
-                            "How long Ollama keeps the model loaded after the "
-                            "call ('0' = unload immediately — use after a big "
-                            "-256k job). Pattern: 0 or <1-9999><s|m|h>."
+                            "Optional: how long Ollama keeps the model loaded "
+                            "after the call ('0' = unload immediately — use "
+                            "after a big -256k job). Omit to inherit the "
+                            "server's OLLAMA_KEEP_ALIVE. Pattern: 0 or "
+                            "<1-9999><s|m|h>."
                         ),
                     },
                     "timeout_s": {
@@ -916,7 +921,7 @@ Insert before the `list_sessions` handler in `call_tool()`:
                     text="Error: prompt is required and must be a non-empty string.",
                 )
             ]
-        model = arguments.get("model", OLLAMA_DELEGATE_DEFAULT_MODEL)
+        model = arguments.get("model", _delegate_default_model())
         if model not in OLLAMA_DELEGATE_MODELS:
             allowed = ", ".join(OLLAMA_DELEGATE_MODELS)
             return [
@@ -930,9 +935,10 @@ Insert before the `list_sessions` handler in `call_tool()`:
             return [
                 TextContent(type="text", text="Error: background must be a JSON boolean.")
             ]
-        keep_alive = arguments.get("keep_alive", _DELEGATE_KEEP_ALIVE_DEFAULT)
-        if not isinstance(keep_alive, str) or not _DELEGATE_KEEP_ALIVE_RE.fullmatch(
-            keep_alive
+        keep_alive = arguments.get("keep_alive")
+        if keep_alive is not None and (
+            not isinstance(keep_alive, str)
+            or not _DELEGATE_KEEP_ALIVE_RE.fullmatch(keep_alive)
         ):
             return [
                 TextContent(
@@ -968,8 +974,9 @@ Insert before the `list_sessions` handler in `call_tool()`:
             "messages": messages,
             "think": think,
             "stream": False,
-            "keep_alive": keep_alive,
         }
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
 
         if background:
             try:
@@ -996,6 +1003,8 @@ Insert before the `list_sessions` handler in `call_tool()`:
         return _render_delegate_answer(outcome)
 ```
 
+Also delete the now-unused `_DELEGATE_KEEP_ALIVE_DEFAULT` constant from the Task-1 constants block (v1.1: no server-side keep_alive default).
+
 - [ ] **Step 5: Run — verify PASS (full suite, all files)**
 
 Run: `uv run --with pytest pytest test_local_delegate.py test_agent_research.py test_redact.py test_session_mgmt.py -q`
@@ -1019,8 +1028,8 @@ git commit -m "feat: local_delegate + local_delegate_result MCP tools"
 - Modify: `test_local_delegate.py`
 
 **Interfaces:**
-- Consumes: `_resolve_ollama_url` (Task 1)
-- Produces: `--check` output gains one `ok:`/`warn:` line; **never increments `errors`**
+- Consumes: `_resolve_ollama_chain`, `_ollama_auth_headers`, `_OLLAMA_DEFAULT_MODEL_ENV_VAR` (Tasks 8/9)
+- Produces: `--check` output gains one `ok:`/`warn:` line **per chain endpoint** (+ optional env-default-model warn); **never increments `errors`**
 
 - [ ] **Step 1: Add failing test**
 
@@ -1034,10 +1043,19 @@ class TestRunCheckOllamaLine(unittest.TestCase):
             get=mock.Mock(return_value=fake_resp, side_effect=get_side_effect),
             RequestException=Exception,
         )
+
+        def fake_keychain(service, account):
+            # Perplexity key resolves; OLLAMA_URL absent so the chain comes
+            # from the env var alone (a Keychain URL of "k" would fail
+            # endpoint validation and mask what this test targets).
+            if service == "OLLAMA_URL":
+                raise ValueError("not found")
+            return "k"
+
         buf = io.StringIO()
         with mock.patch.object(mcp_server, "requests", fake_requests, create=True):
             with mock.patch.object(
-                mcp_server, "get_api_key_from_keychain", return_value="k"
+                mcp_server, "get_api_key_from_keychain", side_effect=fake_keychain
             ):
                 with mock.patch.object(
                     mcp_server, "_load_adc", side_effect=ValueError("no adc")
@@ -1052,13 +1070,22 @@ class TestRunCheckOllamaLine(unittest.TestCase):
 
     def test_reachable_prints_ok(self):
         out, code = self._run_check_output()
-        self.assertIn("ok: ollama reachable", out)
+        self.assertIn("ok: ollama reachable at http://localhost:11434", out)
         self.assertEqual(code, 1)  # only the forced ADC failure counts
 
     def test_unreachable_prints_warn_not_fail(self):
         out, code = self._run_check_output(get_side_effect=Exception("refused"))
-        self.assertIn("warn: ollama not reachable", out)
+        self.assertIn("warn: ollama not reachable at http://localhost:11434", out)
         self.assertEqual(code, 1)  # ollama down did NOT add to errors
+
+    def test_bad_env_default_model_warns(self):
+        with mock.patch.dict(
+            os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": "llama3:8b"}
+        ):
+            out, code = self._run_check_output()
+        self.assertIn("not in", out)  # allowlist warn line
+        self.assertIn("llama3:8b", out)
+        self.assertEqual(code, 1)
 ```
 
 Add `import contextlib` and `import io` to the test file imports. Note `create=True` on the `requests` patch: the stub-import harness may not give `mcp_server` a real `requests` attribute.
@@ -1079,15 +1106,36 @@ Check whether `import requests` exists at the top of `mcp_server.py` (it is in t
     # installs or preflights of the hosted tool families — delegate calls
     # themselves fail closed at call time.
     try:
-        ollama_url = _resolve_ollama_url()
-        resp = requests.get(f"{ollama_url}/api/version", timeout=3)
-        resp.raise_for_status()
-        version = resp.json().get("version", "?")
-        print(f"ok: ollama reachable at {ollama_url} (version {version})")
-    except (ValueError, requests.RequestException) as e:
+        chain = _resolve_ollama_chain()
+    except ValueError as e:
         print(
-            "warn: ollama not reachable (local_delegate unavailable): "
+            "warn: ollama endpoint chain invalid (local_delegate unavailable): "
             f"{redact_secrets(str(e))}"
+        )
+        chain = []
+    for endpoint in chain:
+        try:
+            headers = _ollama_auth_headers(endpoint)
+            if headers is None:
+                print(
+                    "warn: ollama endpoint skipped (no Cloudflare Access creds "
+                    f"in Keychain): {endpoint}"
+                )
+                continue
+            resp = requests.get(f"{endpoint}/api/version", headers=headers, timeout=3)
+            resp.raise_for_status()
+            version = resp.json().get("version", "?")
+            print(f"ok: ollama reachable at {endpoint} (version {version})")
+        except (ValueError, requests.RequestException) as e:
+            print(
+                f"warn: ollama not reachable at {endpoint} "
+                f"(local_delegate may fall back): {redact_secrets(str(e))}"
+            )
+    env_default = os.environ.get(_OLLAMA_DEFAULT_MODEL_ENV_VAR, "").strip()
+    if env_default and env_default not in OLLAMA_DELEGATE_MODELS:
+        print(
+            f"warn: {_OLLAMA_DEFAULT_MODEL_ENV_VAR}={env_default!r} not in "
+            f"allowlist; using {OLLAMA_DELEGATE_DEFAULT_MODEL}"
         )
 ```
 
@@ -1136,7 +1184,7 @@ Make these edits (prose may be adapted, facts must be exact):
    - `- It is not a local-model repo.` → `- No model weights live in this repo — the local family only calls an already-running Ollama.`
    - `- It currently exposes eleven tools across two families:` → `- It currently exposes thirteen tools across three families:` and add to the family list: `  - Local delegate: \`local_delegate\` / \`local_delegate_result\` (Ollama, on-device)`
 2. Stable Public Surface: add a `Tool names (local delegate):` block listing both names.
-3. Provider Mapping: add a `### \`local_delegate\` / \`local_delegate_result\`` section documenting: provider (local Ollama, default `http://localhost:11434`, overridable via `AI_TOOLS_OLLAMA_URL` env or Keychain service `OLLAMA_URL`); model allowlist (three qwen3.6 tags, default base); purpose (privacy / quota offload / second opinion / background jobs); latency (seconds-to-minutes, background via `job_id` + poll); privacy note (input never leaves the machine; nothing written to disk; jobs are in-memory and single-collect); `think` and `keep_alive` semantics.
+3. Provider Mapping: add a `### \`local_delegate\` / \`local_delegate_result\`` section documenting: provider (**local-first Ollama endpoint chain** — default `http://localhost:11434` → `https://ollama-mbp.djvassallo.com` (Cloudflare-Access-gated); override via `AI_TOOLS_OLLAMA_URLS` comma-separated env (singular `AI_TOOLS_OLLAMA_URL` honored for compat), Keychain `OLLAMA_URL` appended; per-call `/api/tags` probe picks the first endpoint serving the tag, cached 60 s; remote endpoints require https + CF Access service-token creds in Keychain, else skipped); model allowlist (three qwen3.6 tags; default base tag inherits each host's window — 64k JVMBPro / 32k jvmacmini; env `AI_TOOLS_OLLAMA_DEFAULT_MODEL` may pick a different allowlisted tag); purpose (privacy / quota offload / second opinion / background jobs); latency (seconds-to-minutes, background via `job_id` + poll); privacy note (**input stays on your machines** — on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API; nothing written to disk; jobs in-memory and single-collect); `think` semantics and `keep_alive` (omit to inherit the server's `OLLAMA_KEEP_ALIVE`).
 4. In the "How It Works" bullet list, add: `- calls the local Ollama server (native /api/chat) for the local_delegate family`.
 5. Update the closing "Together these complement..." paragraph: add "use `local_delegate` when the input must stay on-device or the task is cheap mechanical work".
 
@@ -1145,10 +1193,12 @@ Make these edits (prose may be adapted, facts must be exact):
 In the `mcp_server.py` docstring, change "four families of tools" to "five families of tools" and insert after the gemini bullet:
 
 ```
-- ``local_delegate`` / ``local_delegate_result``: local Ollama
-  delegation — send a task to the on-device qwen3.6 coding model
-  (native /api/chat, think off by default). Input text never leaves
-  the machine; background jobs are in-memory and single-collect.
+- ``local_delegate`` / ``local_delegate_result``: local-first Ollama
+  delegation — send a task to the qwen3.6 coding model (native
+  /api/chat, think off by default) via an ordered endpoint chain:
+  localhost first, then the user's own Cloudflare-Access-gated
+  remote. Input text never leaves the user's machines; background
+  jobs are in-memory and single-collect.
 ```
 
 - [ ] **Step 3: mcpb/manifest.json**
@@ -1156,6 +1206,9 @@ In the `mcp_server.py` docstring, change "four families of tools" to "five famil
 - In `description`: "…— exposed as 11 MCP tools." → "…, local Ollama delegation, and local conversation-session persistence — exposed as 13 MCP tools."
 - In `long_description`: "Four families of tools:" → "Five families of tools:" and insert as family (4): `(4) local_delegate sends a task to the machine's local Ollama qwen3.6 model — on-device, input never leaves the machine — synchronously or in the background via local_delegate_result polling.` (renumber sessions to (5)).
 - In the `tools` array, add two entries following the existing entry shape (name + description matching the Tool schema descriptions from Task 4, abbreviated to one sentence each).
+- **[v1.1]** Add `user_config` entries mapped to env (follow the manifest's existing `user_config`/`env` conventions — read the file first; MCPB v0.3 `${user_config.KEY}` interpolation in the server's `mcp_config.env` block):
+  - `ollama_endpoints` — type string, title "Ollama endpoint chain", description "Comma-separated ordered list of Ollama endpoints, local first", default `http://localhost:11434,https://ollama-mbp.djvassallo.com`, required false → env `AI_TOOLS_OLLAMA_URLS`
+  - `default_model` — type string, title "Default delegate model", description "Must be one of the allowlisted qwen3.6 tags", default `qwen3.6:35b-a3b-coding-nvfp4`, required false → env `AI_TOOLS_OLLAMA_DEFAULT_MODEL`
 - Validate: `python3 -c "import json; json.load(open('mcpb/manifest.json'))"`.
 
 - [ ] **Step 4: commands/local-delegate.md**
@@ -1243,7 +1296,11 @@ Adds the local-delegate tool family per the approved spec
   sync or background)
 - `local_delegate_result`: poll/collect background jobs (in-memory,
   single-collect, cap 4, 30-min ceiling)
-- Endpoint: env AI_TOOLS_OLLAMA_URL → Keychain OLLAMA_URL → localhost:11434
+- Endpoints (v1.1): local-first ordered chain (default localhost →
+  https://ollama-mbp.djvassallo.com behind Cloudflare Access), per-call
+  /api/tags probe + 60s cache, CF Access service-token headers from
+  Keychain for remote https (creds absent → endpoint skipped), non-https
+  remote rejected
 - Non-fatal ollama reachability line in `--check`
 - README charter updated: hosted **and** local behind one MCP surface
 
@@ -1257,3 +1314,638 @@ EOF
 ```
 
 Then run the remaining Stage-2 gate (pr-agent local via its wrapper if configured for this repo) and wait for all GitHub bot reviewers before merge, per the standing review pipeline.
+
+---
+
+### Task 8: [v1.1] Endpoint chain, per-model probe + cache, default-model env (reworks Task 1/2 code)
+
+**Files:**
+- Modify: `mcp_server.py` — in the Local-delegate constants/helpers section: replace `_resolve_ollama_url` (and `_OLLAMA_DEFAULT_URL`) with the chain machinery below; rework `_post_ollama_chat` to select per call
+- Modify: `test_local_delegate.py` — replace `TestResolveOllamaUrl` with `TestResolveOllamaChain`; add `TestDelegateDefaultModel`, `TestSelectOllamaEndpoint`; rework `TestPostOllamaChat` (see Step 1)
+
+**Interfaces:**
+- Consumes: Task 1 constants (`_OLLAMA_URL_ENV_VAR`, `_OLLAMA_URL_KEYCHAIN_SERVICE`, allowlist), `get_api_key_from_keychain`, `_get_http_client`, `_http_error_payload`, `redact_secrets`
+- Produces (used by Tasks 4/5/9):
+  - `_OLLAMA_URLS_ENV_VAR = "AI_TOOLS_OLLAMA_URLS"`, `_OLLAMA_DEFAULT_MODEL_ENV_VAR = "AI_TOOLS_OLLAMA_DEFAULT_MODEL"`
+  - `_OLLAMA_DEFAULT_CHAIN: tuple[str, ...] = ("http://localhost:11434", "https://ollama-mbp.djvassallo.com")`
+  - `_OLLAMA_PROBE_TIMEOUT_S = 2.0`, `_OLLAMA_PROBE_CACHE_TTL_S = 60.0`
+  - `def _is_localhost_endpoint(url: str) -> bool`
+  - `def _validate_ollama_endpoint(url: str) -> str` — raises `ValueError` (bad scheme/netloc, or plain-http non-localhost)
+  - `def _resolve_ollama_chain() -> list[str]` — blocking (Keychain); validated, deduped, ordered
+  - `def _delegate_default_model() -> str` — env override honored only if allowlisted, else base tag
+  - `def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None` — **stub in this task**: `{}` for localhost, `None` for remote (None = SKIP, never call bare; Task 9 replaces with real CF Access lookup)
+  - `async def _select_ollama_endpoint(model: str) -> str` — raises `ValueError` naming every endpoint tried when none serves the tag
+  - `_ollama_endpoint_cache: dict[str, tuple[str, float]]` (model → (endpoint, expires))
+  - `_post_ollama_chat(payload, timeout_s)` — same signature, now selects endpoint internally and sends auth headers
+  - **Removes:** `_resolve_ollama_url`, `_OLLAMA_DEFAULT_URL`
+
+- [ ] **Step 1: Rework/replace tests**
+
+Delete class `TestResolveOllamaUrl`. Rework `TestPostOllamaChat`: delete its `setUp` env patch; instead each test patches endpoint selection directly — add to the class:
+
+```python
+    def _with_selection(self, endpoint="http://localhost:11434"):
+        return mock.patch.object(
+            mcp_server,
+            "_select_ollama_endpoint",
+            mock.AsyncMock(return_value=endpoint),
+        )
+```
+
+wrap each `self._post(...)` call site in `with self._with_selection():` (the redaction test passes its JWT-bearing URL as `endpoint=` instead of via env); replace `test_bad_configured_url_is_failure_envelope` with:
+
+```python
+    def test_selection_failure_is_failure_envelope(self):
+        with mock.patch.object(
+            mcp_server,
+            "_select_ollama_endpoint",
+            mock.AsyncMock(side_effect=ValueError("No Ollama endpoint serves 'm'")),
+        ):
+            client = _FakeClient(response=_FakeResponse(json_data={}))
+            out = self._post(client)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("No Ollama endpoint serves", out["error"])
+```
+
+update the happy-path test to also assert `client.calls[0][1]["headers"] == {}`, and add:
+
+```python
+    def test_connect_error_drops_cache_entry(self):
+        mcp_server._ollama_endpoint_cache["m"] = ("http://localhost:11434", 10**12)
+        client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
+        with self._with_selection():
+            self._post(client, payload={"model": "m"})
+        self.assertNotIn("m", mcp_server._ollama_endpoint_cache)
+```
+
+Then add the new test classes:
+
+```python
+_MODEL = "qwen3.6:35b-a3b-coding-nvfp4"
+
+
+def _no_keychain(service, account):
+    raise ValueError("not found")
+
+
+class TestResolveOllamaChain(unittest.TestCase):
+    def _chain(self, env, keychain=_no_keychain):
+        cleared = {k: "" for k in ("AI_TOOLS_OLLAMA_URLS", "AI_TOOLS_OLLAMA_URL")}
+        with mock.patch.dict(os.environ, {**cleared, **env}):
+            with mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", side_effect=keychain
+            ):
+                return mcp_server._resolve_ollama_chain()
+
+    def test_urls_env_is_ordered_chain(self):
+        chain = self._chain(
+            {"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434/, https://mini.tail:443"}
+        )
+        self.assertEqual(chain, ["http://localhost:11434", "https://mini.tail:443"])
+
+    def test_singular_env_compat_one_item(self):
+        chain = self._chain({"AI_TOOLS_OLLAMA_URL": "http://localhost:11434"})
+        self.assertEqual(chain, ["http://localhost:11434"])
+
+    def test_default_chain_when_no_env(self):
+        self.assertEqual(self._chain({}), list(mcp_server._OLLAMA_DEFAULT_CHAIN))
+
+    def test_keychain_endpoint_appended(self):
+        chain = self._chain(
+            {"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434"},
+            keychain=lambda s, a: "https://kc.example",
+        )
+        self.assertEqual(chain, ["http://localhost:11434", "https://kc.example"])
+
+    def test_duplicates_dropped_preserving_order(self):
+        chain = self._chain(
+            {"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434,http://localhost:11434/"}
+        )
+        self.assertEqual(chain, ["http://localhost:11434"])
+
+    def test_empty_entries_ignored(self):
+        chain = self._chain({"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434,,"})
+        self.assertEqual(chain, ["http://localhost:11434"])
+
+    def test_plain_http_remote_rejected(self):
+        with self.assertRaises(ValueError):
+            self._chain({"AI_TOOLS_OLLAMA_URLS": "http://remote.example:11434"})
+
+    def test_garbage_url_rejected(self):
+        with self.assertRaises(ValueError):
+            self._chain({"AI_TOOLS_OLLAMA_URLS": "http://"})
+
+
+class TestDelegateDefaultModel(unittest.TestCase):
+    def test_base_tag_when_env_unset(self):
+        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": ""}):
+            self.assertEqual(
+                mcp_server._delegate_default_model(),
+                mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL,
+            )
+
+    def test_allowlisted_env_override_honored(self):
+        tag = "qwen3.6:35b-a3b-coding-nvfp4-32k"
+        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": tag}):
+            self.assertEqual(mcp_server._delegate_default_model(), tag)
+
+    def test_non_allowlisted_env_falls_back_to_base(self):
+        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": "llama3:8b"}):
+            self.assertEqual(
+                mcp_server._delegate_default_model(),
+                mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL,
+            )
+
+
+class _FakeTagsClient:
+    """Programmable fake for _select_ollama_endpoint probes."""
+
+    def __init__(self, tags_by_url=None, exc_by_url=None):
+        self.tags_by_url = tags_by_url or {}
+        self.exc_by_url = exc_by_url or {}
+        self.get_calls: list = []
+
+    async def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        base = url.removesuffix("/api/tags")
+        if base in self.exc_by_url:
+            raise self.exc_by_url[base]
+        return _FakeResponse(
+            json_data={"models": [{"name": t} for t in self.tags_by_url.get(base, [])]}
+        )
+
+
+class TestSelectOllamaEndpoint(unittest.TestCase):
+    EP1 = "http://localhost:11434"
+    EP2 = "http://127.0.0.1:11435"
+
+    def setUp(self):
+        mcp_server._ollama_endpoint_cache.clear()
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "AI_TOOLS_OLLAMA_URLS": f"{self.EP1},{self.EP2}",
+                "AI_TOOLS_OLLAMA_URL": "",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        kc = mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", side_effect=_no_keychain
+        )
+        kc.start()
+        self.addCleanup(kc.stop)
+
+    def _select(self, client, model=_MODEL):
+        with mock.patch.object(
+            mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+        ):
+            return asyncio.run(mcp_server._select_ollama_endpoint(model))
+
+    def test_picks_first_endpoint_with_tag(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [_MODEL], self.EP2: [_MODEL]})
+        self.assertEqual(self._select(client), self.EP1)
+
+    def test_skips_endpoint_missing_tag(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: ["other:1b"], self.EP2: [_MODEL]})
+        self.assertEqual(self._select(client), self.EP2)
+
+    def test_skips_unreachable_endpoint(self):
+        client = _FakeTagsClient(
+            tags_by_url={self.EP2: [_MODEL]},
+            exc_by_url={self.EP1: mcp_server.httpx.ConnectError("refused")},
+        )
+        self.assertEqual(self._select(client), self.EP2)
+
+    def test_all_miss_raises_naming_every_endpoint(self):
+        client = _FakeTagsClient(
+            tags_by_url={self.EP2: ["other:1b"]},
+            exc_by_url={self.EP1: mcp_server.httpx.ConnectError("refused")},
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self._select(client)
+        message = str(ctx.exception)
+        self.assertIn(self.EP1, message)
+        self.assertIn(self.EP2, message)
+        self.assertIn("unreachable", message)
+        self.assertIn("other:1b", message)
+
+    def test_cache_prevents_reprobe_within_ttl(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [_MODEL]})
+        self._select(client)
+        calls_after_first = len(client.get_calls)
+        self._select(client)
+        self.assertEqual(len(client.get_calls), calls_after_first)
+
+    def test_cache_expiry_reprobes(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [_MODEL]})
+        with mock.patch.object(mcp_server, "_OLLAMA_PROBE_CACHE_TTL_S", 0.0):
+            self._select(client)
+            calls_after_first = len(client.get_calls)
+            self._select(client)
+        self.assertGreater(len(client.get_calls), calls_after_first)
+
+    def test_remote_without_creds_is_skipped_with_reason(self):
+        with mock.patch.dict(
+            os.environ, {"AI_TOOLS_OLLAMA_URLS": "https://remote.example"}
+        ):
+            client = _FakeTagsClient(tags_by_url={"https://remote.example": [_MODEL]})
+            with self.assertRaises(ValueError) as ctx:
+                self._select(client)
+        self.assertIn("skipped", str(ctx.exception))
+        self.assertEqual(client.get_calls, [])  # never called bare
+```
+
+- [ ] **Step 2: Run — verify FAIL**
+
+Run: `uv run --with pytest pytest test_local_delegate.py -q`
+Expected: ERRORs — `_resolve_ollama_chain`, `_select_ollama_endpoint`, `_delegate_default_model` missing; reworked TestPostOllamaChat failing on `_select_ollama_endpoint` patch target
+
+- [ ] **Step 3: Implement**
+
+In the Local-delegate section of `mcp_server.py`: delete `_OLLAMA_DEFAULT_URL` and `_resolve_ollama_url`; add after the existing constants:
+
+```python
+_OLLAMA_URLS_ENV_VAR = "AI_TOOLS_OLLAMA_URLS"
+_OLLAMA_DEFAULT_MODEL_ENV_VAR = "AI_TOOLS_OLLAMA_DEFAULT_MODEL"
+
+# v1.1 (spec amendment): local-first endpoint chain. The remote default is
+# the user's own Cloudflare-Access-gated JVMBPro tunnel — never a
+# third-party service.
+_OLLAMA_DEFAULT_CHAIN: tuple[str, ...] = (
+    "http://localhost:11434",
+    "https://ollama-mbp.djvassallo.com",
+)
+_OLLAMA_PROBE_TIMEOUT_S = 2.0
+_OLLAMA_PROBE_CACHE_TTL_S = 60.0
+_LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_localhost_endpoint(url: str) -> bool:
+    return (urllib.parse.urlparse(url).hostname or "") in _LOCALHOST_HOSTS
+
+
+def _validate_ollama_endpoint(url: str) -> str:
+    """Validate one chain entry; fail closed on anything not plain http(s).
+
+    Loopback may be http; every other host must be https (v1.1 rule — a
+    remote endpoint is only ever the Access-gated tunnel).
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"Invalid Ollama endpoint {redact_secrets(url)!r}: must be "
+            "http(s)://host[:port]"
+        )
+    if parsed.scheme == "http" and not _is_localhost_endpoint(url):
+        raise ValueError(
+            f"Refusing plain-http non-localhost Ollama endpoint "
+            f"{redact_secrets(url)!r} — remote endpoints must be https"
+        )
+    return url.rstrip("/")
+
+
+def _resolve_ollama_chain() -> list[str]:
+    """Ordered Ollama endpoint chain (v1.1).
+
+    Env `AI_TOOLS_OLLAMA_URLS` (comma-separated) wins; singular
+    `AI_TOOLS_OLLAMA_URL` is honored as a one-item chain for v1 compat;
+    otherwise the default local-first chain. A Keychain `OLLAMA_URL`
+    endpoint is appended when present. Every entry is validated; dupes
+    dropped preserving order. Blocking (Keychain) — async callers wrap
+    in asyncio.to_thread.
+    """
+    raw = os.environ.get(_OLLAMA_URLS_ENV_VAR, "").strip()
+    if raw:
+        entries = [e.strip() for e in raw.split(",") if e.strip()]
+    else:
+        single = os.environ.get(_OLLAMA_URL_ENV_VAR, "").strip()
+        entries = [single] if single else list(_OLLAMA_DEFAULT_CHAIN)
+    try:
+        keychain_url = get_api_key_from_keychain(
+            _OLLAMA_URL_KEYCHAIN_SERVICE, getpass.getuser()
+        ).strip()
+        if keychain_url:
+            entries.append(keychain_url)
+    except ValueError:
+        pass  # optional config — absence is the common case
+    chain: list[str] = []
+    for entry in entries:
+        validated = _validate_ollama_endpoint(entry)
+        if validated not in chain:
+            chain.append(validated)
+    return chain
+
+
+def _delegate_default_model() -> str:
+    """Default model tag; env override honored only if allowlisted.
+
+    Falls back silently to the base tag (run_check surfaces a warn) so a
+    typo'd Desktop setting cannot break tool listing.
+    """
+    env_model = os.environ.get(_OLLAMA_DEFAULT_MODEL_ENV_VAR, "").strip()
+    if env_model in OLLAMA_DELEGATE_MODELS:
+        return env_model
+    return OLLAMA_DELEGATE_DEFAULT_MODEL
+
+
+def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
+    """Auth headers for an endpoint; None means SKIP (never call bare).
+
+    Stub for this task: localhost needs no auth ({}); remote endpoints
+    report None until the Cloudflare Access Keychain wiring lands in the
+    next task.
+    """
+    if _is_localhost_endpoint(endpoint):
+        return {}
+    return None
+
+
+_ollama_endpoint_cache: dict[str, tuple[str, float]] = {}
+
+
+async def _select_ollama_endpoint(model: str) -> str:
+    """First endpoint in the chain whose /api/tags lists `model`.
+
+    Results are cached per model for _OLLAMA_PROBE_CACHE_TTL_S. Raises
+    ValueError naming every endpoint tried and what each reported —
+    actionable and fail-closed.
+    """
+    cached = _ollama_endpoint_cache.get(model)
+    if cached is not None and time.monotonic() < cached[1]:
+        return cached[0]
+    chain = await asyncio.to_thread(_resolve_ollama_chain)
+    client = await _get_http_client()
+    attempts: list[str] = []
+    for endpoint in chain:
+        headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+        if headers is None:
+            attempts.append(
+                f"{endpoint}: skipped (Cloudflare Access credentials not in Keychain)"
+            )
+            continue
+        try:
+            response = await client.get(
+                f"{endpoint}/api/tags",
+                headers=headers,
+                timeout=_OLLAMA_PROBE_TIMEOUT_S,
+            )
+            response.raise_for_status()
+            models = response.json().get("models", [])
+            tags = [
+                str(m.get("name") or m.get("model") or "")
+                for m in models
+                if isinstance(m, dict)
+            ]
+        except httpx.HTTPStatusError as exc:
+            attempts.append(f"{endpoint}: HTTP {exc.response.status_code}")
+            continue
+        except httpx.RequestError:
+            attempts.append(f"{endpoint}: unreachable")
+            continue
+        except ValueError:
+            attempts.append(f"{endpoint}: invalid JSON from /api/tags")
+            continue
+        if model in tags:
+            _ollama_endpoint_cache[model] = (
+                endpoint,
+                time.monotonic() + _OLLAMA_PROBE_CACHE_TTL_S,
+            )
+            return endpoint
+        present = ", ".join(sorted(t for t in tags if t)) or "no models"
+        attempts.append(f"{endpoint}: model not present (has {present})")
+    detail = "; ".join(attempts) or "empty endpoint chain"
+    raise ValueError(
+        f"No Ollama endpoint serves {model!r}: {redact_secrets(detail)}"
+    )
+```
+
+Then rework `_post_ollama_chat` to (docstring updated accordingly):
+
+```python
+async def _post_ollama_chat(
+    payload: dict[str, Any], timeout_s: float
+) -> dict[str, Any]:
+    """POST /api/chat to the first chain endpoint serving payload['model'].
+
+    Same structured-error contract as _post_agent_research: selection,
+    network, HTTP, and parse failures return {"status": "failed", ...}
+    instead of raising. Remote https endpoints get Cloudflare Access
+    service-token headers (absent creds → skipped at selection; the None
+    check here is defense in depth). No retries: an endpoint is either
+    serving or not.
+    """
+    model = str(payload.get("model", ""))
+    try:
+        endpoint = await _select_ollama_endpoint(model)
+    except ValueError as exc:
+        return {"status": "failed", "error": redact_secrets(str(exc))}
+    headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+    if headers is None:
+        return {
+            "status": "failed",
+            "error": f"no credentials for {redact_secrets(endpoint)}",
+        }
+    client = await _get_http_client()
+    try:
+        response = await client.post(
+            f"{endpoint}/api/chat", json=payload, headers=headers, timeout=timeout_s
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        failure = _http_error_payload(exc)
+        if exc.response.status_code == 404:
+            failure["error"] += (
+                f" — model may not be pulled on this host; try: ollama pull {model}"
+            )
+        return failure
+    except httpx.ConnectError:
+        # Answered the probe moments ago but refused the POST — drop the
+        # cached resolution so the next call re-probes the chain.
+        _ollama_endpoint_cache.pop(model, None)
+        return {
+            "status": "failed",
+            "error": (
+                f"Ollama not running at {redact_secrets(endpoint)} — is the "
+                "LaunchAgent up? "
+                "(launchctl kickstart -k gui/$UID/com.jasonvassallo.ollama)"
+            ),
+        }
+    except httpx.RequestError as exc:
+        return {
+            "status": "failed",
+            "error": f"request error: {redact_secrets(str(exc))}",
+        }
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "error": f"invalid JSON from Ollama: {redact_secrets(str(exc))}",
+        }
+```
+
+- [ ] **Step 4: Run — verify PASS**
+
+Run: `uv run --with pytest pytest test_local_delegate.py -q`
+Expected: all pass (~31 tests). Then full suite: `uv run --with pytest pytest test_local_delegate.py test_agent_research.py test_redact.py test_session_mgmt.py -q` — zero regressions.
+
+- [ ] **Step 5: Format + commit**
+
+```bash
+uv tool run ruff format mcp_server.py test_local_delegate.py
+git add mcp_server.py test_local_delegate.py
+git commit -m "feat(v1.1): local-first Ollama endpoint chain with per-model probe + cache"
+```
+
+---
+
+### Task 9: [v1.1] Cloudflare Access service-token auth for remote endpoints
+
+**Files:**
+- Modify: `mcp_server.py` — add the two Keychain service constants; replace the Task-8 stub `_ollama_auth_headers` with the real implementation
+- Modify: `test_local_delegate.py` — add `TestOllamaAuthHeaders`; add POST-header and probe-header tests
+
+**Interfaces:**
+- Consumes: `_is_localhost_endpoint`, `get_api_key_from_keychain`, Task 8's selection/POST paths (which already pass `headers` through)
+- Produces:
+  - `_CF_ACCESS_ID_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_ID"`
+  - `_CF_ACCESS_SECRET_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_SECRET"`
+  - `_ollama_auth_headers(endpoint) -> dict[str, str] | None` (final): `{}` localhost; CF Access header pair for remote https; `None` when either cred absent
+
+- [ ] **Step 1: Add failing tests**
+
+```python
+class TestOllamaAuthHeaders(unittest.TestCase):
+    def _keychain(self, mapping):
+        def fake(service, account):
+            if service in mapping:
+                return mapping[service]
+            raise ValueError("not found")
+
+        return mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", side_effect=fake
+        )
+
+    def test_localhost_needs_no_auth(self):
+        for ep in ("http://localhost:11434", "http://127.0.0.1:11434"):
+            self.assertEqual(mcp_server._ollama_auth_headers(ep), {})
+
+    def test_remote_with_creds_gets_cf_access_headers(self):
+        with self._keychain(
+            {
+                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+            }
+        ):
+            headers = mcp_server._ollama_auth_headers("https://remote.example")
+        self.assertEqual(
+            headers,
+            {"CF-Access-Client-Id": "id-123", "CF-Access-Client-Secret": "sec-456"},
+        )
+
+    def test_remote_missing_either_cred_returns_none(self):
+        with self._keychain({"OLLAMA_CF_ACCESS_CLIENT_ID": "id-123"}):
+            self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
+        with self._keychain({"OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456"}):
+            self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
+
+    def test_probe_sends_cf_headers_to_remote(self):
+        with mock.patch.dict(
+            os.environ,
+            {"AI_TOOLS_OLLAMA_URLS": "https://remote.example", "AI_TOOLS_OLLAMA_URL": ""},
+        ):
+            with self._keychain(
+                {
+                    "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                    "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+                }
+            ):
+                mcp_server._ollama_endpoint_cache.clear()
+                client = _FakeTagsClient(
+                    tags_by_url={"https://remote.example": [_MODEL]}
+                )
+                with mock.patch.object(
+                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+                ):
+                    endpoint = asyncio.run(mcp_server._select_ollama_endpoint(_MODEL))
+        self.assertEqual(endpoint, "https://remote.example")
+        _, kwargs = client.get_calls[0]
+        self.assertEqual(kwargs["headers"]["CF-Access-Client-Id"], "id-123")
+
+    def test_post_sends_cf_headers_and_never_leaks_secret_in_errors(self):
+        with self._keychain(
+            {
+                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+            }
+        ):
+            with mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value="https://remote.example"),
+            ):
+                client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
+                with mock.patch.object(
+                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+                ):
+                    out = asyncio.run(
+                        mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
+                    )
+        self.assertEqual(out["status"], "failed")
+        self.assertNotIn("sec-456", out["error"])
+```
+
+- [ ] **Step 2: Run — verify FAIL**
+
+Run: `uv run --with pytest pytest test_local_delegate.py -q -k OllamaAuthHeaders`
+Expected: `test_remote_with_creds_gets_cf_access_headers` and the probe/POST header tests FAIL (stub returns None for remote)
+
+- [ ] **Step 3: Implement**
+
+Add constants next to `_OLLAMA_URL_KEYCHAIN_SERVICE`:
+
+```python
+_CF_ACCESS_ID_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_ID"
+_CF_ACCESS_SECRET_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_SECRET"
+```
+
+Replace the stub `_ollama_auth_headers` with:
+
+```python
+def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
+    """Auth headers for an Ollama endpoint; None means SKIP, never call bare.
+
+    localhost → {} (no auth). Non-localhost https → Cloudflare Access
+    service-token headers read from the Keychain per call (never cached,
+    never logged). Either credential absent → None (fail closed): the
+    caller treats the endpoint as unavailable rather than calling an
+    Access-gated host unauthenticated.
+    """
+    if _is_localhost_endpoint(endpoint):
+        return {}
+    user = getpass.getuser()
+    try:
+        client_id = get_api_key_from_keychain(_CF_ACCESS_ID_KEYCHAIN_SERVICE, user)
+        client_secret = get_api_key_from_keychain(
+            _CF_ACCESS_SECRET_KEYCHAIN_SERVICE, user
+        )
+    except ValueError:
+        return None
+    return {
+        "CF-Access-Client-Id": client_id,
+        "CF-Access-Client-Secret": client_secret,
+    }
+```
+
+- [ ] **Step 4: Run — verify PASS**
+
+Run: `uv run --with pytest pytest test_local_delegate.py -q`
+Expected: all pass (Task 8's `test_remote_without_creds_is_skipped_with_reason` still passes — its keychain mock raises for every service, so creds resolve to None). Then the full 4-file suite — zero regressions.
+
+- [ ] **Step 5: Format + commit**
+
+```bash
+uv tool run ruff format mcp_server.py test_local_delegate.py
+git add mcp_server.py test_local_delegate.py
+git commit -m "feat(v1.1): Cloudflare Access service-token auth for remote Ollama endpoints"
+```
