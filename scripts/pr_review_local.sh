@@ -13,7 +13,13 @@
 # the same model review in seconds with clean, non-`<think>`-polluted output.
 #
 # Overridable via env: PR_AGENT_OLLAMA_MODEL, PR_AGENT_MAX_TOKENS,
-# PR_AGENT_AI_TIMEOUT, OLLAMA_API_BASE, PR_AGENT_PROXY_PORT.
+# PR_AGENT_AI_TIMEOUT, OLLAMA_API_BASE, PR_AGENT_PROXY_PORT, PR_AGENT_NUM_CTX.
+# PR_AGENT_NUM_CTX: stock Ollama defaults to a small context window, which would
+# silently truncate pr-agent's PR_AGENT_MAX_TOKENS (14000) budget. The proxy sets
+# a num_ctx floor of 16384 (comfortably above the 14k budget) on every request
+# that doesn't already specify one, so the script doesn't depend on the owner's
+# servers having OLLAMA_CONTEXT_LENGTH set — servers with a larger context are
+# unaffected since an explicit caller-set num_ctx always wins.
 # CONFIG__PUBLISH_OUTPUT=false dry-runs it (no posting to the PR).
 #
 set -euo pipefail
@@ -27,17 +33,20 @@ CMD=("${@:-review}")
 UPSTREAM="${OLLAMA_API_BASE:-http://localhost:11434}"
 PROXY_PORT="${PR_AGENT_PROXY_PORT:-11435}"
 MODEL="${PR_AGENT_OLLAMA_MODEL:-ollama/qwen3.6:35b-a3b-coding-nvfp4}"
+NUM_CTX="${PR_AGENT_NUM_CTX:-16384}"
 
 # --- stand up the think:false-injecting Ollama proxy (stdlib only) -----------
-PROXY_PY="$(mktemp -t ollama_think_off.XXXXXX).py"
+PROXY_PY="$(mktemp -t ollama_think_off.XXXXXX)"
 cat >"$PROXY_PY" <<'PY'
 import json
 import sys
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM = sys.argv[1].rstrip("/")
 PORT = int(sys.argv[2])
+NUM_CTX = int(sys.argv[3])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -50,6 +59,8 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 if isinstance(data, dict):
                     data["think"] = False  # force qwen3 thinking OFF
+                    options = data.setdefault("options", {})
+                    options.setdefault("num_ctx", NUM_CTX)
                     body = json.dumps(data).encode()
             except (json.JSONDecodeError, ValueError):
                 pass
@@ -57,15 +68,27 @@ class Handler(BaseHTTPRequestHandler):
             UPSTREAM + self.path, data=body, method=method,
             headers={"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req) as resp:
-            self.send_response(resp.status)
-            self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
+                self.end_headers()
+                while True:
+                    chunk = resp.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+        except urllib.error.HTTPError as e:
+            err_body = e.read()
+            self.send_response(e.code)
+            self.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
             self.end_headers()
-            while True:
-                chunk = resp.read(8192)
-                if not chunk:
-                    break
-                self.wfile.write(chunk)
+            self.wfile.write(err_body)
+        except (urllib.error.URLError, TimeoutError) as e:
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": f"upstream Ollama unreachable: {e}"}).encode())
 
     def do_POST(self):
         self._forward("POST")
@@ -80,7 +103,7 @@ class Handler(BaseHTTPRequestHandler):
 ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
 PY
 
-python3 "$PROXY_PY" "$UPSTREAM" "$PROXY_PORT" &
+python3 "$PROXY_PY" "$UPSTREAM" "$PROXY_PORT" "$NUM_CTX" &
 PROXY_PID=$!
 cleanup() { kill "$PROXY_PID" 2>/dev/null || true; rm -f "$PROXY_PY"; }
 trap cleanup EXIT
