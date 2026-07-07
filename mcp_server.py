@@ -10,7 +10,7 @@
 # ]
 # ///
 """
-MCP server providing four families of tools:
+MCP server providing five families of tools:
 
 - ``quick_research`` / ``deep_research``: Perplexity Sonar / Sonar Pro
   — inline research with citations. ``quick_research`` uses the smaller
@@ -28,6 +28,12 @@ MCP server providing four families of tools:
   long-running (minutes, up to 60), citation-dense reports via
   Google's hosted research agent. Asynchronous: ``_start`` returns an
   interaction_id; poll ``_result`` until terminal status.
+- ``local_delegate`` / ``local_delegate_result``: local-first Ollama
+  delegation — send a task to the qwen3.6 coding model (native
+  /api/chat, think off by default) via an ordered endpoint chain:
+  localhost first, then the user's own Cloudflare-Access-gated
+  remote. Input text never leaves the user's machines; background
+  jobs are in-memory and single-collect.
 - ``list_sessions`` / ``save_session`` / ``load_session`` /
   ``update_session`` / ``delete_session``: local conversation-session
   persistence backed by ``~/.claude/sessions/``.

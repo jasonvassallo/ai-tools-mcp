@@ -3,8 +3,8 @@
   "name": "ai-tools-mcp",
   "display_name": "AI Tools MCP",
   "version": "1.2.0",
-  "description": "Perplexity Sonar (quick), Sonar Pro (deep), and Agent API Search-as-Code (bulk) research, Google Gemini Deep Research (async, long-form reports), and local conversation-session persistence — exposed as 11 MCP tools.",
-  "long_description": "Four families of tools: (1) quick_research uses Perplexity Sonar for fast single-source citation-backed answers, and deep_research uses Sonar Pro for inline multi-source synthesis. (2) agent_research drives Perplexity's Agent API with the sandbox tool (Search as Code): a hosted agent writes and runs code that searches programmatically, covering every item in bulk/enumerable research tasks — synchronous or background via agent_research_result polling. (3) gemini_deep_research_start/_result run long-form research tasks (5–60 minutes) on Google's Deep Research model and poll for results. (4) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
+  "description": "Perplexity Sonar (quick), Sonar Pro (deep), and Agent API Search-as-Code (bulk) research, Google Gemini Deep Research (async, long-form reports), local Ollama delegation, and local conversation-session persistence — exposed as 13 MCP tools.",
+  "long_description": "Five families of tools: (1) quick_research uses Perplexity Sonar for fast single-source citation-backed answers, and deep_research uses Sonar Pro for inline multi-source synthesis. (2) agent_research drives Perplexity's Agent API with the sandbox tool (Search as Code): a hosted agent writes and runs code that searches programmatically, covering every item in bulk/enumerable research tasks — synchronous or background via agent_research_result polling. (3) gemini_deep_research_start/_result run long-form research tasks (5–60 minutes) on Google's Deep Research model and poll for results. (4) local_delegate sends a task to the machine's local Ollama qwen3.6 model — on-device, input never leaves the machine — synchronously or in the background via local_delegate_result polling. (5) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
   "author": {
     "name": "Jason Vassallo",
     "email": "jasonvassallo@mac.com"
@@ -20,7 +20,11 @@
     "entry_point": "server/mcp_server.py",
     "mcp_config": {
       "command": "${user_config.uv_path}",
-      "args": ["run", "${__dirname}/server/mcp_server.py"]
+      "args": ["run", "${__dirname}/server/mcp_server.py"],
+      "env": {
+        "AI_TOOLS_OLLAMA_URLS": "${user_config.ollama_endpoints}",
+        "AI_TOOLS_OLLAMA_DEFAULT_MODEL": "${user_config.default_model}"
+      }
     }
   },
   "user_config": {
@@ -30,6 +34,20 @@
       "description": "Absolute path to your uv binary (PEP 723 inline-deps runner). Find yours with `which uv` in Terminal. The default works for Homebrew installs on Apple Silicon.",
       "default": "/opt/homebrew/bin/uv",
       "required": true
+    },
+    "ollama_endpoints": {
+      "type": "string",
+      "title": "Ollama endpoint chain",
+      "description": "Comma-separated ordered list of Ollama endpoints, local first",
+      "default": "http://localhost:11434,https://ollama-mbp.djvassallo.com",
+      "required": false
+    },
+    "default_model": {
+      "type": "string",
+      "title": "Default delegate model",
+      "description": "Must be one of the allowlisted qwen3.6 tags",
+      "default": "qwen3.6:35b-a3b-coding-nvfp4",
+      "required": false
     }
   },
   "tools": [
@@ -39,6 +57,8 @@
     {"name": "agent_research_result", "description": "Poll a background agent_research task by response_id (formatted answer when completed)."},
     {"name": "gemini_deep_research_start", "description": "Start an asynchronous Google Gemini Deep Research task (returns interaction_id; poll with _result)."},
     {"name": "gemini_deep_research_result", "description": "Poll a Gemini Deep Research task by interaction_id (status, output_text when completed)."},
+    {"name": "local_delegate", "description": "Delegate a task to the local Ollama qwen3.6 coding model via a local-first endpoint chain — input never leaves your machines (synchronous by default, or background=true returns a job_id)."},
+    {"name": "local_delegate_result", "description": "Poll a background local_delegate job by job_id (single-collect: retrieving the result clears the job)."},
     {"name": "list_sessions", "description": "List all saved conversation sessions, most recent first."},
     {"name": "save_session", "description": "Persist the current conversation to ~/.claude/sessions/<uuid>.json with secret redaction."},
     {"name": "load_session", "description": "Load a previously saved session by UUID."},
