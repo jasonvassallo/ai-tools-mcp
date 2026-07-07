@@ -115,7 +115,7 @@ Standalone install:
 Claude Code plugin (loaded via `claude --plugin-dir .`):
 - `.claude-plugin/plugin.json`: Plugin manifest (name, version, author)
 - `.mcp.json`: MCP server registration (points at `mcp_server.py` via `${CLAUDE_PLUGIN_ROOT}`)
-- `commands/`: Eight slash commands (`/ai-tools-mcp:deep-research`, `:gemini-start`, `:gemini-result`, `:sessions`, `:save-session`, `:load-session`, `:update-session`, `:delete-session`)
+- `commands/`: Eleven slash commands (`/ai-tools-mcp:quick-research`, `:deep-research`, `:agent-research`, `:gemini-start`, `:gemini-result`, `:local-delegate`, `:sessions`, `:save-session`, `:load-session`, `:update-session`, `:delete-session`)
 - `skills/using-ai-research/`: When-to-use routing skill (WebSearch vs. Perplexity vs. Gemini)
 - `skills/session-workflows/`: Save/load/rename/delete patterns
 - `hooks/hooks.json` + `hooks/preflight.sh`: `SessionStart` hook that runs `--check` and surfaces credential health to Claude

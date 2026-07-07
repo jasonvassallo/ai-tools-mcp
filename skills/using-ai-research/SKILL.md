@@ -1,6 +1,6 @@
 ---
 name: using-ai-research
-description: Choose the right research tool for a question — built-in WebSearch for quick lookups, Perplexity quick_research (Sonar) for fast citation-backed answers, Perplexity deep_research (Sonar Pro) for inline multi-source synthesis, Perplexity agent_research (Search-as-Code) for bulk/enumerable research, Gemini Deep Research for long-form reports. Use whenever the user asks a research question, requests citations, or needs to investigate a topic across multiple sources.
+description: Choose the right research tool for a question — built-in WebSearch for quick lookups, Perplexity quick_research (Sonar) for fast citation-backed answers, Perplexity deep_research (Sonar Pro) for inline multi-source synthesis, Perplexity agent_research (Search-as-Code) for bulk/enumerable research, Gemini Deep Research for long-form reports, or local_delegate (Ollama) for sensitive/private input or local text work. Use whenever the user asks a research question, requests citations, needs to investigate a topic across multiple sources, has sensitive/private input that must stay on-device, or wants to perform cheap local text work (summarize, reformat, boilerplate).
 ---
 
 # Choosing a Research Tool
