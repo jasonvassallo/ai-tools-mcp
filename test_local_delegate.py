@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import os
 import sys
 import types
@@ -737,6 +738,185 @@ class TestDelegateJobs(unittest.TestCase):
                     self.assertIn("ceiling", out["error"])
 
         asyncio.run(scenario())
+
+
+class TestToolListing(unittest.TestCase):
+    def _tools(self):
+        tools = asyncio.run(mcp_server.list_tools())
+        return {t.name: t for t in tools}
+
+    def test_both_tools_listed(self):
+        by_name = self._tools()
+        self.assertIn("local_delegate", by_name)
+        self.assertIn("local_delegate_result", by_name)
+
+    def test_prompt_required_and_model_enum_matches_allowlist(self):
+        schema = self._tools()["local_delegate"].inputSchema
+        self.assertEqual(schema["required"], ["prompt"])
+        self.assertEqual(
+            schema["properties"]["model"]["enum"],
+            list(mcp_server.OLLAMA_DELEGATE_MODELS),
+        )
+
+    def test_result_requires_job_id(self):
+        schema = self._tools()["local_delegate_result"].inputSchema
+        self.assertEqual(schema["required"], ["job_id"])
+
+
+class TestLocalDelegateValidation(unittest.TestCase):
+    def test_missing_prompt(self):
+        out = _call("local_delegate", {})
+        self.assertIn("prompt", out[0].text)
+
+    def test_empty_prompt(self):
+        out = _call("local_delegate", {"prompt": "   "})
+        self.assertIn("prompt", out[0].text)
+
+    def test_model_not_in_allowlist(self):
+        out = _call("local_delegate", {"prompt": "x", "model": "llama3:8b"})
+        self.assertIn("qwen3.6:35b-a3b-coding-nvfp4", out[0].text)
+
+    def test_think_must_be_bool(self):
+        out = _call("local_delegate", {"prompt": "x", "think": "yes"})
+        self.assertIn("think", out[0].text)
+
+    def test_background_must_be_bool(self):
+        out = _call("local_delegate", {"prompt": "x", "background": "yes"})
+        self.assertIn("background", out[0].text)
+
+    def test_keep_alive_pattern(self):
+        for bad in ("5 m", "-1m", "10d", "", "99999s", "5m; rm -rf /"):
+            out = _call("local_delegate", {"prompt": "x", "keep_alive": bad})
+            self.assertIn("keep_alive", out[0].text, msg=bad)
+
+    def test_timeout_bounds_and_bool_rejection(self):
+        for bad in (0, -5, 601, True, "300"):
+            out = _call("local_delegate", {"prompt": "x", "timeout_s": bad})
+            self.assertIn("timeout_s", out[0].text, msg=repr(bad))
+
+    def test_system_must_be_string(self):
+        out = _call("local_delegate", {"prompt": "x", "system": 42})
+        self.assertIn("system", out[0].text)
+
+
+class TestLocalDelegateSync(unittest.TestCase):
+    def test_payload_construction_defaults(self):
+        fake = mock.AsyncMock(return_value={"model": "m", "message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            out = _call("local_delegate", {"prompt": "do the thing"})
+        payload, timeout_s = fake.call_args.args
+        self.assertEqual(payload["model"], mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL)
+        self.assertEqual(
+            payload["messages"], [{"role": "user", "content": "do the thing"}]
+        )
+        self.assertIs(payload["think"], False)
+        self.assertIs(payload["stream"], False)
+        self.assertNotIn(
+            "keep_alive", payload
+        )  # v1.1: omitted → inherit server OLLAMA_KEEP_ALIVE
+        self.assertEqual(timeout_s, 300.0)
+        self.assertIn("ok", out[0].text)
+
+    def test_payload_with_system_think_keepalive_timeout(self):
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            _call(
+                "local_delegate",
+                {
+                    "prompt": "p",
+                    "system": "you are terse",
+                    "think": True,
+                    "keep_alive": "0",
+                    "timeout_s": 600,
+                    "model": "qwen3.6:35b-a3b-coding-nvfp4-256k",
+                },
+            )
+        payload, timeout_s = fake.call_args.args
+        self.assertEqual(
+            payload["messages"][0], {"role": "system", "content": "you are terse"}
+        )
+        self.assertEqual(payload["messages"][1], {"role": "user", "content": "p"})
+        self.assertIs(payload["think"], True)
+        self.assertEqual(payload["keep_alive"], "0")
+        self.assertEqual(payload["model"], "qwen3.6:35b-a3b-coding-nvfp4-256k")
+        self.assertEqual(timeout_s, 600.0)
+
+    def test_failure_envelope_reaches_caller(self):
+        fake = mock.AsyncMock(return_value={"status": "failed", "error": "down"})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            out = _call("local_delegate", {"prompt": "p"})
+        self.assertIn("down", out[0].text)
+
+
+class TestLocalDelegateBackground(unittest.TestCase):
+    def setUp(self):
+        mcp_server._delegate_jobs.clear()
+
+    def test_background_returns_job_id_then_result_collects(self):
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def fake_post(payload, timeout_s):
+                await gate.wait()
+                return {"model": "m", "message": {"content": "bg answer"}}
+
+            with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
+                started = await mcp_server.call_tool(
+                    "local_delegate", {"prompt": "p", "background": True}
+                )
+                envelope = json.loads(started[0].text)
+                self.assertEqual(envelope["status"], "started")
+                job_id = envelope["job_id"]
+
+                running = await mcp_server.call_tool(
+                    "local_delegate_result", {"job_id": job_id}
+                )
+                self.assertIn("running", running[0].text)
+
+                gate.set()
+                await asyncio.sleep(0.05)
+                done = await mcp_server.call_tool(
+                    "local_delegate_result", {"job_id": job_id}
+                )
+                self.assertIn("bg answer", done[0].text)
+
+        asyncio.run(scenario())
+
+    def test_cap_error_is_clean_text(self):
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def fake_post(payload, timeout_s):
+                await gate.wait()
+                return {}
+
+            with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
+                ids = []
+                for _ in range(4):
+                    started = await mcp_server.call_tool(
+                        "local_delegate", {"prompt": "p", "background": True}
+                    )
+                    ids.append(json.loads(started[0].text)["job_id"])
+                fifth = await mcp_server.call_tool(
+                    "local_delegate", {"prompt": "p", "background": True}
+                )
+                self.assertIn("cap", fifth[0].text)
+                gate.set()
+                await asyncio.sleep(0.05)
+                for job_id in ids:
+                    await mcp_server.call_tool(
+                        "local_delegate_result", {"job_id": job_id}
+                    )
+
+        asyncio.run(scenario())
+
+    def test_result_unknown_id_is_clean_error(self):
+        out = _call("local_delegate_result", {"job_id": "b" * 32})
+        self.assertIn("Error", out[0].text)
+
+    def test_result_missing_id_is_clean_error(self):
+        out = _call("local_delegate_result", {})
+        self.assertIn("Error", out[0].text)
 
 
 if __name__ == "__main__":

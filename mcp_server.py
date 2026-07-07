@@ -1183,7 +1183,6 @@ _CF_ACCESS_SECRET_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_SECRET"
 # `0` (unload immediately) or 1-9999 seconds/minutes/hours. Strict so a
 # malformed value cannot smuggle arbitrary JSON into the Ollama request.
 _DELEGATE_KEEP_ALIVE_RE = re.compile(r"^(0|[1-9][0-9]{0,3}(s|m|h))$")
-_DELEGATE_KEEP_ALIVE_DEFAULT = "5m"
 
 # Shared-client default is 30s; delegate calls pass explicit per-request
 # timeouts (same mechanism as _AGENT_API_TIMEOUT_SECONDS).
@@ -1754,6 +1753,103 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="local_delegate",
+            description=(
+                "Delegate a task to the LOCAL Ollama qwen3.6 coding model — "
+                "input text never leaves the machine (unlike every research "
+                "tool here, which calls hosted APIs). Use for: private/"
+                "sensitive text that must stay on-device; cheap mechanical "
+                "work (summaries, boilerplate, drafts, bulk transforms) that "
+                "doesn't need frontier quality; an independent second opinion "
+                "on code or text; or long background jobs (pass "
+                "background=true, poll local_delegate_result). No web access "
+                "— for research use the research tools instead. The model is "
+                "strong at code and structured transforms but far below "
+                "frontier models on hard reasoning: keep tasks well-scoped."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The task. Include any needed file content inline — "
+                            "the server never reads the filesystem."
+                        ),
+                    },
+                    "system": {
+                        "type": "string",
+                        "description": "Optional system prompt framing the task.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "enum": list(OLLAMA_DELEGATE_MODELS),
+                        "default": _delegate_default_model(),
+                        "description": (
+                            "Server-side allowlist. The default (base tag) "
+                            "inherits each serving host's context window "
+                            "(64k on JVMBPro, 32k on jvmacmini); -32k/-256k "
+                            "pin explicit windows (-256k = several GB of KV "
+                            "cache, JVMBPro only). The endpoint chain is "
+                            "probed per call; the first endpoint serving "
+                            "the tag wins."
+                        ),
+                    },
+                    "think": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Enable the model's thinking mode. Off by default "
+                            "for speed; enable for reasoning-heavy asks."
+                        ),
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "true: return a job_id immediately; poll "
+                            "local_delegate_result. false: wait for the answer."
+                        ),
+                    },
+                    "keep_alive": {
+                        "type": "string",
+                        "description": (
+                            "Optional: how long Ollama keeps the model loaded "
+                            "after the call ('0' = unload immediately — use "
+                            "after a big -256k job). Omit to inherit the "
+                            "server's OLLAMA_KEEP_ALIVE. Pattern: 0 or "
+                            "<1-9999><s|m|h>."
+                        ),
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "default": 300,
+                        "description": "Sync timeout in seconds (1-600).",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        ),
+        Tool(
+            name="local_delegate_result",
+            description=(
+                "Poll/collect a background local_delegate job by job_id. "
+                "Returns running status with elapsed seconds, or the answer. "
+                "Results are single-collect: once retrieved the job is gone. "
+                "Jobs live in server memory only and do not survive restarts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The 32-hex job id returned by local_delegate.",
+                    },
+                },
+                "required": ["job_id"],
+            },
+        ),
+        Tool(
             name="list_sessions",
             description=(
                 "List all saved conversation sessions, most recent first. "
@@ -2230,6 +2326,100 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result["hint"] = "Still running. Poll again in ~30 seconds."
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+    if name == "local_delegate":
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: prompt is required and must be a non-empty string.",
+                )
+            ]
+        model = arguments.get("model", _delegate_default_model())
+        if model not in OLLAMA_DELEGATE_MODELS:
+            allowed = ", ".join(OLLAMA_DELEGATE_MODELS)
+            return [
+                TextContent(type="text", text=f"Error: model must be one of: {allowed}")
+            ]
+        think = arguments.get("think", False)
+        if not isinstance(think, bool):
+            return [
+                TextContent(type="text", text="Error: think must be a JSON boolean.")
+            ]
+        background = arguments.get("background", False)
+        if not isinstance(background, bool):
+            return [
+                TextContent(
+                    type="text", text="Error: background must be a JSON boolean."
+                )
+            ]
+        keep_alive = arguments.get("keep_alive")
+        if keep_alive is not None and (
+            not isinstance(keep_alive, str)
+            or not _DELEGATE_KEEP_ALIVE_RE.fullmatch(keep_alive)
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: keep_alive must match 0 or <1-9999><s|m|h> (e.g. '5m', '0').",
+                )
+            ]
+        timeout_s = arguments.get("timeout_s", _DELEGATE_TIMEOUT_DEFAULT_S)
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, int)
+            or not 1 <= timeout_s <= _DELEGATE_TIMEOUT_MAX_S
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "Error: timeout_s must be an integer between 1 and "
+                        f"{_DELEGATE_TIMEOUT_MAX_S}."
+                    ),
+                )
+            ]
+        system = arguments.get("system")
+        if system is not None and not isinstance(system, str):
+            return [TextContent(type="text", text="Error: system must be a string.")]
+
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        payload = {
+            "model": model,
+            "messages": messages,
+            "think": think,
+            "stream": False,
+        }
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+
+        if background:
+            try:
+                job_id = _start_delegate_job(payload)
+            except ValueError as exc:
+                return [TextContent(type="text", text=f"Error: {exc}")]
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"job_id": job_id, "status": "started"}),
+                )
+            ]
+
+        data = await _post_ollama_chat(payload, float(timeout_s))
+        return _render_delegate_answer(data)
+
+    if name == "local_delegate_result":
+        try:
+            outcome = _collect_delegate_job(arguments.get("job_id"))
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"Error: {exc}")]
+        if outcome.get("status") == "running":
+            return [TextContent(type="text", text=json.dumps(outcome))]
+        return _render_delegate_answer(outcome)
 
     if name == "list_sessions":
         sessions = list_sessions()
