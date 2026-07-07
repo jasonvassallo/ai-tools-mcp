@@ -169,3 +169,67 @@ files); all network mocked, no live Ollama in CI:
 Fleet routing between machines, streaming responses, app-level auth headers,
 disk-persisted jobs, free-form model strings, server-side file reading,
 returning thinking traces, model management (pull/stop/ps).
+
+---
+
+## v1.1 amendment (2026-07-06, user-approved): endpoint fallback chain + remote auth
+
+Supersedes the single-endpoint "Endpoint resolution" section and pulls two
+items out of "Out of scope": minimal fleet routing (an ordered endpoint list)
+and app-level auth headers (Cloudflare Access service-token headers).
+
+**Motivation.** The delegate must work even when the local machine has no
+qwen3.6 model: try local Ollama first, then fall back to the remote
+Access-gated endpoint (`https://ollama-mbp.djvassallo.com`, live since
+2026-07-03) so the tool keeps working anywhere JVMBPro is reachable.
+
+### Endpoint chain resolution (replaces v1 single-endpoint order)
+
+1. `AI_TOOLS_OLLAMA_URLS` env var — comma-separated ordered list. In the
+   Claude Desktop `.mcpb` install this is surfaced as a **`user_config`
+   field in `mcpb/manifest.json`** (so it is an extension *setting*, not a
+   hardcode; editable in Desktop's extension UI). `AI_TOOLS_OLLAMA_URL`
+   (singular, v1) remains honored as a one-item chain for compat.
+2. Keychain service `OLLAMA_URL` (optional, one endpoint, appended if set).
+3. Default chain: `http://localhost:11434`, `https://ollama-mbp.djvassallo.com`.
+
+**Per-call selection:** for the requested model tag, probe each endpoint in
+order with `GET /api/tags` (2 s timeout) and pick the first whose tag list
+contains the tag. Cache the (endpoint, model) resolution for 60 s to avoid
+re-probing on every call. If no endpoint has the tag → error naming every
+endpoint tried and the tags it saw (actionable, fail-closed).
+
+### Remote auth (Cloudflare Access service token)
+
+- For any **non-localhost https** endpoint, attach
+  `CF-Access-Client-Id` / `CF-Access-Client-Secret` read from Keychain
+  services `OLLAMA_CF_ACCESS_CLIENT_ID` / `OLLAMA_CF_ACCESS_CLIENT_SECRET`.
+- Fail-closed: if the creds are absent, that endpoint is *skipped* (treated
+  as unreachable), never called bare.
+- Plain-`http` non-localhost endpoints are rejected at parse time (loopback
+  may be http; everything else must be https).
+- Secrets are read per-call and never logged; redaction already covers error
+  payloads.
+
+### Model default and machine asymmetry (decision record)
+
+- Default model stays the **base tag** `qwen3.6:35b-a3b-coding-nvfp4`. The
+  base tag inherits each server's `OLLAMA_CONTEXT_LENGTH`: **64k on JVMBPro,
+  32k on jvmacmini** — each machine serves the window it can afford, and the
+  helper-agent use case fits comfortably in either. `-32k`/`-256k` tags stay
+  on the allowlist for explicit pinning (`-256k` exists only on JVMBPro).
+- `keep_alive` default changes from `"5m"` to **omitted** (inherit the
+  server's `OLLAMA_KEEP_ALIVE`) so delegate calls do not shorten the warm
+  window on hosts tuned to stay warm. Explicit values, including `"0"`,
+  still pass through.
+
+### Plan impact (docs/superpowers/plans/2026-07-06-local-delegate.md)
+
+- Task 1 → resolves an ordered chain (list, not scalar) + probe/cache; tests
+  gain: chain parsing, probe pick-first-with-tag, 60 s cache, all-miss error.
+- Task 2 → auth-header injection for non-localhost https + reject non-https
+  remote; tests gain: header presence (mocked Keychain), creds-absent skip,
+  http-remote rejection.
+- Task 4 → schema text documents the chain + default-model asymmetry.
+- Task 6 → `mcpb/manifest.json` gains `user_config` entries
+  `ollama_endpoints` and `default_model` mapped to env.
