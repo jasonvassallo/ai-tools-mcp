@@ -41,11 +41,17 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
         def __init__(self, *a, **kw):
             pass
 
-    class _FakeHTTPStatusError(Exception):
-        pass
-
     class _FakeRequestError(Exception):
         pass
+
+    class _FakeConnectError(_FakeRequestError):
+        pass
+
+    class _FakeHTTPStatusError(Exception):
+        def __init__(self, message="", *, request=None, response=None):
+            super().__init__(message)
+            self.request = request
+            self.response = response
 
     class _FakeServer:
         def __init__(self, name):
@@ -124,6 +130,7 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             AsyncClient=_FakeAsyncClient,
             HTTPStatusError=_FakeHTTPStatusError,
             RequestError=_FakeRequestError,
+            ConnectError=_FakeConnectError,
         ),
         "google": google_mod,
         "google.auth": auth_mod,
@@ -158,6 +165,105 @@ mcp_server = _load_mcp_server()
 
 def _call(name: str, arguments: dict) -> list:
     return asyncio.run(mcp_server.call_tool(name, arguments))
+
+
+class _FakeResponse:
+    def __init__(self, json_data=None, status_code=200, text=""):
+        self._json = json_data
+        self.status_code = status_code
+        self.text = text
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise mcp_server.httpx.HTTPStatusError(
+                f"{self.status_code}", request=None, response=self
+            )
+
+    def json(self):
+        if self._json is None:
+            raise ValueError("no JSON")
+        return self._json
+
+
+class _FakeClient:
+    def __init__(self, response=None, exc=None):
+        self.response = response
+        self.exc = exc
+        self.calls: list = []
+
+    async def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.exc is not None:
+            raise self.exc
+        return self.response
+
+
+def _with_client(client):
+    return mock.patch.object(
+        mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+    )
+
+
+class TestPostOllamaChat(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.dict(
+            os.environ, {"AI_TOOLS_OLLAMA_URL": "http://localhost:11434"}
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _post(self, client, payload=None, timeout_s=300.0):
+        with _with_client(client):
+            return asyncio.run(
+                mcp_server._post_ollama_chat(payload or {"model": "m"}, timeout_s)
+            )
+
+    def test_happy_path_posts_to_api_chat_with_timeout(self):
+        client = _FakeClient(
+            response=_FakeResponse(json_data={"message": {"content": "hi"}})
+        )
+        out = self._post(
+            client, payload={"model": "m", "stream": False}, timeout_s=42.0
+        )
+        self.assertEqual(out["message"]["content"], "hi")
+        url, kwargs = client.calls[0]
+        self.assertEqual(url, "http://localhost:11434/api/chat")
+        self.assertEqual(kwargs["timeout"], 42.0)
+        self.assertEqual(kwargs["json"]["model"], "m")
+
+    def test_connect_error_mentions_launchagent(self):
+        client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
+        out = self._post(client)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("LaunchAgent", out["error"])
+        self.assertIn("http://localhost:11434", out["error"])
+
+    def test_404_adds_pull_hint(self):
+        client = _FakeClient(
+            response=_FakeResponse(status_code=404, text="model not found")
+        )
+        out = self._post(client, payload={"model": "qwen3.6:35b-a3b-coding-nvfp4"})
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("ollama pull qwen3.6:35b-a3b-coding-nvfp4", out["error"])
+
+    def test_non_404_http_error_no_pull_hint(self):
+        client = _FakeClient(response=_FakeResponse(status_code=500, text="boom"))
+        out = self._post(client)
+        self.assertEqual(out["status"], "failed")
+        self.assertNotIn("ollama pull", out["error"])
+
+    def test_non_json_200_is_failure_envelope(self):
+        client = _FakeClient(response=_FakeResponse(json_data=None))
+        out = self._post(client)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("invalid JSON", out["error"])
+
+    def test_bad_configured_url_is_failure_envelope(self):
+        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_URL": "ftp://nope"}):
+            client = _FakeClient(response=_FakeResponse(json_data={}))
+            out = self._post(client)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("Invalid Ollama URL", out["error"])
 
 
 class TestResolveOllamaUrl(unittest.TestCase):

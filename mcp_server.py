@@ -1218,6 +1218,58 @@ def _resolve_ollama_url() -> str:
     return url.rstrip("/")
 
 
+async def _post_ollama_chat(
+    payload: dict[str, Any], timeout_s: float
+) -> dict[str, Any]:
+    """POST to the local Ollama /api/chat endpoint.
+
+    Same structured-error contract as _post_agent_research: network, HTTP,
+    and parse failures return {"status": "failed", "error": ...} instead of
+    raising. No auth header — the endpoint is localhost by default; a remote
+    endpoint's auth story is transport-level (Tailscale ACLs), not app-level.
+    No retries: a local server is either up or not.
+    """
+    try:
+        base_url = await asyncio.to_thread(_resolve_ollama_url)
+    except ValueError as exc:
+        return {"status": "failed", "error": redact_secrets(str(exc))}
+    client = await _get_http_client()
+    try:
+        response = await client.post(
+            f"{base_url}/api/chat", json=payload, timeout=timeout_s
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        failure = _http_error_payload(exc)
+        if exc.response.status_code == 404:
+            model = payload.get("model", "")
+            failure["error"] += (
+                f" — model may not be pulled on this host; try: ollama pull {model}"
+            )
+        return failure
+    except httpx.ConnectError:
+        # Most likely real-world failure; make the message actionable.
+        return {
+            "status": "failed",
+            "error": (
+                f"Ollama not running at {base_url} — is the LaunchAgent up? "
+                "(launchctl kickstart -k gui/$UID/com.jasonvassallo.ollama)"
+            ),
+        }
+    except httpx.RequestError as exc:
+        return {
+            "status": "failed",
+            "error": f"request error: {redact_secrets(str(exc))}",
+        }
+    except ValueError as exc:
+        # response.json() on a non-JSON 200 body.
+        return {
+            "status": "failed",
+            "error": f"invalid JSON from Ollama: {redact_secrets(str(exc))}",
+        }
+
+
 # Create MCP server
 server = Server("ai-tools-mcp")
 
