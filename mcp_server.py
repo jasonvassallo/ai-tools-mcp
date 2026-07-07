@@ -62,6 +62,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import uuid
 from contextlib import contextmanager
@@ -1174,7 +1175,6 @@ OLLAMA_DELEGATE_MODELS: tuple[str, ...] = (
 )
 OLLAMA_DELEGATE_DEFAULT_MODEL = OLLAMA_DELEGATE_MODELS[0]
 
-_OLLAMA_DEFAULT_URL = "http://localhost:11434"
 _OLLAMA_URL_ENV_VAR = "AI_TOOLS_OLLAMA_URL"
 _OLLAMA_URL_KEYCHAIN_SERVICE = "OLLAMA_URL"
 
@@ -1195,66 +1195,204 @@ _DELEGATE_JOB_CAP = 4
 _DELEGATE_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
-def _resolve_ollama_url() -> str:
-    """Resolve the Ollama base URL: env var → Keychain → localhost.
+_OLLAMA_URLS_ENV_VAR = "AI_TOOLS_OLLAMA_URLS"
+_OLLAMA_DEFAULT_MODEL_ENV_VAR = "AI_TOOLS_OLLAMA_DEFAULT_MODEL"
 
-    Blocking (Keychain lookup shells out to `security`) — async callers
-    wrap in asyncio.to_thread. Raises ValueError for a configured URL
-    that is not plain http(s) (fail closed rather than guess).
+# v1.1 (spec amendment): local-first endpoint chain. The remote default is
+# the user's own Cloudflare-Access-gated JVMBPro tunnel — never a
+# third-party service.
+_OLLAMA_DEFAULT_CHAIN: tuple[str, ...] = (
+    "http://localhost:11434",
+    "https://ollama-mbp.djvassallo.com",
+)
+_OLLAMA_PROBE_TIMEOUT_S = 2.0
+_OLLAMA_PROBE_CACHE_TTL_S = 60.0
+_LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_localhost_endpoint(url: str) -> bool:
+    return (urllib.parse.urlparse(url).hostname or "") in _LOCALHOST_HOSTS
+
+
+def _validate_ollama_endpoint(url: str) -> str:
+    """Validate one chain entry; fail closed on anything not plain http(s).
+
+    Loopback may be http; every other host must be https (v1.1 rule — a
+    remote endpoint is only ever the Access-gated tunnel).
     """
-    url = os.environ.get(_OLLAMA_URL_ENV_VAR, "").strip()
-    if not url:
-        try:
-            url = get_api_key_from_keychain(
-                _OLLAMA_URL_KEYCHAIN_SERVICE, getpass.getuser()
-            )
-        except ValueError:
-            url = _OLLAMA_DEFAULT_URL
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError(
-            f"Invalid Ollama URL {redact_secrets(url)!r}: must be http(s)://host[:port]"
+            f"Invalid Ollama endpoint {redact_secrets(url)!r}: must be "
+            "http(s)://host[:port]"
+        )
+    if parsed.scheme == "http" and not _is_localhost_endpoint(url):
+        raise ValueError(
+            f"Refusing plain-http non-localhost Ollama endpoint "
+            f"{redact_secrets(url)!r} — remote endpoints must be https"
         )
     return url.rstrip("/")
+
+
+def _resolve_ollama_chain() -> list[str]:
+    """Ordered Ollama endpoint chain (v1.1).
+
+    Env `AI_TOOLS_OLLAMA_URLS` (comma-separated) wins; singular
+    `AI_TOOLS_OLLAMA_URL` is honored as a one-item chain for v1 compat;
+    otherwise the default local-first chain. A Keychain `OLLAMA_URL`
+    endpoint is appended when present. Every entry is validated; dupes
+    dropped preserving order. Blocking (Keychain) — async callers wrap
+    in asyncio.to_thread.
+    """
+    raw = os.environ.get(_OLLAMA_URLS_ENV_VAR, "").strip()
+    if raw:
+        entries = [e.strip() for e in raw.split(",") if e.strip()]
+    else:
+        single = os.environ.get(_OLLAMA_URL_ENV_VAR, "").strip()
+        entries = [single] if single else list(_OLLAMA_DEFAULT_CHAIN)
+    try:
+        keychain_url = get_api_key_from_keychain(
+            _OLLAMA_URL_KEYCHAIN_SERVICE, getpass.getuser()
+        ).strip()
+        if keychain_url:
+            entries.append(keychain_url)
+    except ValueError:
+        pass  # optional config — absence is the common case
+    chain: list[str] = []
+    for entry in entries:
+        validated = _validate_ollama_endpoint(entry)
+        if validated not in chain:
+            chain.append(validated)
+    return chain
+
+
+def _delegate_default_model() -> str:
+    """Default model tag; env override honored only if allowlisted.
+
+    Falls back silently to the base tag (run_check surfaces a warn) so a
+    typo'd Desktop setting cannot break tool listing.
+    """
+    env_model = os.environ.get(_OLLAMA_DEFAULT_MODEL_ENV_VAR, "").strip()
+    if env_model in OLLAMA_DELEGATE_MODELS:
+        return env_model
+    return OLLAMA_DELEGATE_DEFAULT_MODEL
+
+
+def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
+    """Auth headers for an endpoint; None means SKIP (never call bare).
+
+    Stub for this task: localhost needs no auth ({}); remote endpoints
+    report None until the Cloudflare Access Keychain wiring lands in the
+    next task.
+    """
+    if _is_localhost_endpoint(endpoint):
+        return {}
+    return None
+
+
+_ollama_endpoint_cache: dict[str, tuple[str, float]] = {}
+
+
+async def _select_ollama_endpoint(model: str) -> str:
+    """First endpoint in the chain whose /api/tags lists `model`.
+
+    Results are cached per model for _OLLAMA_PROBE_CACHE_TTL_S. Raises
+    ValueError naming every endpoint tried and what each reported —
+    actionable and fail-closed.
+    """
+    cached = _ollama_endpoint_cache.get(model)
+    if cached is not None and time.monotonic() < cached[1]:
+        return cached[0]
+    chain = await asyncio.to_thread(_resolve_ollama_chain)
+    client = await _get_http_client()
+    attempts: list[str] = []
+    for endpoint in chain:
+        headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+        if headers is None:
+            attempts.append(
+                f"{endpoint}: skipped (Cloudflare Access credentials not in Keychain)"
+            )
+            continue
+        try:
+            response = await client.get(
+                f"{endpoint}/api/tags",
+                headers=headers,
+                timeout=_OLLAMA_PROBE_TIMEOUT_S,
+            )
+            response.raise_for_status()
+            models = response.json().get("models", [])
+            tags = [
+                str(m.get("name") or m.get("model") or "")
+                for m in models
+                if isinstance(m, dict)
+            ]
+        except httpx.HTTPStatusError as exc:
+            attempts.append(f"{endpoint}: HTTP {exc.response.status_code}")
+            continue
+        except httpx.RequestError:
+            attempts.append(f"{endpoint}: unreachable")
+            continue
+        except ValueError:
+            attempts.append(f"{endpoint}: invalid JSON from /api/tags")
+            continue
+        if model in tags:
+            _ollama_endpoint_cache[model] = (
+                endpoint,
+                time.monotonic() + _OLLAMA_PROBE_CACHE_TTL_S,
+            )
+            return endpoint
+        present = ", ".join(sorted(t for t in tags if t)) or "no models"
+        attempts.append(f"{endpoint}: model not present (has {present})")
+    detail = "; ".join(attempts) or "empty endpoint chain"
+    raise ValueError(f"No Ollama endpoint serves {model!r}: {redact_secrets(detail)}")
 
 
 async def _post_ollama_chat(
     payload: dict[str, Any], timeout_s: float
 ) -> dict[str, Any]:
-    """POST to the local Ollama /api/chat endpoint.
+    """POST /api/chat to the first chain endpoint serving payload['model'].
 
-    Same structured-error contract as _post_agent_research: network, HTTP,
-    and parse failures return {"status": "failed", "error": ...} instead of
-    raising. No auth header yet — localhost needs none; Cloudflare Access
-    service-token headers for remote https endpoints arrive with the v1.1
-    endpoint-chain amendment (see the design doc).
-    No retries: a local server is either up or not.
+    Same structured-error contract as _post_agent_research: selection,
+    network, HTTP, and parse failures return {"status": "failed", ...}
+    instead of raising. Remote https endpoints get Cloudflare Access
+    service-token headers (absent creds → skipped at selection; the None
+    check here is defense in depth). No retries: an endpoint is either
+    serving or not.
     """
+    model = str(payload.get("model", ""))
     try:
-        base_url = await asyncio.to_thread(_resolve_ollama_url)
+        endpoint = await _select_ollama_endpoint(model)
     except ValueError as exc:
         return {"status": "failed", "error": redact_secrets(str(exc))}
+    headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+    if headers is None:
+        return {
+            "status": "failed",
+            "error": f"no credentials for {redact_secrets(endpoint)}",
+        }
     client = await _get_http_client()
     try:
         response = await client.post(
-            f"{base_url}/api/chat", json=payload, timeout=timeout_s
+            f"{endpoint}/api/chat", json=payload, headers=headers, timeout=timeout_s
         )
         response.raise_for_status()
         return response.json()
     except httpx.HTTPStatusError as exc:
         failure = _http_error_payload(exc)
         if exc.response.status_code == 404:
-            model = payload.get("model", "")
             failure["error"] += (
                 f" — model may not be pulled on this host; try: ollama pull {model}"
             )
         return failure
     except httpx.ConnectError:
-        # Most likely real-world failure; make the message actionable.
+        # Answered the probe moments ago but refused the POST — drop the
+        # cached resolution so the next call re-probes the chain.
+        _ollama_endpoint_cache.pop(model, None)
         return {
             "status": "failed",
             "error": (
-                f"Ollama not running at {redact_secrets(base_url)} — is the LaunchAgent up? "
+                f"Ollama not running at {redact_secrets(endpoint)} — is the "
+                "LaunchAgent up? "
                 "(launchctl kickstart -k gui/$UID/com.jasonvassallo.ollama)"
             ),
         }
@@ -1264,7 +1402,6 @@ async def _post_ollama_chat(
             "error": f"request error: {redact_secrets(str(exc))}",
         }
     except ValueError as exc:
-        # response.json() on a non-JSON 200 body.
         return {
             "status": "failed",
             "error": f"invalid JSON from Ollama: {redact_secrets(str(exc))}",

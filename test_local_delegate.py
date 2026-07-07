@@ -15,7 +15,6 @@ Run:
 from __future__ import annotations
 
 import asyncio
-import getpass
 import importlib.util
 import os
 import sys
@@ -205,12 +204,12 @@ def _with_client(client):
 
 
 class TestPostOllamaChat(unittest.TestCase):
-    def setUp(self):
-        patcher = mock.patch.dict(
-            os.environ, {"AI_TOOLS_OLLAMA_URL": "http://localhost:11434"}
+    def _with_selection(self, endpoint="http://localhost:11434"):
+        return mock.patch.object(
+            mcp_server,
+            "_select_ollama_endpoint",
+            mock.AsyncMock(return_value=endpoint),
         )
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def _post(self, client, payload=None, timeout_s=300.0):
         with _with_client(client):
@@ -222,18 +221,21 @@ class TestPostOllamaChat(unittest.TestCase):
         client = _FakeClient(
             response=_FakeResponse(json_data={"message": {"content": "hi"}})
         )
-        out = self._post(
-            client, payload={"model": "m", "stream": False}, timeout_s=42.0
-        )
+        with self._with_selection():
+            out = self._post(
+                client, payload={"model": "m", "stream": False}, timeout_s=42.0
+            )
         self.assertEqual(out["message"]["content"], "hi")
         url, kwargs = client.calls[0]
         self.assertEqual(url, "http://localhost:11434/api/chat")
         self.assertEqual(kwargs["timeout"], 42.0)
         self.assertEqual(kwargs["json"]["model"], "m")
+        self.assertEqual(client.calls[0][1]["headers"], {})
 
     def test_connect_error_mentions_launchagent(self):
         client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
-        out = self._post(client)
+        with self._with_selection():
+            out = self._post(client)
         self.assertEqual(out["status"], "failed")
         self.assertIn("LaunchAgent", out["error"])
         self.assertIn("http://localhost:11434", out["error"])
@@ -242,28 +244,35 @@ class TestPostOllamaChat(unittest.TestCase):
         client = _FakeClient(
             response=_FakeResponse(status_code=404, text="model not found")
         )
-        out = self._post(client, payload={"model": "qwen3.6:35b-a3b-coding-nvfp4"})
+        with self._with_selection():
+            out = self._post(client, payload={"model": "qwen3.6:35b-a3b-coding-nvfp4"})
         self.assertEqual(out["status"], "failed")
         self.assertIn("ollama pull qwen3.6:35b-a3b-coding-nvfp4", out["error"])
 
     def test_non_404_http_error_no_pull_hint(self):
         client = _FakeClient(response=_FakeResponse(status_code=500, text="boom"))
-        out = self._post(client)
+        with self._with_selection():
+            out = self._post(client)
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("ollama pull", out["error"])
 
     def test_non_json_200_is_failure_envelope(self):
         client = _FakeClient(response=_FakeResponse(json_data=None))
-        out = self._post(client)
+        with self._with_selection():
+            out = self._post(client)
         self.assertEqual(out["status"], "failed")
         self.assertIn("invalid JSON", out["error"])
 
-    def test_bad_configured_url_is_failure_envelope(self):
-        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_URL": "ftp://nope"}):
+    def test_selection_failure_is_failure_envelope(self):
+        with mock.patch.object(
+            mcp_server,
+            "_select_ollama_endpoint",
+            mock.AsyncMock(side_effect=ValueError("No Ollama endpoint serves 'm'")),
+        ):
             client = _FakeClient(response=_FakeResponse(json_data={}))
             out = self._post(client)
         self.assertEqual(out["status"], "failed")
-        self.assertIn("Invalid Ollama URL", out["error"])
+        self.assertIn("No Ollama endpoint serves", out["error"])
 
     def test_connect_error_redacts_secret_in_url(self):
         # Assemble a JWT-shaped secret at runtime so scanners don't flag
@@ -272,8 +281,11 @@ class TestPostOllamaChat(unittest.TestCase):
         payload = "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4iLCJpYXQ6MTUxNjIzOTAyMn0"
         signature = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
         jwt_token = f"{header}.{payload}.{signature}"
-        url_with_secret = f"http://token:{jwt_token}@remotehost:11434"
-        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_URL": url_with_secret}):
+        # localhost host so the POST (and its ConnectError message) is
+        # actually exercised — a remote host would be skipped for missing
+        # credentials before the POST. The secret rides in the userinfo.
+        url_with_secret = f"http://token:{jwt_token}@localhost:11434"
+        with self._with_selection(endpoint=url_with_secret):
             client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
             out = self._post(client)
         self.assertEqual(out["status"], "failed")
@@ -285,48 +297,191 @@ class TestPostOllamaChat(unittest.TestCase):
         # Verify redaction worked: should see [REDACTED_JWT] instead.
         self.assertIn("[REDACTED_JWT]", out["error"])
 
+    def test_connect_error_drops_cache_entry(self):
+        mcp_server._ollama_endpoint_cache["m"] = ("http://localhost:11434", 10**12)
+        client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
+        with self._with_selection():
+            self._post(client, payload={"model": "m"})
+        self.assertNotIn("m", mcp_server._ollama_endpoint_cache)
 
-class TestResolveOllamaUrl(unittest.TestCase):
-    def test_env_var_wins(self):
-        with mock.patch.dict(
-            os.environ, {"AI_TOOLS_OLLAMA_URL": "http://jvmacmini:11434/"}
-        ):
-            self.assertEqual(mcp_server._resolve_ollama_url(), "http://jvmacmini:11434")
 
-    def test_keychain_second(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AI_TOOLS_OLLAMA_URL", None)
+_MODEL = "qwen3.6:35b-a3b-coding-nvfp4"
+
+
+def _no_keychain(service, account):
+    raise ValueError("not found")
+
+
+class TestResolveOllamaChain(unittest.TestCase):
+    def _chain(self, env, keychain=_no_keychain):
+        cleared = {k: "" for k in ("AI_TOOLS_OLLAMA_URLS", "AI_TOOLS_OLLAMA_URL")}
+        with mock.patch.dict(os.environ, {**cleared, **env}):
             with mock.patch.object(
-                mcp_server,
-                "get_api_key_from_keychain",
-                return_value="https://mini.tail:11434",
-            ) as kc:
-                self.assertEqual(
-                    mcp_server._resolve_ollama_url(), "https://mini.tail:11434"
-                )
-        kc.assert_called_once_with("OLLAMA_URL", getpass.getuser())
-
-    def test_default_localhost_when_neither(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("AI_TOOLS_OLLAMA_URL", None)
-            with mock.patch.object(
-                mcp_server,
-                "get_api_key_from_keychain",
-                side_effect=ValueError("not found"),
+                mcp_server, "get_api_key_from_keychain", side_effect=keychain
             ):
-                self.assertEqual(
-                    mcp_server._resolve_ollama_url(), "http://localhost:11434"
-                )
+                return mcp_server._resolve_ollama_chain()
 
-    def test_rejects_non_http_scheme(self):
-        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_URL": "file:///etc/passwd"}):
-            with self.assertRaises(ValueError):
-                mcp_server._resolve_ollama_url()
+    def test_urls_env_is_ordered_chain(self):
+        chain = self._chain(
+            {"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434/, https://mini.tail:443"}
+        )
+        self.assertEqual(chain, ["http://localhost:11434", "https://mini.tail:443"])
 
-    def test_rejects_garbage_url(self):
-        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_URL": "http://"}):
-            with self.assertRaises(ValueError):
-                mcp_server._resolve_ollama_url()
+    def test_singular_env_compat_one_item(self):
+        chain = self._chain({"AI_TOOLS_OLLAMA_URL": "http://localhost:11434"})
+        self.assertEqual(chain, ["http://localhost:11434"])
+
+    def test_default_chain_when_no_env(self):
+        self.assertEqual(self._chain({}), list(mcp_server._OLLAMA_DEFAULT_CHAIN))
+
+    def test_keychain_endpoint_appended(self):
+        chain = self._chain(
+            {"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434"},
+            keychain=lambda s, a: "https://kc.example",
+        )
+        self.assertEqual(chain, ["http://localhost:11434", "https://kc.example"])
+
+    def test_duplicates_dropped_preserving_order(self):
+        chain = self._chain(
+            {"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434,http://localhost:11434/"}
+        )
+        self.assertEqual(chain, ["http://localhost:11434"])
+
+    def test_empty_entries_ignored(self):
+        chain = self._chain({"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434,,"})
+        self.assertEqual(chain, ["http://localhost:11434"])
+
+    def test_plain_http_remote_rejected(self):
+        with self.assertRaises(ValueError):
+            self._chain({"AI_TOOLS_OLLAMA_URLS": "http://remote.example:11434"})
+
+    def test_garbage_url_rejected(self):
+        with self.assertRaises(ValueError):
+            self._chain({"AI_TOOLS_OLLAMA_URLS": "http://"})
+
+
+class TestDelegateDefaultModel(unittest.TestCase):
+    def test_base_tag_when_env_unset(self):
+        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": ""}):
+            self.assertEqual(
+                mcp_server._delegate_default_model(),
+                mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL,
+            )
+
+    def test_allowlisted_env_override_honored(self):
+        tag = "qwen3.6:35b-a3b-coding-nvfp4-32k"
+        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": tag}):
+            self.assertEqual(mcp_server._delegate_default_model(), tag)
+
+    def test_non_allowlisted_env_falls_back_to_base(self):
+        with mock.patch.dict(
+            os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": "llama3:8b"}
+        ):
+            self.assertEqual(
+                mcp_server._delegate_default_model(),
+                mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL,
+            )
+
+
+class _FakeTagsClient:
+    """Programmable fake for _select_ollama_endpoint probes."""
+
+    def __init__(self, tags_by_url=None, exc_by_url=None):
+        self.tags_by_url = tags_by_url or {}
+        self.exc_by_url = exc_by_url or {}
+        self.get_calls: list = []
+
+    async def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        base = url.removesuffix("/api/tags")
+        if base in self.exc_by_url:
+            raise self.exc_by_url[base]
+        return _FakeResponse(
+            json_data={"models": [{"name": t} for t in self.tags_by_url.get(base, [])]}
+        )
+
+
+class TestSelectOllamaEndpoint(unittest.TestCase):
+    EP1 = "http://localhost:11434"
+    EP2 = "http://127.0.0.1:11435"
+
+    def setUp(self):
+        mcp_server._ollama_endpoint_cache.clear()
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "AI_TOOLS_OLLAMA_URLS": f"{self.EP1},{self.EP2}",
+                "AI_TOOLS_OLLAMA_URL": "",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        kc = mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", side_effect=_no_keychain
+        )
+        kc.start()
+        self.addCleanup(kc.stop)
+
+    def _select(self, client, model=_MODEL):
+        with mock.patch.object(
+            mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+        ):
+            return asyncio.run(mcp_server._select_ollama_endpoint(model))
+
+    def test_picks_first_endpoint_with_tag(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [_MODEL], self.EP2: [_MODEL]})
+        self.assertEqual(self._select(client), self.EP1)
+
+    def test_skips_endpoint_missing_tag(self):
+        client = _FakeTagsClient(
+            tags_by_url={self.EP1: ["other:1b"], self.EP2: [_MODEL]}
+        )
+        self.assertEqual(self._select(client), self.EP2)
+
+    def test_skips_unreachable_endpoint(self):
+        client = _FakeTagsClient(
+            tags_by_url={self.EP2: [_MODEL]},
+            exc_by_url={self.EP1: mcp_server.httpx.ConnectError("refused")},
+        )
+        self.assertEqual(self._select(client), self.EP2)
+
+    def test_all_miss_raises_naming_every_endpoint(self):
+        client = _FakeTagsClient(
+            tags_by_url={self.EP2: ["other:1b"]},
+            exc_by_url={self.EP1: mcp_server.httpx.ConnectError("refused")},
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self._select(client)
+        message = str(ctx.exception)
+        self.assertIn(self.EP1, message)
+        self.assertIn(self.EP2, message)
+        self.assertIn("unreachable", message)
+        self.assertIn("other:1b", message)
+
+    def test_cache_prevents_reprobe_within_ttl(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [_MODEL]})
+        self._select(client)
+        calls_after_first = len(client.get_calls)
+        self._select(client)
+        self.assertEqual(len(client.get_calls), calls_after_first)
+
+    def test_cache_expiry_reprobes(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [_MODEL]})
+        with mock.patch.object(mcp_server, "_OLLAMA_PROBE_CACHE_TTL_S", 0.0):
+            self._select(client)
+            calls_after_first = len(client.get_calls)
+            self._select(client)
+        self.assertGreater(len(client.get_calls), calls_after_first)
+
+    def test_remote_without_creds_is_skipped_with_reason(self):
+        with mock.patch.dict(
+            os.environ, {"AI_TOOLS_OLLAMA_URLS": "https://remote.example"}
+        ):
+            client = _FakeTagsClient(tags_by_url={"https://remote.example": [_MODEL]})
+            with self.assertRaises(ValueError) as ctx:
+                self._select(client)
+        self.assertIn("skipped", str(ctx.exception))
+        self.assertEqual(client.get_calls, [])  # never called bare
 
 
 if __name__ == "__main__":
