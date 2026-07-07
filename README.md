@@ -99,7 +99,7 @@ It:
 - calls the local Ollama server (native /api/chat) for the local_delegate family
 - returns plain text MCP responses
 
-There are no local model weights, no background service, and no embedded secrets in the repo.
+There are no local model weights, no persistent background service, and no embedded secrets in the repo. (The local_delegate family only calls an already-running Ollama server; background jobs are in-process asyncio tasks.)
 
 ## Repository Layout
 

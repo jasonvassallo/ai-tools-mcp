@@ -8,10 +8,12 @@ name: Tests
 # - permissions: contents: read (least privilege).
 # - No secrets are referenced.
 #
-# Why Ubuntu (not macOS): test files (test_redact.py, test_session_mgmt.py)
-# stub out mcp, openai, google.auth, and Keychain via subprocess.run mocks,
-# so they're portable. mcp_server.py at runtime is macOS-targeted (Keychain
-# + fcntl with POSIX fallback), but the test suite is platform-agnostic.
+# Why Ubuntu (not macOS): all four test files (test_redact.py,
+# test_session_mgmt.py, test_agent_research.py, test_local_delegate.py)
+# share a stub-import harness that stubs out mcp, openai, google.auth, and
+# Keychain via subprocess.run mocks, so they're portable. mcp_server.py at
+# runtime is macOS-targeted (Keychain + fcntl with POSIX fallback), but the
+# test suite is platform-agnostic.
 
 on:
   push:

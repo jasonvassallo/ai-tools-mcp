@@ -1,6 +1,6 @@
 # ai-tools-mcp
 
-This repository contains a small MCP server for hosted AI APIs. It is not a local-model repo.
+This repository contains a small MCP server that exposes hosted AI APIs and the machine's local Ollama server behind one MCP surface. No model weights live here.
 
 ## Purpose
 
@@ -82,8 +82,12 @@ Add to `~/.claude/.mcp.json`:
 
 ## Guardrails
 
-- Keep this repo focused on hosted API-backed MCP tooling.
-- Do not add local-model features here.
+- Keep this repo focused on hosted API-backed MCP tooling, plus the
+  `local_delegate` family, which only *calls* an already-running Ollama.
+- Local-model features here are limited to calling an already-running Ollama
+  server (the `local_delegate` family) — no model weights, no inference
+  engines, no model management.
 - Do not add email-triage code here.
-- Local-only AI projects belong in `local_llm_integration`, not this repo.
+- Model weights, inference engines, and deeper local-AI projects still
+  belong in `local_llm_integration`, not this repo.
 - Never publish secrets, API keys, tokens, `.env` files, certificates, or private keys to GitHub from this repo.

@@ -254,7 +254,15 @@ def run_check() -> None:
                     f"in Keychain): {endpoint}"
                 )
                 continue
-            resp = requests.get(f"{endpoint}/api/version", headers=headers, timeout=3)
+            # allow_redirects=False: a CF Access service-token header must
+            # never follow a redirect off-host — same rationale as the
+            # shared httpx client's follow_redirects=False.
+            resp = requests.get(
+                f"{endpoint}/api/version",
+                headers=headers,
+                timeout=3,
+                allow_redirects=False,
+            )
             resp.raise_for_status()
             version = resp.json().get("version", "?")
             print(f"ok: ollama reachable at {endpoint} (version {version})")
@@ -1244,6 +1252,9 @@ _DELEGATE_BG_CEILING_S = 1800.0
 # jvmacmini runs num_parallel=1 — queuing beyond a few jobs would lie to
 # the caller; fail fast instead.
 _DELEGATE_JOB_CAP = 4
+# Completed jobs the caller never collects via local_delegate_result would
+# otherwise accumulate forever on a long-lived server — bound the tail.
+_DELEGATE_DONE_RETAINED = 16
 _DELEGATE_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
@@ -1314,8 +1325,11 @@ def _resolve_ollama_chain() -> list[str]:
         ).strip()
         if keychain_url:
             entries.append(keychain_url)
-    except ValueError:
-        pass  # optional config — absence is the common case
+    except (ValueError, FileNotFoundError):
+        # ValueError: item not found (common case). FileNotFoundError: the
+        # `security` CLI itself is absent (non-macOS) — Keychain is optional
+        # config here, so degrade gracefully instead of crashing.
+        pass
     chain: list[str] = []
     for entry in entries:
         validated = _validate_ollama_endpoint(entry)
@@ -1353,7 +1367,11 @@ def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
         client_secret = get_api_key_from_keychain(
             _CF_ACCESS_SECRET_KEYCHAIN_SERVICE, user
         )
-    except ValueError:
+    except (ValueError, FileNotFoundError):
+        # ValueError: item not found (common case). FileNotFoundError: the
+        # `security` CLI itself is absent (non-macOS) — Keychain is optional
+        # config here, so degrade gracefully (remote endpoint skipped)
+        # instead of crashing.
         return None
     if not client_id or not client_secret:
         # A Keychain item can exist with an empty password — `security`
@@ -1533,6 +1551,32 @@ def _start_delegate_job(payload: dict[str, Any]) -> str:
     the 32 GB host runs num_parallel=1, so queuing more would lie to the
     caller; failing fast is honest.
     """
+    # Bound the never-collected tail: a caller that starts jobs and never
+    # calls local_delegate_result would otherwise leak one dict entry per
+    # job forever on a long-lived server. Retain only the newest
+    # _DELEGATE_DONE_RETAINED completed jobs, evicting older ones
+    # oldest-first (by "started"). This does not change single-collect
+    # semantics — anything actually retrieved via local_delegate_result is
+    # deleted there as before; eviction here only reclaims memory for
+    # completed jobs nobody ever asks for.
+    done_ids = sorted(
+        (jid for jid, job in _delegate_jobs.items() if job["task"].done()),
+        key=lambda jid: _delegate_jobs[jid]["started"],
+    )
+    excess = len(done_ids) - _DELEGATE_DONE_RETAINED
+    if excess > 0:
+        for jid in done_ids[:excess]:
+            task = _delegate_jobs.pop(jid)["task"]
+            try:
+                # task.exception() marks the exception (if any) as
+                # retrieved, so asyncio never logs "exception was never
+                # retrieved" for an evicted-but-failed job. It raises
+                # CancelledError instead of returning for a cancelled
+                # task — swallow that the same way.
+                task.exception()
+            except asyncio.CancelledError:
+                pass
+
     running = sum(1 for job in _delegate_jobs.values() if not job["task"].done())
     if running >= _DELEGATE_JOB_CAP:
         raise ValueError(

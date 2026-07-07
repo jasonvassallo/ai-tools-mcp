@@ -285,6 +285,18 @@ class TestOllamaAuthHeaders(unittest.TestCase):
         ):
             self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
 
+    def test_missing_security_binary_returns_none(self):
+        # On non-macOS, `security` doesn't exist — subprocess.run raises
+        # FileNotFoundError. Cloudflare Access creds are optional config
+        # here too, so the remote endpoint must be skipped (None), not
+        # crash the whole delegate chain.
+        with mock.patch.object(
+            mcp_server,
+            "get_api_key_from_keychain",
+            side_effect=FileNotFoundError("security: command not found"),
+        ):
+            self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
+
     def test_probe_sends_cf_headers_to_remote(self):
         with mock.patch.dict(
             os.environ,
@@ -509,6 +521,13 @@ def _no_keychain(service, account):
     raise ValueError("not found")
 
 
+def _no_security_binary(service, account):
+    # subprocess.run raises FileNotFoundError when the `security` CLI
+    # itself is missing (non-macOS) — distinct from ValueError, which
+    # means the binary ran but the item wasn't found.
+    raise FileNotFoundError("security: command not found")
+
+
 class TestResolveOllamaChain(unittest.TestCase):
     def _chain(self, env, keychain=_no_keychain):
         cleared = {k: "" for k in ("AI_TOOLS_OLLAMA_URLS", "AI_TOOLS_OLLAMA_URL")}
@@ -563,6 +582,18 @@ class TestResolveOllamaChain(unittest.TestCase):
     def test_garbage_url_rejected(self):
         with self.assertRaises(ValueError):
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://"})
+
+    def test_missing_security_binary_degrades_gracefully(self):
+        # On non-macOS, `security` doesn't exist at all — subprocess.run
+        # raises FileNotFoundError rather than the "item not found"
+        # ValueError. The Keychain lookup here is optional config (an
+        # extra chain entry), so the chain must still resolve from
+        # env/default instead of the whole call crashing.
+        chain = self._chain(
+            {"AI_TOOLS_OLLAMA_URLS": "http://localhost:11434"},
+            keychain=_no_security_binary,
+        )
+        self.assertEqual(chain, ["http://localhost:11434"])
 
 
 class TestDelegateDefaultModel(unittest.TestCase):
@@ -827,6 +858,72 @@ class TestDelegateJobs(unittest.TestCase):
 
         asyncio.run(scenario())
 
+    def test_completed_jobs_beyond_retention_are_evicted(self):
+        # Completed-but-never-collected jobs must not accumulate forever.
+        # Start well more than _DELEGATE_DONE_RETAINED jobs, let each
+        # complete instantly, never call local_delegate_result on any of
+        # them, and confirm the registry stays bounded — retaining only
+        # the newest window — instead of growing unboundedly.
+        async def scenario():
+            async def fake_post(payload, timeout_s):
+                return {"message": {"content": "done"}}
+
+            with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
+                with mock.patch.object(mcp_server, "_DELEGATE_DONE_RETAINED", 3):
+                    retained = mcp_server._DELEGATE_DONE_RETAINED
+                    total = retained + 5
+                    ids = []
+                    for _ in range(total):
+                        job_id = mcp_server._start_delegate_job({"model": "m"})
+                        task = mcp_server._delegate_jobs[job_id]["task"]
+                        await _settle(task.done)
+                        ids.append(job_id)
+
+                    survivors = mcp_server._delegate_jobs
+                    self.assertLessEqual(len(survivors), retained + 1)
+                    # Newest jobs survive...
+                    for jid in ids[-(retained + 1) :]:
+                        self.assertIn(jid, survivors)
+                    # ...oldest ones were evicted.
+                    for jid in ids[: total - (retained + 1)]:
+                        self.assertNotIn(jid, survivors)
+
+        asyncio.run(scenario())
+
+    def test_eviction_swallows_cancelled_task_exception_retrieval(self):
+        # The eviction path calls task.exception() to mark any exception
+        # as retrieved (avoiding asyncio's "exception was never
+        # retrieved" warning). For a *cancelled* task, task.exception()
+        # itself raises CancelledError (asyncio semantics) instead of
+        # returning — eviction must swallow that, not let it escape
+        # _start_delegate_job. A Mock stands in for the cancelled task so
+        # this is deterministic (no real cancellation race).
+        async def scenario():
+            cancelled_task = mock.Mock()
+            cancelled_task.done.return_value = True
+            cancelled_task.exception.side_effect = asyncio.CancelledError()
+            stale_job_id = "a" * 32
+            mcp_server._delegate_jobs[stale_job_id] = {
+                "task": cancelled_task,
+                "started": time.monotonic() - 100,
+            }
+
+            async def fake_post(payload, timeout_s):
+                return {"message": {"content": "done"}}
+
+            with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
+                with mock.patch.object(mcp_server, "_DELEGATE_DONE_RETAINED", 0):
+                    # Retention of 0 forces immediate eviction of the
+                    # pre-seeded cancelled entry; must not raise.
+                    job_id = mcp_server._start_delegate_job({"model": "m"})
+                    task = mcp_server._delegate_jobs[job_id]["task"]
+                    await _settle(task.done)
+
+            self.assertNotIn(stale_job_id, mcp_server._delegate_jobs)
+            cancelled_task.exception.assert_called_once()
+
+        asyncio.run(scenario())
+
 
 class TestToolListing(unittest.TestCase):
     def _tools(self):
@@ -1016,6 +1113,7 @@ class TestRunCheckOllamaLine(unittest.TestCase):
             get=mock.Mock(return_value=fake_resp, side_effect=get_side_effect),
             RequestException=Exception,
         )
+        self._last_fake_get = fake_requests.get
 
         def fake_keychain(service, account):
             # Perplexity key resolves; OLLAMA_URL absent so the chain comes
@@ -1063,6 +1161,16 @@ class TestRunCheckOllamaLine(unittest.TestCase):
         self.assertIn("not in", out)  # allowlist warn line
         self.assertIn("llama3:8b", out)
         self.assertEqual(code, 1)
+
+    def test_probe_disables_redirects(self):
+        # A CF Access service-token header must never follow a redirect
+        # off-host — same rationale as the shared httpx client's
+        # follow_redirects=False. requests.get needs the equivalent
+        # allow_redirects=False on the --check probe.
+        self._run_check_output()
+        self.assertEqual(self._last_fake_get.call_count, 1)
+        _, kwargs = self._last_fake_get.call_args
+        self.assertEqual(kwargs.get("allow_redirects"), False)
 
 
 if __name__ == "__main__":
