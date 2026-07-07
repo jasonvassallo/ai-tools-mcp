@@ -55,12 +55,14 @@ having been run; only the ``gemini_*`` tools will fail when invoked.
 """
 
 import asyncio
+import getpass
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -1151,6 +1153,69 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
         lines.extend(f"- {redact_secrets(detail)}" for detail in failed_execs)
 
     return [TextContent(type="text", text="\n".join(lines))]
+
+
+# ─── Local delegate (Ollama) ──────────────────────────────────────────
+#
+# Third tool family: delegate tasks to a LOCAL Ollama model. Inverts the
+# data-flow of every other family — exists precisely so input text can
+# stay on-device (plus quota offload, second opinions, background/batch
+# work). The server only CALLS an already-running Ollama; it never reads
+# files, pulls models, or manages the Ollama service (least privilege).
+#
+# Native /api/chat (not the OpenAI-compat endpoint) because only the
+# native API accepts `think` — qwen3.6 is a thinking model and
+# think:false is required for fast structured work.
+
+OLLAMA_DELEGATE_MODELS: tuple[str, ...] = (
+    "qwen3.6:35b-a3b-coding-nvfp4",
+    "qwen3.6:35b-a3b-coding-nvfp4-32k",
+    "qwen3.6:35b-a3b-coding-nvfp4-256k",
+)
+OLLAMA_DELEGATE_DEFAULT_MODEL = OLLAMA_DELEGATE_MODELS[0]
+
+_OLLAMA_DEFAULT_URL = "http://localhost:11434"
+_OLLAMA_URL_ENV_VAR = "AI_TOOLS_OLLAMA_URL"
+_OLLAMA_URL_KEYCHAIN_SERVICE = "OLLAMA_URL"
+
+# `0` (unload immediately) or 1-9999 seconds/minutes/hours. Strict so a
+# malformed value cannot smuggle arbitrary JSON into the Ollama request.
+_DELEGATE_KEEP_ALIVE_RE = re.compile(r"^(0|[1-9][0-9]{0,3}(s|m|h))$")
+_DELEGATE_KEEP_ALIVE_DEFAULT = "5m"
+
+# Shared-client default is 30s; delegate calls pass explicit per-request
+# timeouts (same mechanism as _AGENT_API_TIMEOUT_SECONDS).
+_DELEGATE_TIMEOUT_DEFAULT_S = 300
+_DELEGATE_TIMEOUT_MAX_S = 600
+_DELEGATE_BG_CEILING_S = 1800.0
+
+# jvmacmini runs num_parallel=1 — queuing beyond a few jobs would lie to
+# the caller; fail fast instead.
+_DELEGATE_JOB_CAP = 4
+_DELEGATE_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _resolve_ollama_url() -> str:
+    """Resolve the Ollama base URL: env var → Keychain → localhost.
+
+    Blocking (Keychain lookup shells out to `security`) — async callers
+    wrap in asyncio.to_thread. Raises ValueError for a configured URL
+    that is not plain http(s) (fail closed rather than guess).
+    """
+    url = os.environ.get(_OLLAMA_URL_ENV_VAR, "").strip()
+    if not url:
+        try:
+            url = get_api_key_from_keychain(
+                _OLLAMA_URL_KEYCHAIN_SERVICE, getpass.getuser()
+            )
+        except ValueError:
+            url = _OLLAMA_DEFAULT_URL
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"Invalid Ollama URL {redact_secrets(url)!r}: must be http(s)://host[:port]"
+        )
+    return url.rstrip("/")
 
 
 # Create MCP server
