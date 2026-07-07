@@ -620,5 +620,106 @@ class TestSelectOllamaEndpoint(unittest.TestCase):
         self.assertEqual(client.get_calls, [])  # never called bare
 
 
+class TestRenderDelegateAnswer(unittest.TestCase):
+    def test_happy_path(self):
+        out = mcp_server._render_delegate_answer(
+            {"model": "qwen3.6:35b-a3b-coding-nvfp4", "message": {"content": "answer"}}
+        )
+        self.assertIn("answer", out[0].text)
+        self.assertIn("Local Delegate", out[0].text)
+
+    def test_thinking_field_is_discarded(self):
+        out = mcp_server._render_delegate_answer(
+            {"model": "m", "message": {"content": "answer", "thinking": "scratchpad"}}
+        )
+        self.assertNotIn("scratchpad", out[0].text)
+
+    def test_failure_envelope_surfaced(self):
+        out = mcp_server._render_delegate_answer({"status": "failed", "error": "boom"})
+        self.assertIn("Error", out[0].text)
+        self.assertIn("boom", out[0].text)
+
+    def test_empty_content_is_error(self):
+        out = mcp_server._render_delegate_answer({"message": {"content": ""}})
+        self.assertIn("no content", out[0].text)
+
+    def test_missing_message_is_error(self):
+        out = mcp_server._render_delegate_answer({})
+        self.assertIn("no content", out[0].text)
+
+
+class TestDelegateJobs(unittest.TestCase):
+    def setUp(self):
+        mcp_server._delegate_jobs.clear()
+
+    def test_lifecycle_start_running_collect_gone(self):
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def fake_post(payload, timeout_s):
+                await gate.wait()
+                return {"message": {"content": "done!"}}
+
+            with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
+                job_id = mcp_server._start_delegate_job({"model": "m"})
+                running = mcp_server._collect_delegate_job(job_id)
+                self.assertEqual(running["status"], "running")
+                self.assertIsInstance(running["elapsed_s"], int)
+                gate.set()
+                await asyncio.sleep(0.05)  # let the wait_for-wrapped task finish
+                done = mcp_server._collect_delegate_job(job_id)
+                self.assertEqual(done["message"]["content"], "done!")
+                with self.assertRaises(ValueError):
+                    mcp_server._collect_delegate_job(job_id)  # single-collect
+
+        asyncio.run(scenario())
+
+    def test_job_cap_rejects_fifth(self):
+        async def scenario():
+            gate = asyncio.Event()
+
+            async def fake_post(payload, timeout_s):
+                await gate.wait()
+                return {}
+
+            with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
+                ids = [mcp_server._start_delegate_job({}) for _ in range(4)]
+                with self.assertRaises(ValueError):
+                    mcp_server._start_delegate_job({})
+                gate.set()
+                await asyncio.sleep(0.05)
+                for job_id in ids:  # drain so no pending tasks leak
+                    mcp_server._collect_delegate_job(job_id)
+
+        asyncio.run(scenario())
+
+    def test_malformed_job_id_rejected(self):
+        with self.assertRaises(ValueError):
+            mcp_server._collect_delegate_job("not-a-job-id")
+
+    def test_none_job_id_rejected(self):
+        with self.assertRaises(ValueError):
+            mcp_server._collect_delegate_job(None)
+
+    def test_unknown_wellformed_job_id_rejected(self):
+        with self.assertRaises(ValueError):
+            mcp_server._collect_delegate_job("a" * 32)
+
+    def test_timeout_result_is_failure_envelope(self):
+        async def scenario():
+            async def hang(payload, timeout_s):
+                await asyncio.sleep(3600)
+
+            with mock.patch.object(mcp_server, "_post_ollama_chat", hang):
+                with mock.patch.object(mcp_server, "_DELEGATE_BG_CEILING_S", 0.01):
+                    job_id = mcp_server._start_delegate_job({})
+                    await asyncio.sleep(0.05)
+                    out = mcp_server._collect_delegate_job(job_id)
+                    self.assertEqual(out["status"], "failed")
+                    self.assertIn("ceiling", out["error"])
+
+        asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     unittest.main()

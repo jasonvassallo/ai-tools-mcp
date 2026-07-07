@@ -1437,6 +1437,97 @@ async def _post_ollama_chat(
         }
 
 
+def _render_delegate_answer(data: dict[str, Any]) -> list[TextContent]:
+    """Render an Ollama /api/chat response (or failure envelope) as MCP text.
+
+    message.thinking is deliberately discarded — the caller needs the
+    answer, not the model's scratchpad. Output passes through
+    redact_secrets for the same never-emit-secret-shapes contract as
+    every other family.
+    """
+    if data.get("status") == "failed":
+        return [
+            TextContent(
+                type="text", text=f"Error: {data.get('error', 'unknown failure')}"
+            )
+        ]
+    message = data.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        return [TextContent(type="text", text="Error: Ollama returned no content")]
+    model = redact_secrets(str(data.get("model", "")))
+    return [
+        TextContent(
+            type="text",
+            text=f"## Local Delegate ({model})\n\n{redact_secrets(content)}",
+        )
+    ]
+
+
+# In-memory only, deliberately: delegated input may be exactly the
+# sensitive text kept off cloud APIs — it does not belong on disk. Jobs
+# die with the MCP server process; the polling Claude session dies with
+# it too, so nothing durable is lost.
+_delegate_jobs: dict[str, dict[str, Any]] = {}
+
+
+def _start_delegate_job(payload: dict[str, Any]) -> str:
+    """Launch a background delegate call; return its job id.
+
+    Raises ValueError when _DELEGATE_JOB_CAP jobs are already running —
+    the 32 GB host runs num_parallel=1, so queuing more would lie to the
+    caller; failing fast is honest.
+    """
+    running = sum(1 for job in _delegate_jobs.values() if not job["task"].done())
+    if running >= _DELEGATE_JOB_CAP:
+        raise ValueError(
+            f"Delegate job cap ({_DELEGATE_JOB_CAP}) reached — collect finished "
+            "jobs via local_delegate_result or wait for one to complete."
+        )
+    job_id = uuid.uuid4().hex
+    coro = asyncio.wait_for(
+        _post_ollama_chat(payload, _DELEGATE_BG_CEILING_S),
+        timeout=_DELEGATE_BG_CEILING_S,
+    )
+    _delegate_jobs[job_id] = {
+        "task": asyncio.get_running_loop().create_task(coro),
+        "started": time.monotonic(),
+    }
+    return job_id
+
+
+def _collect_delegate_job(job_id: str | None) -> dict[str, Any]:
+    """Poll/collect a background job. Completed jobs are single-collect:
+    the registry entry is deleted on retrieval so memory stays clean."""
+    if not isinstance(job_id, str) or not _DELEGATE_JOB_ID_RE.fullmatch(job_id):
+        raise ValueError("job_id must be the 32-hex id returned by local_delegate.")
+    job = _delegate_jobs.get(job_id)
+    if job is None:
+        raise ValueError(
+            f"Unknown job_id {job_id!r} — results are single-collect and jobs "
+            "do not survive an MCP server restart."
+        )
+    task = job["task"]
+    if not task.done():
+        return {
+            "status": "running",
+            "elapsed_s": int(time.monotonic() - job["started"]),
+        }
+    del _delegate_jobs[job_id]
+    try:
+        return task.result()
+    except (TimeoutError, asyncio.CancelledError):
+        # asyncio.wait_for raises TimeoutError (== asyncio.TimeoutError on
+        # 3.12) past the ceiling; treat cancellation the same way.
+        return {
+            "status": "failed",
+            "error": (
+                f"background job exceeded the {int(_DELEGATE_BG_CEILING_S)}s "
+                "ceiling and was cancelled"
+            ),
+        }
+
+
 # Create MCP server
 server = Server("ai-tools-mcp")
 
