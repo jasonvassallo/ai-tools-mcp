@@ -15,7 +15,9 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -45,6 +47,9 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
         pass
 
     class _FakeConnectError(_FakeRequestError):
+        pass
+
+    class _FakeRequestsException(Exception):
         pass
 
     class _FakeHTTPStatusError(Exception):
@@ -131,6 +136,10 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             HTTPStatusError=_FakeHTTPStatusError,
             RequestError=_FakeRequestError,
             ConnectError=_FakeConnectError,
+        ),
+        "requests": _make(
+            "requests",
+            RequestException=_FakeRequestsException,
         ),
         "google": google_mod,
         "google.auth": auth_mod,
@@ -917,6 +926,60 @@ class TestLocalDelegateBackground(unittest.TestCase):
     def test_result_missing_id_is_clean_error(self):
         out = _call("local_delegate_result", {})
         self.assertIn("Error", out[0].text)
+
+
+class TestRunCheckOllamaLine(unittest.TestCase):
+    def _run_check_output(self, get_side_effect=None, json_version="0.9.0"):
+        fake_resp = mock.Mock()
+        fake_resp.raise_for_status = mock.Mock()
+        fake_resp.json.return_value = {"version": json_version}
+        fake_requests = types.SimpleNamespace(
+            get=mock.Mock(return_value=fake_resp, side_effect=get_side_effect),
+            RequestException=Exception,
+        )
+
+        def fake_keychain(service, account):
+            # Perplexity key resolves; OLLAMA_URL absent so the chain comes
+            # from the env var alone (a Keychain URL of "k" would fail
+            # endpoint validation and mask what this test targets).
+            if service == "OLLAMA_URL":
+                raise ValueError("not found")
+            return "k"
+
+        buf = io.StringIO()
+        with mock.patch.object(mcp_server, "requests", fake_requests, create=True):
+            with mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", side_effect=fake_keychain
+            ):
+                with mock.patch.object(
+                    mcp_server, "_load_adc", side_effect=ValueError("no adc")
+                ):
+                    with mock.patch.dict(
+                        os.environ, {"AI_TOOLS_OLLAMA_URL": "http://localhost:11434"}
+                    ):
+                        with contextlib.redirect_stdout(buf):
+                            with self.assertRaises(SystemExit) as ctx:
+                                mcp_server.run_check()
+        return buf.getvalue(), ctx.exception.code
+
+    def test_reachable_prints_ok(self):
+        out, code = self._run_check_output()
+        self.assertIn("ok: ollama reachable at http://localhost:11434", out)
+        self.assertEqual(code, 1)  # only the forced ADC failure counts
+
+    def test_unreachable_prints_warn_not_fail(self):
+        out, code = self._run_check_output(get_side_effect=Exception("refused"))
+        self.assertIn("warn: ollama not reachable at http://localhost:11434", out)
+        self.assertEqual(code, 1)  # ollama down did NOT add to errors
+
+    def test_bad_env_default_model_warns(self):
+        with mock.patch.dict(
+            os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": "llama3:8b"}
+        ):
+            out, code = self._run_check_output()
+        self.assertIn("not in", out)  # allowlist warn line
+        self.assertIn("llama3:8b", out)
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

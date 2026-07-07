@@ -73,6 +73,9 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     class _FakeRequestError(Exception):
         pass
 
+    class _FakeRequestsException(Exception):
+        pass
+
     class _FakeServer:
         def __init__(self, name):
             self.name = name
@@ -158,6 +161,10 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             AsyncClient=_FakeAsyncClient,
             HTTPStatusError=_FakeHTTPStatusError,
             RequestError=_FakeRequestError,
+        ),
+        "requests": _make(
+            "requests",
+            RequestException=_FakeRequestsException,
         ),
         "google": google_mod,
         "google.auth": auth_mod,

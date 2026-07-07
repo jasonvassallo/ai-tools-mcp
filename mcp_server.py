@@ -73,6 +73,7 @@ from typing import Any
 import google.auth
 import google.auth.transport.requests
 import httpx
+import requests
 
 # fcntl is POSIX-only; on Windows the import fails. We catch
 # ImportError so the module can still be imported (e.g. for docs,
@@ -226,6 +227,42 @@ def run_check() -> None:
     except (ValueError, Exception) as e:  # noqa: BLE001 - report any auth issue
         print(f"fail: {e}")
         errors += 1
+
+    # Non-fatal: local_delegate family. Ollama being down must not fail
+    # installs or preflights of the hosted tool families — delegate calls
+    # themselves fail closed at call time.
+    try:
+        chain = _resolve_ollama_chain()
+    except ValueError as e:
+        print(
+            "warn: ollama endpoint chain invalid (local_delegate unavailable): "
+            f"{redact_secrets(str(e))}"
+        )
+        chain = []
+    for endpoint in chain:
+        try:
+            headers = _ollama_auth_headers(endpoint)
+            if headers is None:
+                print(
+                    "warn: ollama endpoint skipped (no Cloudflare Access creds "
+                    f"in Keychain): {endpoint}"
+                )
+                continue
+            resp = requests.get(f"{endpoint}/api/version", headers=headers, timeout=3)
+            resp.raise_for_status()
+            version = resp.json().get("version", "?")
+            print(f"ok: ollama reachable at {endpoint} (version {version})")
+        except (ValueError, requests.RequestException) as e:
+            print(
+                f"warn: ollama not reachable at {endpoint} "
+                f"(local_delegate may fall back): {redact_secrets(str(e))}"
+            )
+    env_default = os.environ.get(_OLLAMA_DEFAULT_MODEL_ENV_VAR, "").strip()
+    if env_default and env_default not in OLLAMA_DELEGATE_MODELS:
+        print(
+            f"warn: {_OLLAMA_DEFAULT_MODEL_ENV_VAR}={env_default!r} not in "
+            f"allowlist; using {OLLAMA_DELEGATE_DEFAULT_MODEL}"
+        )
 
     sys.exit(errors)
 
@@ -639,9 +676,6 @@ def delete_session(session_id: str) -> dict[str, Any]:
             raise ValueError(f"Session not found: {session_id}") from None
     return {"success": True, "session_id": session_id}
 
-
-if "--check" in sys.argv:
-    run_check()
 
 # Perplexity client is constructed lazily so the module imports
 # cleanly even when the keychain CLI is unavailable (e.g. on Windows
@@ -2543,6 +2577,10 @@ async def main():
         await server.run(
             read_stream, write_stream, server.create_initialization_options()
         )
+
+
+if "--check" in sys.argv:
+    run_check()
 
 
 if __name__ == "__main__":

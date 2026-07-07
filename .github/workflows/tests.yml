@@ -69,7 +69,7 @@ jobs:
         # httpx/requests install. Adding a new module-level import to
         # mcp_server.py means extending the stubs in BOTH files, not
         # patching this workflow.
-        run: uv run --with pytest pytest test_redact.py test_session_mgmt.py test_agent_research.py -q
+        run: uv run --with pytest pytest test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py -q
 
       - name: Ruff format check
-        run: uv tool run ruff format --check mcp_server.py test_redact.py test_session_mgmt.py test_agent_research.py
+        run: uv tool run ruff format --check mcp_server.py test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py
