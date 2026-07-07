@@ -1257,7 +1257,11 @@ git commit -m "docs: local delegate family — README charter, manifest, command
 
 ```bash
 cd /Users/jasonvassallo/Documents/Code/ai-tools-mcp
-uv run python3 - <<'EOF'
+# NB: a bare `uv run python3 -` does NOT resolve mcp_server.py's PEP 723
+# inline deps (that only happens when the script file is the run target),
+# so supply them explicitly:
+uv run --with 'openai>=1.0.0' --with 'mcp>=1.0.0' --with 'httpx>=0.27' \
+       --with 'google-auth>=2.30' --with 'requests>=2.31' python3 - <<'EOF'
 import asyncio, importlib.util
 spec = importlib.util.spec_from_file_location("m", "mcp_server.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
