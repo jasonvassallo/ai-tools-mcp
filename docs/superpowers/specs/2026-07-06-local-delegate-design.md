@@ -48,7 +48,7 @@ Two tools, mirroring the `agent_research` / `agent_research_result` precedent.
 | `model` | string | `qwen3.6:35b-a3b-coding-nvfp4` | **Server-side allowlist**: base, `-32k`, `-256k` tags only. Anything else → error listing allowed values. |
 | `think` | bool | `false` | Passed natively to `/api/chat`. |
 | `background` | bool | `false` | `false`: block until the answer returns. `true`: return a `job_id` immediately. |
-| `keep_alive` | string | `"5m"` | Passed through to Ollama; `"0"` unloads immediately after the call (useful after a big `-256k` job on the 32 GB box). Validated against a strict pattern (`0` or `<int><s|m|h>`). |
+| `keep_alive` | string | omitted *(v1.1; was "5m")* | Passed through to Ollama when set; `"0"` unloads immediately after the call (useful after a big `-256k` job on the 32 GB box). Validated against a strict pattern (`0` or `<int><s|m|h>`). Default changed to omitted in v1.1 so the call inherits the server's `OLLAMA_KEEP_ALIVE` instead of shortening the warm window — see the v1.1 amendment below. |
 | `timeout_s` | int | 300 | Sync read timeout; capped at 600. |
 
 Returns: the model's answer as plain `TextContent` (sync), or
@@ -69,7 +69,7 @@ Returns one of:
 - the error payload → entry deleted likewise
 - unknown id → clean error
 
-## Endpoint resolution (fail-closed order)
+## Endpoint resolution (fail-closed order) **[Superseded by the v1.1 amendment below]**
 
 1. `AI_TOOLS_OLLAMA_URL` environment variable, if set
 2. macOS Keychain entry, service `OLLAMA_URL` (optional; config not credential,
@@ -166,9 +166,10 @@ files); all network mocked, no live Ollama in CI:
 
 ## Out of scope (v1)
 
-Fleet routing between machines, streaming responses, app-level auth headers,
-disk-persisted jobs, free-form model strings, server-side file reading,
-returning thinking traces, model management (pull/stop/ps).
+Fleet routing between machines *(pulled into v1.1)*, streaming responses,
+app-level auth headers *(pulled into v1.1)*, disk-persisted jobs, free-form
+model strings, server-side file reading, returning thinking traces, model
+management (pull/stop/ps).
 
 ---
 

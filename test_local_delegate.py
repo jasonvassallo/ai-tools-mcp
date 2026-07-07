@@ -348,6 +348,40 @@ class TestOllamaAuthHeaders(unittest.TestCase):
         self.assertNotIn("sec-456", out["error"])
         self.assertIn("[REDACTED_CF_ACCESS]", out["error"])
 
+    def test_http_error_scrub_survives_truncation_straddle(self):
+        # The secret straddles the 500-char truncation cutoff: it starts at
+        # index 495 and (being 7 chars) ends at index 502, i.e. the body[:500]
+        # snippet contains only its first 5 chars ("sec-4"). If the scrub runs
+        # AFTER truncation (substring match against the full secret), it never
+        # finds the full value in the truncated snippet and the fragment
+        # leaks. The scrub must run on the full body BEFORE truncation.
+        with self._keychain(
+            {
+                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+            }
+        ):
+            with mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value="https://remote.example"),
+            ):
+                secret = "sec-456"
+                filler_before = "a" * 495
+                filler_after = "b" * (600 - len(filler_before) - len(secret))
+                body = filler_before + secret + filler_after
+                self.assertEqual(len(body), 600)
+                client = _FakeClient(response=_FakeResponse(status_code=403, text=body))
+                with mock.patch.object(
+                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+                ):
+                    out = asyncio.run(
+                        mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
+                    )
+        self.assertEqual(out["status"], "failed")
+        self.assertNotIn("sec-456", out["error"])
+        self.assertNotIn("sec-4", out["error"])
+
 
 class TestPostOllamaChat(unittest.TestCase):
     def _with_selection(self, endpoint="http://localhost:11434"):
@@ -501,6 +535,14 @@ class TestResolveOllamaChain(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://remote.example:11434"})
 
+    def test_embedded_credentials_rejected(self):
+        # Credentials in the endpoint URL are never legitimate here — remote
+        # auth is CF Access headers from the Keychain, not URL userinfo.
+        # Embedded creds would otherwise flow into error messages / --check
+        # stdout, and redact_secrets has no generic userinfo pattern.
+        with self.assertRaises(ValueError):
+            self._chain({"AI_TOOLS_OLLAMA_URLS": "http://user:pw@localhost:11434"})
+
     def test_garbage_url_rejected(self):
         with self.assertRaises(ValueError):
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://"})
@@ -532,9 +574,13 @@ class TestDelegateDefaultModel(unittest.TestCase):
 class _FakeTagsClient:
     """Programmable fake for _select_ollama_endpoint probes."""
 
-    def __init__(self, tags_by_url=None, exc_by_url=None):
+    def __init__(self, tags_by_url=None, exc_by_url=None, raw_json_by_url=None):
         self.tags_by_url = tags_by_url or {}
         self.exc_by_url = exc_by_url or {}
+        # Overrides tags_by_url for a given base URL: returns this JSON body
+        # verbatim (e.g. a bare list) instead of the {"models": [...]} shape,
+        # to exercise probe responses that aren't a dict at the top level.
+        self.raw_json_by_url = raw_json_by_url or {}
         self.get_calls: list = []
 
     async def get(self, url, **kwargs):
@@ -542,6 +588,8 @@ class _FakeTagsClient:
         base = url.removesuffix("/api/tags")
         if base in self.exc_by_url:
             raise self.exc_by_url[base]
+        if base in self.raw_json_by_url:
+            return _FakeResponse(json_data=self.raw_json_by_url[base])
         return _FakeResponse(
             json_data={"models": [{"name": t} for t in self.tags_by_url.get(base, [])]}
         )
@@ -628,6 +676,18 @@ class TestSelectOllamaEndpoint(unittest.TestCase):
                 self._select(client)
         self.assertIn("skipped", str(ctx.exception))
         self.assertEqual(client.get_calls, [])  # never called bare
+
+    def test_non_dict_tags_body_treated_as_no_models(self):
+        # A probed endpoint can return valid JSON that isn't an object (e.g.
+        # a bare list or string) — `.get("models", [])` on a non-dict blows
+        # up with AttributeError, escaping the always-return-envelope
+        # contract. Must be treated as "no models" and fall through to the
+        # next endpoint instead of raising.
+        client = _FakeTagsClient(
+            raw_json_by_url={self.EP1: [1, 2]},
+            tags_by_url={self.EP2: [_MODEL]},
+        )
+        self.assertEqual(self._select(client), self.EP2)
 
 
 class TestRenderDelegateAnswer(unittest.TestCase):

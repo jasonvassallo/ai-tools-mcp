@@ -778,19 +778,30 @@ async def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-def _http_error_payload(exc: httpx.HTTPStatusError) -> dict[str, Any]:
+def _http_error_payload(
+    exc: httpx.HTTPStatusError, *, scrub: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """Build a structured failure dict from an httpx HTTPStatusError.
 
     Keeps a short body snippet (≤500 chars) so the caller has enough context to
     diagnose without bloating the MCP response. Runs the snippet through
     `redact_secrets` because Gemini error bodies have, on occasion, echoed
     request headers or query content.
+
+    `scrub` is an optional set of exact secret values (e.g. live header
+    values a caller holds) to strip from the body — value-aware, precise
+    replacement for secret shapes `redact_secrets`'s patterns don't cover.
+    Applied to the FULL body, before the 500-char truncation: a secret
+    straddling the cutoff would otherwise leave an un-scrubbed fragment.
     """
     status_code = exc.response.status_code
     try:
         body = exc.response.text or ""
     except Exception:  # noqa: BLE001 - never let body extraction shadow the real error
         body = ""
+    for secret in scrub:
+        if secret:
+            body = body.replace(secret, "[REDACTED_CF_ACCESS]")
     snippet = redact_secrets(body[:500])
     return {"status": "failed", "error": f"{status_code}: {snippet}"}
 
@@ -1272,6 +1283,12 @@ def _validate_ollama_endpoint(url: str) -> str:
             f"Refusing plain-http non-localhost Ollama endpoint "
             f"{redact_secrets(url)!r} — remote endpoints must be https"
         )
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            f"Refusing Ollama endpoint with embedded credentials "
+            f"{redact_secrets(url)!r} — auth belongs in the Keychain "
+            "(CF Access service token), never in the URL"
+        )
     return url.rstrip("/")
 
 
@@ -1380,7 +1397,8 @@ async def _select_ollama_endpoint(model: str) -> str:
                 timeout=_OLLAMA_PROBE_TIMEOUT_S,
             )
             response.raise_for_status()
-            models = response.json().get("models", [])
+            data = response.json()
+            models = data.get("models", []) if isinstance(data, dict) else []
             tags = [
                 str(m.get("name") or m.get("model") or "")
                 for m in models
@@ -1438,15 +1456,12 @@ async def _post_ollama_chat(
         response.raise_for_status()
         return response.json()
     except httpx.HTTPStatusError as exc:
-        failure = _http_error_payload(exc)
-        for secret in headers.values():
-            # Value-aware scrub: an Access-gated host's error body can echo
-            # request headers; redact_secrets has no CF-token pattern, but we
-            # hold the exact values, so scrub them precisely.
-            if secret:
-                failure["error"] = failure["error"].replace(
-                    secret, "[REDACTED_CF_ACCESS]"
-                )
+        # Value-aware scrub: an Access-gated host's error body can echo
+        # request headers; redact_secrets has no CF-token pattern, but we
+        # hold the exact header values, so scrub them precisely — before
+        # _http_error_payload truncates the body, so a secret straddling
+        # the truncation cutoff can't leave an un-scrubbed fragment.
+        failure = _http_error_payload(exc, scrub=tuple(headers.values()))
         if exc.response.status_code == 404:
             failure["error"] += (
                 f" — model may not be pulled on this host; try: ollama pull {model}"
