@@ -10,9 +10,11 @@ Add a third tool family to `mcp_server.py`: delegation of tasks to the local
 Ollama `qwen3.6:35b-a3b-coding-nvfp4` model. Four use cases, all served by one
 generic surface:
 
-1. **Privacy** — input text that must never leave the machine (the existing
-   research tools all send text to hosted APIs; this tool exists so text can
-   stay on-device).
+1. **Privacy** — input text that must never reach a third-party API (the
+   existing research tools all send text to hosted APIs). Text stays
+   on-device when localhost serves the model — always probed first; under
+   v1.1 it may otherwise fall back to the user's **own** Access-gated
+   endpoint, never a third party.
 2. **Quota/cost offload** — cheap mechanical work (summaries, boilerplate,
    drafts, bulk transforms) on free local compute.
 3. **Second opinion** — independent local review of code or text.
@@ -98,8 +100,9 @@ app-level. No auth headers in v1.
 
 **Sync:** `call_tool("local_delegate")` → validate params → resolve endpoint →
 `POST {endpoint}/api/chat` with
-`{model, messages: [system?, user], think, stream: false, keep_alive}`
-(no `options` block — context length is owned by the model tags, not the caller)
+`{model, messages: [system?, user], think, stream: false, keep_alive?}`
+(`keep_alive` only when the caller provided it — v1.1; no `options` block —
+context length is owned by the model tags, not the caller)
 → extract `message.content` → `TextContent`.
 
 **Background:** same request inside a task; registry `running → done|error`;
@@ -125,9 +128,13 @@ for background jobs) — same mechanism the agent-research POST already uses.
 
 ## Security posture
 
-- Input text goes only to the resolved Ollama endpoint (localhost by default).
+- Input text goes only to an endpoint in the user-controlled chain
+  (local-first; remote is the user's own Access-gated host — v1.1).
 - No disk writes for prompts, results, or job state.
-- No new secrets; `OLLAMA_URL` Keychain entry is optional config.
+- Secrets only in Keychain: `OLLAMA_URL` is optional config; v1.1 adds the
+  `OLLAMA_CF_ACCESS_CLIENT_ID` / `OLLAMA_CF_ACCESS_CLIENT_SECRET` service-token
+  entries (read per call, never cached/logged; endpoint skipped when absent).
+  *(This supersedes the original "no new secrets" line.)*
 - Redaction (`redact_secrets`) applied to anything logged or embedded in error
   payloads.
 - Least privilege: the server does not read files, list models, pull models,
@@ -140,6 +147,8 @@ files); all network mocked, no live Ollama in CI:
 
 - allowlist: valid tags, invalid tag, default
 - endpoint resolution precedence: env > keychain > default (mocked)
+  *(v1.1: chain parsing, per-model probe pick-first-with-tag, 60 s cache,
+  all-miss error, CF-Access header injection/skip — see amendment)*
 - request body: `think` propagation, system message included/omitted,
   `keep_alive` pass-through and pattern validation, `timeout_s` cap
 - sync: happy path, connection refused, non-200
