@@ -237,6 +237,27 @@ class TestOllamaAuthHeaders(unittest.TestCase):
         with self._keychain({"OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456"}):
             self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
 
+    def test_remote_empty_client_id_returns_none(self):
+        # A Keychain item can exist with an empty password: `security`
+        # returns "" with returncode 0 (no ValueError). Must still fail
+        # closed rather than send a malformed header.
+        with self._keychain(
+            {
+                "OLLAMA_CF_ACCESS_CLIENT_ID": "",
+                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+            }
+        ):
+            self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
+
+    def test_remote_empty_client_secret_returns_none(self):
+        with self._keychain(
+            {
+                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "",
+            }
+        ):
+            self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
+
     def test_probe_sends_cf_headers_to_remote(self):
         with mock.patch.dict(
             os.environ,
@@ -284,6 +305,38 @@ class TestOllamaAuthHeaders(unittest.TestCase):
                     )
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("sec-456", out["error"])
+
+    def test_http_error_body_echoing_secret_is_scrubbed(self):
+        # An Access-gated host's 403 body can echo request headers verbatim.
+        # redact_secrets has no CF-Access-token pattern, so the only backstop
+        # is the value-aware scrub in _post_ollama_chat's HTTPStatusError
+        # branch — assert it actually strips the live secret value.
+        with self._keychain(
+            {
+                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+            }
+        ):
+            with mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value="https://remote.example"),
+            ):
+                client = _FakeClient(
+                    response=_FakeResponse(
+                        status_code=403,
+                        text="denied for CF-Access-Client-Secret: sec-456",
+                    )
+                )
+                with mock.patch.object(
+                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+                ):
+                    out = asyncio.run(
+                        mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
+                    )
+        self.assertEqual(out["status"], "failed")
+        self.assertNotIn("sec-456", out["error"])
+        self.assertIn("[REDACTED_CF_ACCESS]", out["error"])
 
 
 class TestPostOllamaChat(unittest.TestCase):

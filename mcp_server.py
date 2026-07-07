@@ -1299,6 +1299,12 @@ def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
         )
     except ValueError:
         return None
+    if not client_id or not client_secret:
+        # A Keychain item can exist with an empty password — `security`
+        # returns "" with returncode 0 (no ValueError). Treat that the same
+        # as "absent" so we fail closed instead of calling the Access-gated
+        # host with a malformed header.
+        return None
     return {
         "CF-Access-Client-Id": client_id,
         "CF-Access-Client-Secret": client_secret,
@@ -1394,6 +1400,14 @@ async def _post_ollama_chat(
         return response.json()
     except httpx.HTTPStatusError as exc:
         failure = _http_error_payload(exc)
+        for secret in headers.values():
+            # Value-aware scrub: an Access-gated host's error body can echo
+            # request headers; redact_secrets has no CF-token pattern, but we
+            # hold the exact values, so scrub them precisely.
+            if secret:
+                failure["error"] = failure["error"].replace(
+                    secret, "[REDACTED_CF_ACCESS]"
+                )
         if exc.response.status_code == 404:
             failure["error"] += (
                 f" — model may not be pulled on this host; try: ollama pull {model}"
