@@ -1177,6 +1177,8 @@ OLLAMA_DELEGATE_DEFAULT_MODEL = OLLAMA_DELEGATE_MODELS[0]
 
 _OLLAMA_URL_ENV_VAR = "AI_TOOLS_OLLAMA_URL"
 _OLLAMA_URL_KEYCHAIN_SERVICE = "OLLAMA_URL"
+_CF_ACCESS_ID_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_ID"
+_CF_ACCESS_SECRET_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_SECRET"
 
 # `0` (unload immediately) or 1-9999 seconds/minutes/hours. Strict so a
 # malformed value cannot smuggle arbitrary JSON into the Ollama request.
@@ -1279,15 +1281,28 @@ def _delegate_default_model() -> str:
 
 
 def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
-    """Auth headers for an endpoint; None means SKIP (never call bare).
+    """Auth headers for an Ollama endpoint; None means SKIP, never call bare.
 
-    Stub for this task: localhost needs no auth ({}); remote endpoints
-    report None until the Cloudflare Access Keychain wiring lands in the
-    next task.
+    localhost → {} (no auth). Non-localhost https → Cloudflare Access
+    service-token headers read from the Keychain per call (never cached,
+    never logged). Either credential absent → None (fail closed): the
+    caller treats the endpoint as unavailable rather than calling an
+    Access-gated host unauthenticated.
     """
     if _is_localhost_endpoint(endpoint):
         return {}
-    return None
+    user = getpass.getuser()
+    try:
+        client_id = get_api_key_from_keychain(_CF_ACCESS_ID_KEYCHAIN_SERVICE, user)
+        client_secret = get_api_key_from_keychain(
+            _CF_ACCESS_SECRET_KEYCHAIN_SERVICE, user
+        )
+    except ValueError:
+        return None
+    return {
+        "CF-Access-Client-Id": client_id,
+        "CF-Access-Client-Secret": client_secret,
+    }
 
 
 _ollama_endpoint_cache: dict[str, tuple[str, float]] = {}

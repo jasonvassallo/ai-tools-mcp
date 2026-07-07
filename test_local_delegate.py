@@ -203,6 +203,89 @@ def _with_client(client):
     )
 
 
+class TestOllamaAuthHeaders(unittest.TestCase):
+    def _keychain(self, mapping):
+        def fake(service, account):
+            if service in mapping:
+                return mapping[service]
+            raise ValueError("not found")
+
+        return mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", side_effect=fake
+        )
+
+    def test_localhost_needs_no_auth(self):
+        for ep in ("http://localhost:11434", "http://127.0.0.1:11434"):
+            self.assertEqual(mcp_server._ollama_auth_headers(ep), {})
+
+    def test_remote_with_creds_gets_cf_access_headers(self):
+        with self._keychain(
+            {
+                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+            }
+        ):
+            headers = mcp_server._ollama_auth_headers("https://remote.example")
+        self.assertEqual(
+            headers,
+            {"CF-Access-Client-Id": "id-123", "CF-Access-Client-Secret": "sec-456"},
+        )
+
+    def test_remote_missing_either_cred_returns_none(self):
+        with self._keychain({"OLLAMA_CF_ACCESS_CLIENT_ID": "id-123"}):
+            self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
+        with self._keychain({"OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456"}):
+            self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
+
+    def test_probe_sends_cf_headers_to_remote(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "AI_TOOLS_OLLAMA_URLS": "https://remote.example",
+                "AI_TOOLS_OLLAMA_URL": "",
+            },
+        ):
+            with self._keychain(
+                {
+                    "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                    "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+                }
+            ):
+                mcp_server._ollama_endpoint_cache.clear()
+                client = _FakeTagsClient(
+                    tags_by_url={"https://remote.example": [_MODEL]}
+                )
+                with mock.patch.object(
+                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+                ):
+                    endpoint = asyncio.run(mcp_server._select_ollama_endpoint(_MODEL))
+        self.assertEqual(endpoint, "https://remote.example")
+        _, kwargs = client.get_calls[0]
+        self.assertEqual(kwargs["headers"]["CF-Access-Client-Id"], "id-123")
+
+    def test_post_sends_cf_headers_and_never_leaks_secret_in_errors(self):
+        with self._keychain(
+            {
+                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+            }
+        ):
+            with mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value="https://remote.example"),
+            ):
+                client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
+                with mock.patch.object(
+                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+                ):
+                    out = asyncio.run(
+                        mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
+                    )
+        self.assertEqual(out["status"], "failed")
+        self.assertNotIn("sec-456", out["error"])
+
+
 class TestPostOllamaChat(unittest.TestCase):
     def _with_selection(self, endpoint="http://localhost:11434"):
         return mock.patch.object(
