@@ -40,6 +40,18 @@ files + expected answer + thinking tokens (if `think:true`, add 1–4k).
 - **> ~60k** → `-256k`, explicitly. Whole-repo dumps, giant transcripts.
   JVMBPro must be on.
 
+## Constrained machines (e.g. 32 GB Windows desktop, CPU-only, office apps open)
+
+When the host can't fit the 35B qwen (~20 GB loaded), the allowlist is
+overridden per machine (`ollama_models` extension setting /
+`AI_TOOLS_OLLAMA_MODELS`) with a small local model first — e.g.
+`qwen2.5-coder:14b` (q4, ~9 GB; the qwen3-coder line starts at 30B and does
+not fit). Routing then works itself out: calls for the small tag run
+locally; calls that name a qwen3.6 tag miss the local probe and fall
+through the endpoint chain to `ollama-mbp` (64k/256k) or the always-on
+`ollama` (32k) endpoint. On CPU-only hosts keep `think:false` (thinking is
+slow there) and expect ~4–8 tok/s from a dense 12–14B q4.
+
 ## Host-specific etiquette
 
 - **On JVMBPro, prefer `-256k` for local calls.** It is the instance already

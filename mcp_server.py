@@ -174,19 +174,50 @@ def redact_secrets(value: Any) -> Any:
     return value
 
 
+# v1.2 (issue #20): credentials resolve environment-first, then macOS
+# Keychain. The env step is what makes non-macOS hosts (Windows) work —
+# there is no security(1) there, so credentials are supplied via per-user
+# environment variables instead. Most services map to an env var named
+# after the Keychain service; the exceptions live here.
+_CRED_ENV_OVERRIDES: dict[tuple[str, str], str] = {
+    ("api_tokens", "perplexity"): "PERPLEXITY_API_KEY",
+}
+
+
+def _cred_env_var(service: str, account: str) -> str:
+    override = _CRED_ENV_OVERRIDES.get((service, account))
+    if override:
+        return override
+    return re.sub(r"[^A-Z0-9]", "_", service.upper())
+
+
 def get_api_key_from_keychain(service: str, account: str) -> str:
-    """Retrieve API key from macOS Keychain."""
-    result = subprocess.run(
-        ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise ValueError(
-            f"Keychain item not found. Add with:\n"
-            f"  security add-generic-password -s '{service}' -a '{account}' -w 'YOUR_API_KEY'"
+    """Retrieve a credential: environment variable first, then macOS Keychain.
+
+    Empty/whitespace env values are ignored (fail closed, never treat blank
+    as a credential). A miss in both sources raises naming both remedies.
+    On non-macOS hosts security(1) does not exist; that path degrades to the
+    same error rather than crashing.
+    """
+    env_var = _cred_env_var(service, account)
+    env_val = os.environ.get(env_var, "").strip()
+    if env_val:
+        return env_val
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
         )
-    return result.stdout.strip()
+    except FileNotFoundError:
+        result = None  # non-macOS: no security(1) binary
+    if result is not None and result.returncode == 0:
+        return result.stdout.strip()
+    raise ValueError(
+        f"Credential not found. Set the {env_var} environment variable "
+        f"(required on non-macOS), or add it to the macOS Keychain with:\n"
+        f"  security add-generic-password -s '{service}' -a '{account}' -w 'YOUR_API_KEY'"
+    )
 
 
 _ADC_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
@@ -1227,11 +1258,30 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # native API accepts `think` — qwen3.6 is a thinking model and
 # think:false is required for fast structured work.
 
-OLLAMA_DELEGATE_MODELS: tuple[str, ...] = (
+_OLLAMA_MODELS_ENV_VAR = "AI_TOOLS_OLLAMA_MODELS"
+_OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "qwen3.6:35b-a3b-coding-nvfp4",
     "qwen3.6:35b-a3b-coding-nvfp4-32k",
     "qwen3.6:35b-a3b-coding-nvfp4-256k",
 )
+
+
+def _resolve_delegate_models() -> tuple[str, ...]:
+    """v1.2 (issue #20): allowlist overridable per machine via env/user_config.
+
+    Comma-separated, order-preserving, deduplicated; the first entry becomes
+    the default model. Blank or effectively-empty values fall back to the
+    built-in qwen tags (fail closed — a typo'd setting cannot yield an empty
+    allowlist that rejects everything).
+    """
+    raw = os.environ.get(_OLLAMA_MODELS_ENV_VAR, "").strip()
+    if not raw:
+        return _OLLAMA_BUILTIN_DELEGATE_MODELS
+    models = tuple(dict.fromkeys(m.strip() for m in raw.split(",") if m.strip()))
+    return models or _OLLAMA_BUILTIN_DELEGATE_MODELS
+
+
+OLLAMA_DELEGATE_MODELS: tuple[str, ...] = _resolve_delegate_models()
 OLLAMA_DELEGATE_DEFAULT_MODEL = OLLAMA_DELEGATE_MODELS[0]
 
 _OLLAMA_URL_ENV_VAR = "AI_TOOLS_OLLAMA_URL"
