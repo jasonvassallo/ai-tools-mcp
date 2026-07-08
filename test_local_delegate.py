@@ -182,7 +182,16 @@ def _load_mcp_server():
             )
             assert spec is not None and spec.loader is not None
             module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            # OLLAMA_DELEGATE_MODELS is resolved from the environment at
+            # import time; a developer/CI shell following the Windows
+            # guidance may export AI_TOOLS_OLLAMA_MODELS, which would
+            # replace the built-in allowlist this suite asserts against
+            # (Codex P2, PR #22). Import under a scrubbed env; the
+            # resolver tests exercise the override explicitly.
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AI_TOOLS_OLLAMA_MODELS", None)
+                os.environ.pop("AI_TOOLS_OLLAMA_DEFAULT_MODEL", None)
+                spec.loader.exec_module(module)
     return module
 
 

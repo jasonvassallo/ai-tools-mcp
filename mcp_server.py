@@ -399,9 +399,14 @@ def _session_lock(session_file: Path):
         # than fall through to a no-op lock that would silently let
         # the resurrection race re-open. (Per PR #4 round-9 review,
         # Gemini medium L17: "fcntl module is Unix-specific".)
-        raise OSError(
-            "Session management requires POSIX (macOS/Linux). "
-            "fcntl is unavailable on this platform."
+        # ValueError (not OSError) so the tool dispatcher's existing
+        # `except ValueError` surfaces this as a clean tool error on
+        # Windows installs instead of an internal exception (Codex
+        # P2, PR #22).
+        raise ValueError(
+            "update_session/delete_session require POSIX advisory locking "
+            "(fcntl), which this platform lacks — these two tools are "
+            "unavailable on Windows; all other tools work."
         )
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = session_file.with_suffix(".lock")

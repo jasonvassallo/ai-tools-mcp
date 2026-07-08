@@ -954,7 +954,9 @@ class TestAtomicWrites(_SessionMgmtBase):
     def test_session_lock_raises_clean_error_on_non_posix(self):
         """PR #4 round-9 review (Gemini medium L17): on Windows or
         any platform without ``fcntl``, ``_session_lock`` must raise
-        a clear OSError instead of crashing with AttributeError. The
+        a clean error instead of crashing with AttributeError —
+        since v1.2 (win32 support) a ValueError, which the tool
+        dispatcher already translates into a user-visible error. The
         module's top-level ``import fcntl`` is wrapped in try/except
         so the module loads fine on Windows; this test verifies the
         runtime guard inside the helper."""
@@ -966,7 +968,7 @@ class TestAtomicWrites(_SessionMgmtBase):
         # to None — the same state the conditional import produces
         # when ImportError fires.
         with mock.patch.object(mcp_server, "fcntl", None):
-            with self.assertRaises(OSError) as ctx:
+            with self.assertRaises(ValueError) as ctx:
                 with mcp_server._session_lock(session_file):
                     pass  # pragma: no cover — should not reach
             self.assertIn("POSIX", str(ctx.exception))
