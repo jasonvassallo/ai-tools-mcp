@@ -1204,6 +1204,13 @@ class TestLazyKeychainImport(unittest.TestCase):
         # Reuse the already-imported test module (it was loaded with a
         # stubbed succeeding ``subprocess.run`` returning ``dummy-key``)
         # and reset the cache so we can observe the first-call write.
+        # Env isolation: with PERPLEXITY_API_KEY set (v1.2 env-first
+        # resolution), the accessor would never shell out and the
+        # call-count assertion below would fail spuriously.
+        env_guard = mock.patch.dict(mcp_server.os.environ, {}, clear=False)
+        env_guard.start()
+        self.addCleanup(env_guard.stop)
+        mcp_server.os.environ.pop("PERPLEXITY_API_KEY", None)
         original = mcp_server._perplexity_client_cache
         try:
             mcp_server._perplexity_client_cache = None
