@@ -1476,7 +1476,14 @@ async def _select_ollama_endpoint(model: str) -> str:
             )
             continue
         try:
-            response = await client.get(
+            # Auth is server-sourced (CF Access service-token creds from env
+            # or Keychain via _ollama_auth_headers), never a caller-supplied
+            # credential. The endpoint comes from operator config (env /
+            # user_config / Keychain / built-in defaults), validated
+            # https-only for non-localhost with URL userinfo rejected — no
+            # tool parameter can redirect the credential to an attacker
+            # host. Same false-positive class as the PR #15 suppressions.
+            response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
                 f"{endpoint}/api/tags",
                 headers=headers,
                 timeout=_OLLAMA_PROBE_TIMEOUT_S,
