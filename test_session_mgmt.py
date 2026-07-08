@@ -1171,10 +1171,13 @@ class TestLazyKeychainImport(unittest.TestCase):
 
     def test_get_perplexity_client_propagates_keychain_error(self):
         """When ``deep_research`` is invoked on a system without the
-        keychain CLI, the underlying error must surface — we are
-        deferring the lookup, not silently swallowing it. This proves
-        the laziness preserves the original failure-mode signal."""
+        keychain CLI, the failure must surface — we are deferring the
+        lookup, not silently swallowing it. v1.2 (issue #20): a missing
+        security(1) no longer leaks a raw FileNotFoundError; it raises
+        the actionable ValueError naming the env-var remedy, so the
+        laziness still preserves a loud, actionable failure signal."""
         module = self._import_with_failing_keychain(drop_fcntl=False)
+        module.os.environ.pop("PERPLEXITY_API_KEY", None)
         with mock.patch.object(
             module,
             "subprocess",
@@ -1187,8 +1190,9 @@ class TestLazyKeychainImport(unittest.TestCase):
                 CalledProcessError=Exception,
             ),
         ):
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaises(ValueError) as ctx:
                 module._get_perplexity_client()
+        self.assertIn("PERPLEXITY_API_KEY", str(ctx.exception))
 
     def test_get_perplexity_client_caches_first_call(self):
         """The accessor must memoise — repeated invocations should
