@@ -29,11 +29,16 @@ shift || true
 CMD=("${@:-review}")
 
 : "${GH_TOKEN:?GH_TOKEN not set — load your GitHub PAT from Keychain into the env}"
+command -v pr-agent >/dev/null \
+  || { echo "pr-agent not found on PATH — install it (e.g. uv tool install pr-agent)" >&2; exit 1; }
 
 UPSTREAM="${OLLAMA_API_BASE:-http://localhost:11434}"
 PROXY_PORT="${PR_AGENT_PROXY_PORT:-11435}"
 MODEL="${PR_AGENT_OLLAMA_MODEL:-ollama/qwen3.6:35b-a3b-coding-nvfp4}"
 NUM_CTX="${PR_AGENT_NUM_CTX:-16384}"
+case "$NUM_CTX" in
+  ''|*[!0-9]*) echo "PR_AGENT_NUM_CTX must be a positive integer, got: ${NUM_CTX}" >&2; exit 1;;
+esac
 
 # --- stand up the think:false-injecting Ollama proxy (stdlib only) -----------
 PROXY_PY="$(mktemp -t ollama_think_off.XXXXXX)"
@@ -59,8 +64,11 @@ class Handler(BaseHTTPRequestHandler):
                 data = json.loads(body)
                 if isinstance(data, dict):
                     data["think"] = False  # force qwen3 thinking OFF
-                    options = data.setdefault("options", {})
-                    options.setdefault("num_ctx", NUM_CTX)
+                    # Guard: a caller-sent non-dict "options" (null, list)
+                    # must not crash the injector.
+                    if not isinstance(data.get("options"), dict):
+                        data["options"] = {}
+                    data["options"].setdefault("num_ctx", NUM_CTX)
                     body = json.dumps(data).encode()
             except (json.JSONDecodeError, ValueError):
                 pass
@@ -68,27 +76,29 @@ class Handler(BaseHTTPRequestHandler):
             UPSTREAM + self.path, data=body, method=method,
             headers={"Content-Type": "application/json"},
         )
+        # Buffer the full upstream response BEFORE sending anything to the
+        # client: an error mid-copy can then never attempt a second
+        # send_response after headers already went out (header-resend bug
+        # class). Responses here are bounded (single structured review
+        # call / tag lists), so buffering is safe.
         try:
             with urllib.request.urlopen(req, timeout=600) as resp:
-                self.send_response(resp.status)
-                self.send_header("Content-Type", resp.headers.get("Content-Type", "application/json"))
-                self.end_headers()
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
+                payload = resp.read()
+                status = resp.status
+                ctype = resp.headers.get("Content-Type", "application/json")
         except urllib.error.HTTPError as e:
-            err_body = e.read()
-            self.send_response(e.code)
-            self.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
-            self.end_headers()
-            self.wfile.write(err_body)
+            payload = e.read()
+            status = e.code
+            ctype = e.headers.get("Content-Type", "application/json")
         except (urllib.error.URLError, TimeoutError) as e:
-            self.send_response(502)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": f"upstream Ollama unreachable: {e}"}).encode())
+            payload = json.dumps({"error": f"upstream Ollama unreachable: {e}"}).encode()
+            status = 502
+            ctype = "application/json"
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def do_POST(self):
         self._forward("POST")
@@ -110,10 +120,10 @@ trap cleanup EXIT
 
 # wait for the proxy to bind + verify it forwards to Ollama
 for _ in 1 2 3 4 5; do
-  curl -s --max-time 3 "http://127.0.0.1:${PROXY_PORT}/api/tags" >/dev/null 2>&1 && break
+  curl -sf --max-time 3 "http://127.0.0.1:${PROXY_PORT}/api/tags" >/dev/null 2>&1 && break
   sleep 1
 done
-curl -s --max-time 3 "http://127.0.0.1:${PROXY_PORT}/api/tags" >/dev/null \
+curl -sf --max-time 3 "http://127.0.0.1:${PROXY_PORT}/api/tags" >/dev/null \
   || { echo "think-off proxy failed to start on :${PROXY_PORT}" >&2; exit 1; }
 
 # --- run pr-agent against the proxy (token from env, never on disk) ----------
