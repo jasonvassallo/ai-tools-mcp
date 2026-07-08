@@ -7,6 +7,14 @@
 #     "httpx>=0.27",
 #     "google-auth>=2.30",
 #     "requests>=2.31",
+#     # transitive floors per pip-audit 2026-07-07 (starlette, python-multipart,
+#     # pyjwt, cryptography, pydantic-settings, idna)
+#     "starlette>=1.3.1",
+#     "python-multipart>=0.0.31",
+#     "pyjwt>=2.13.0",
+#     "cryptography>=48.0.1",
+#     "pydantic-settings>=2.14.2",
+#     "idna>=3.15",
 # ]
 # ///
 """
