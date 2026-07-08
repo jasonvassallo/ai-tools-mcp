@@ -1477,7 +1477,8 @@ async def _select_ollama_endpoint(model: str) -> str:
         headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
         if headers is None:
             attempts.append(
-                f"{endpoint}: skipped (Cloudflare Access credentials not in Keychain)"
+                f"{endpoint}: skipped (Cloudflare Access credentials not in "
+                "env or Keychain)"
             )
             continue
         try:
