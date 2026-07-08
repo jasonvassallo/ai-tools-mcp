@@ -954,7 +954,9 @@ class TestAtomicWrites(_SessionMgmtBase):
     def test_session_lock_raises_clean_error_on_non_posix(self):
         """PR #4 round-9 review (Gemini medium L17): on Windows or
         any platform without ``fcntl``, ``_session_lock`` must raise
-        a clear OSError instead of crashing with AttributeError. The
+        a clean error instead of crashing with AttributeError —
+        since v1.2 (win32 support) a ValueError, which the tool
+        dispatcher already translates into a user-visible error. The
         module's top-level ``import fcntl`` is wrapped in try/except
         so the module loads fine on Windows; this test verifies the
         runtime guard inside the helper."""
@@ -966,7 +968,7 @@ class TestAtomicWrites(_SessionMgmtBase):
         # to None — the same state the conditional import produces
         # when ImportError fires.
         with mock.patch.object(mcp_server, "fcntl", None):
-            with self.assertRaises(OSError) as ctx:
+            with self.assertRaises(ValueError) as ctx:
                 with mcp_server._session_lock(session_file):
                     pass  # pragma: no cover — should not reach
             self.assertIn("POSIX", str(ctx.exception))
@@ -1171,10 +1173,16 @@ class TestLazyKeychainImport(unittest.TestCase):
 
     def test_get_perplexity_client_propagates_keychain_error(self):
         """When ``deep_research`` is invoked on a system without the
-        keychain CLI, the underlying error must surface — we are
-        deferring the lookup, not silently swallowing it. This proves
-        the laziness preserves the original failure-mode signal."""
+        keychain CLI, the failure must surface — we are deferring the
+        lookup, not silently swallowing it. v1.2 (issue #20): a missing
+        security(1) no longer leaks a raw FileNotFoundError; it raises
+        the actionable ValueError naming the env-var remedy, so the
+        laziness still preserves a loud, actionable failure signal."""
         module = self._import_with_failing_keychain(drop_fcntl=False)
+        env_guard = mock.patch.dict(module.os.environ, {}, clear=False)
+        env_guard.start()
+        self.addCleanup(env_guard.stop)
+        module.os.environ.pop("PERPLEXITY_API_KEY", None)
         with mock.patch.object(
             module,
             "subprocess",
@@ -1187,8 +1195,9 @@ class TestLazyKeychainImport(unittest.TestCase):
                 CalledProcessError=Exception,
             ),
         ):
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaises(ValueError) as ctx:
                 module._get_perplexity_client()
+        self.assertIn("PERPLEXITY_API_KEY", str(ctx.exception))
 
     def test_get_perplexity_client_caches_first_call(self):
         """The accessor must memoise — repeated invocations should
@@ -1197,6 +1206,13 @@ class TestLazyKeychainImport(unittest.TestCase):
         # Reuse the already-imported test module (it was loaded with a
         # stubbed succeeding ``subprocess.run`` returning ``dummy-key``)
         # and reset the cache so we can observe the first-call write.
+        # Env isolation: with PERPLEXITY_API_KEY set (v1.2 env-first
+        # resolution), the accessor would never shell out and the
+        # call-count assertion below would fail spuriously.
+        env_guard = mock.patch.dict(mcp_server.os.environ, {}, clear=False)
+        env_guard.start()
+        self.addCleanup(env_guard.stop)
+        mcp_server.os.environ.pop("PERPLEXITY_API_KEY", None)
         original = mcp_server._perplexity_client_cache
         try:
             mcp_server._perplexity_client_cache = None

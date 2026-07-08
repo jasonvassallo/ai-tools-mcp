@@ -174,19 +174,50 @@ def redact_secrets(value: Any) -> Any:
     return value
 
 
+# v1.2 (issue #20): credentials resolve environment-first, then macOS
+# Keychain. The env step is what makes non-macOS hosts (Windows) work —
+# there is no security(1) there, so credentials are supplied via per-user
+# environment variables instead. Most services map to an env var named
+# after the Keychain service; the exceptions live here.
+_CRED_ENV_OVERRIDES: dict[tuple[str, str], str] = {
+    ("api_tokens", "perplexity"): "PERPLEXITY_API_KEY",
+}
+
+
+def _cred_env_var(service: str, account: str) -> str:
+    override = _CRED_ENV_OVERRIDES.get((service, account))
+    if override:
+        return override
+    return re.sub(r"[^A-Z0-9]", "_", service.upper())
+
+
 def get_api_key_from_keychain(service: str, account: str) -> str:
-    """Retrieve API key from macOS Keychain."""
-    result = subprocess.run(
-        ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise ValueError(
-            f"Keychain item not found. Add with:\n"
-            f"  security add-generic-password -s '{service}' -a '{account}' -w 'YOUR_API_KEY'"
+    """Retrieve a credential: environment variable first, then macOS Keychain.
+
+    Empty/whitespace env values are ignored (fail closed, never treat blank
+    as a credential). A miss in both sources raises naming both remedies.
+    On non-macOS hosts security(1) does not exist; that path degrades to the
+    same error rather than crashing.
+    """
+    env_var = _cred_env_var(service, account)
+    env_val = os.environ.get(env_var, "").strip()
+    if env_val:
+        return env_val
+    try:
+        result = subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
+            capture_output=True,
+            text=True,
         )
-    return result.stdout.strip()
+    except FileNotFoundError:
+        result = None  # non-macOS: no security(1) binary
+    if result is not None and result.returncode == 0:
+        return result.stdout.strip()
+    raise ValueError(
+        f"Credential not found. Set the {env_var} environment variable "
+        f"(required on non-macOS), or add it to the macOS Keychain with:\n"
+        f"  security add-generic-password -s '{service}' -a '{account}' -w 'YOUR_API_KEY'"
+    )
 
 
 _ADC_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
@@ -219,7 +250,10 @@ def run_check() -> None:
     errors = 0
     try:
         get_api_key_from_keychain("api_tokens", "perplexity")
-        print("ok: perplexity key found in keychain")
+        source = (
+            "env" if os.environ.get("PERPLEXITY_API_KEY", "").strip() else "keychain"
+        )
+        print(f"ok: perplexity key found ({source})")
     except ValueError as e:
         print(f"fail: {e}")
         errors += 1
@@ -251,7 +285,7 @@ def run_check() -> None:
             if headers is None:
                 print(
                     "warn: ollama endpoint skipped (no Cloudflare Access creds "
-                    f"in Keychain): {endpoint}"
+                    f"in env or Keychain): {endpoint}"
                 )
                 continue
             # allow_redirects=False: a CF Access service-token header must
@@ -367,9 +401,14 @@ def _session_lock(session_file: Path):
         # than fall through to a no-op lock that would silently let
         # the resurrection race re-open. (Per PR #4 round-9 review,
         # Gemini medium L17: "fcntl module is Unix-specific".)
-        raise OSError(
-            "Session management requires POSIX (macOS/Linux). "
-            "fcntl is unavailable on this platform."
+        # ValueError (not OSError) so the tool dispatcher's existing
+        # `except ValueError` surfaces this as a clean tool error on
+        # Windows installs instead of an internal exception (Codex
+        # P2, PR #22).
+        raise ValueError(
+            "update_session/delete_session require POSIX advisory locking "
+            "(fcntl), which this platform lacks — these two tools are "
+            "unavailable on Windows; all other tools work."
         )
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = session_file.with_suffix(".lock")
@@ -708,10 +747,10 @@ def _get_perplexity_client() -> OpenAI:
     """Lazy accessor for the Perplexity client.
 
     Builds and caches a single ``OpenAI`` client on first call. Raises
-    whatever ``get_api_key_from_keychain`` raises (typically
-    ``ValueError`` for a missing key, or ``FileNotFoundError`` if the
-    macOS ``security`` CLI itself is absent). Per PR #4 round-10
-    review, Codex P2 L38.
+    whatever ``get_api_key_from_keychain`` raises — since v1.2 that is
+    always ``ValueError`` (a missing key, or a missing ``security(1)``
+    binary on non-macOS, both folded into the same actionable error).
+    Per PR #4 round-10 review, Codex P2 L38.
     """
     global _perplexity_client_cache
     if _perplexity_client_cache is None:
@@ -1227,11 +1266,30 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # native API accepts `think` — qwen3.6 is a thinking model and
 # think:false is required for fast structured work.
 
-OLLAMA_DELEGATE_MODELS: tuple[str, ...] = (
+_OLLAMA_MODELS_ENV_VAR = "AI_TOOLS_OLLAMA_MODELS"
+_OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "qwen3.6:35b-a3b-coding-nvfp4",
     "qwen3.6:35b-a3b-coding-nvfp4-32k",
     "qwen3.6:35b-a3b-coding-nvfp4-256k",
 )
+
+
+def _resolve_delegate_models() -> tuple[str, ...]:
+    """v1.2 (issue #20): allowlist overridable per machine via env/user_config.
+
+    Comma-separated, order-preserving, deduplicated; the first entry becomes
+    the default model. Blank or effectively-empty values fall back to the
+    built-in qwen tags (fail closed — a typo'd setting cannot yield an empty
+    allowlist that rejects everything).
+    """
+    raw = os.environ.get(_OLLAMA_MODELS_ENV_VAR, "").strip()
+    if not raw:
+        return _OLLAMA_BUILTIN_DELEGATE_MODELS
+    models = tuple(dict.fromkeys(m.strip() for m in raw.split(",") if m.strip()))
+    return models or _OLLAMA_BUILTIN_DELEGATE_MODELS
+
+
+OLLAMA_DELEGATE_MODELS: tuple[str, ...] = _resolve_delegate_models()
 OLLAMA_DELEGATE_DEFAULT_MODEL = OLLAMA_DELEGATE_MODELS[0]
 
 _OLLAMA_URL_ENV_VAR = "AI_TOOLS_OLLAMA_URL"
@@ -1341,10 +1399,10 @@ def _resolve_ollama_chain() -> list[str]:
         ).strip()
         if keychain_url:
             entries.append(keychain_url)
-    except (ValueError, FileNotFoundError):
-        # ValueError: item not found (common case). FileNotFoundError: the
-        # `security` CLI itself is absent (non-macOS) — Keychain is optional
-        # config here, so degrade gracefully instead of crashing.
+    except ValueError:
+        # Not found in env or Keychain (get_api_key_from_keychain folds the
+        # non-macOS missing-security(1) case into ValueError) — this entry
+        # is optional config, so degrade gracefully instead of crashing.
         pass
     chain: list[str] = []
     for entry in entries:
@@ -1383,11 +1441,11 @@ def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
         client_secret = get_api_key_from_keychain(
             _CF_ACCESS_SECRET_KEYCHAIN_SERVICE, user
         )
-    except (ValueError, FileNotFoundError):
-        # ValueError: item not found (common case). FileNotFoundError: the
-        # `security` CLI itself is absent (non-macOS) — Keychain is optional
-        # config here, so degrade gracefully (remote endpoint skipped)
-        # instead of crashing.
+    except ValueError:
+        # Not found in env or Keychain (get_api_key_from_keychain folds the
+        # non-macOS missing-security(1) case into ValueError) — degrade
+        # gracefully (remote endpoint skipped, never called bare) instead
+        # of crashing.
         return None
     if not client_id or not client_secret:
         # A Keychain item can exist with an empty password — `security`
@@ -1421,11 +1479,19 @@ async def _select_ollama_endpoint(model: str) -> str:
         headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
         if headers is None:
             attempts.append(
-                f"{endpoint}: skipped (Cloudflare Access credentials not in Keychain)"
+                f"{endpoint}: skipped (Cloudflare Access credentials not in "
+                "env or Keychain)"
             )
             continue
         try:
-            response = await client.get(
+            # Auth is server-sourced (CF Access service-token creds from env
+            # or Keychain via _ollama_auth_headers), never a caller-supplied
+            # credential. The endpoint comes from operator config (env /
+            # user_config / Keychain / built-in defaults), validated
+            # https-only for non-localhost with URL userinfo rejected — no
+            # tool parameter can redirect the credential to an attacker
+            # host. Same false-positive class as the PR #15 suppressions.
+            response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
                 f"{endpoint}/api/tags",
                 headers=headers,
                 timeout=_OLLAMA_PROBE_TIMEOUT_S,

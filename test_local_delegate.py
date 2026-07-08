@@ -182,7 +182,16 @@ def _load_mcp_server():
             )
             assert spec is not None and spec.loader is not None
             module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            # OLLAMA_DELEGATE_MODELS is resolved from the environment at
+            # import time; a developer/CI shell following the Windows
+            # guidance may export AI_TOOLS_OLLAMA_MODELS, which would
+            # replace the built-in allowlist this suite asserts against
+            # (Codex P2, PR #22). Import under a scrubbed env; the
+            # resolver tests exercise the override explicitly.
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AI_TOOLS_OLLAMA_MODELS", None)
+                os.environ.pop("AI_TOOLS_OLLAMA_DEFAULT_MODEL", None)
+                spec.loader.exec_module(module)
     return module
 
 
@@ -287,13 +296,14 @@ class TestOllamaAuthHeaders(unittest.TestCase):
 
     def test_missing_security_binary_returns_none(self):
         # On non-macOS, `security` doesn't exist — subprocess.run raises
-        # FileNotFoundError. Cloudflare Access creds are optional config
-        # here too, so the remote endpoint must be skipped (None), not
-        # crash the whole delegate chain.
+        # a miss (v1.2: the helper folds a missing security(1) into the
+        # same ValueError as an ordinary miss). Cloudflare Access creds
+        # are optional config here too, so the remote endpoint must be
+        # skipped (None), not crash the whole delegate chain.
         with mock.patch.object(
             mcp_server,
             "get_api_key_from_keychain",
-            side_effect=FileNotFoundError("security: command not found"),
+            side_effect=ValueError("Credential not found. Set the ..."),
         ):
             self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
 
@@ -522,10 +532,12 @@ def _no_keychain(service, account):
 
 
 def _no_security_binary(service, account):
-    # subprocess.run raises FileNotFoundError when the `security` CLI
-    # itself is missing (non-macOS) — distinct from ValueError, which
-    # means the binary ran but the item wasn't found.
-    raise FileNotFoundError("security: command not found")
+    # v1.2: get_api_key_from_keychain folds a missing `security` CLI
+    # (non-macOS) into the same actionable ValueError as an ordinary
+    # miss — callers only ever see ValueError.
+    raise ValueError(
+        "Credential not found. Set the OLLAMA_URL environment variable ..."
+    )
 
 
 class TestResolveOllamaChain(unittest.TestCase):
@@ -603,9 +615,9 @@ class TestResolveOllamaChain(unittest.TestCase):
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://"})
 
     def test_missing_security_binary_degrades_gracefully(self):
-        # On non-macOS, `security` doesn't exist at all — subprocess.run
-        # raises FileNotFoundError rather than the "item not found"
-        # ValueError. The Keychain lookup here is optional config (an
+        # On non-macOS, `security` doesn't exist at all; v1.2 folds that
+        # into the same actionable ValueError as an ordinary miss.
+        # The Keychain lookup here is optional config (an
         # extra chain entry), so the chain must still resolve from
         # env/default instead of the whole call crashing.
         chain = self._chain(
@@ -1190,6 +1202,85 @@ class TestRunCheckOllamaLine(unittest.TestCase):
         self.assertEqual(self._last_fake_get.call_count, 1)
         _, kwargs = self._last_fake_get.call_args
         self.assertEqual(kwargs.get("allow_redirects"), False)
+
+
+class TestCredentialResolution(unittest.TestCase):
+    """v1.2 (issue #20): env-first credential lookup, Keychain fallback."""
+
+    def test_env_override_wins_without_touching_keychain(self):
+        with mock.patch.dict(os.environ, {"PERPLEXITY_API_KEY": "pk-env"}):
+            with mock.patch.object(mcp_server.subprocess, "run") as run:
+                self.assertEqual(
+                    mcp_server.get_api_key_from_keychain("api_tokens", "perplexity"),
+                    "pk-env",
+                )
+                run.assert_not_called()
+
+    def test_generic_env_name_is_the_service_name(self):
+        with mock.patch.dict(os.environ, {"OLLAMA_CF_ACCESS_CLIENT_ID": "cid-env"}):
+            with mock.patch.object(mcp_server.subprocess, "run") as run:
+                self.assertEqual(
+                    mcp_server.get_api_key_from_keychain(
+                        "OLLAMA_CF_ACCESS_CLIENT_ID", "jasonvassallo"
+                    ),
+                    "cid-env",
+                )
+                run.assert_not_called()
+
+    def test_blank_env_is_ignored_and_falls_through(self):
+        ok = mock.Mock(returncode=0, stdout="from-keychain\n")
+        with mock.patch.dict(os.environ, {"PERPLEXITY_API_KEY": "   "}):
+            with mock.patch.object(mcp_server.subprocess, "run", return_value=ok):
+                self.assertEqual(
+                    mcp_server.get_api_key_from_keychain("api_tokens", "perplexity"),
+                    "from-keychain",
+                )
+
+    def test_missing_everywhere_error_names_the_env_var(self):
+        miss = mock.Mock(returncode=1, stdout="")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PERPLEXITY_API_KEY", None)
+            with mock.patch.object(mcp_server.subprocess, "run", return_value=miss):
+                with self.assertRaises(ValueError) as ctx:
+                    mcp_server.get_api_key_from_keychain("api_tokens", "perplexity")
+        self.assertIn("PERPLEXITY_API_KEY", str(ctx.exception))
+
+    def test_non_macos_no_security_binary_degrades_to_same_error(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("OLLAMA_URL", None)
+            with mock.patch.object(
+                mcp_server.subprocess, "run", side_effect=FileNotFoundError
+            ):
+                with self.assertRaises(ValueError) as ctx:
+                    mcp_server.get_api_key_from_keychain("OLLAMA_URL", "u")
+        self.assertIn("OLLAMA_URL", str(ctx.exception))
+
+
+class TestModelAllowlistOverride(unittest.TestCase):
+    """v1.2 (issue #20): AI_TOOLS_OLLAMA_MODELS overrides the allowlist."""
+
+    def test_unset_env_returns_builtin(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("AI_TOOLS_OLLAMA_MODELS", None)
+            self.assertEqual(
+                mcp_server._resolve_delegate_models(),
+                mcp_server._OLLAMA_BUILTIN_DELEGATE_MODELS,
+            )
+
+    def test_override_parses_orders_and_dedupes(self):
+        raw = " qwen2.5-coder:14b , qwen3.6:35b-a3b-coding-nvfp4 ,qwen2.5-coder:14b "
+        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_MODELS": raw}):
+            self.assertEqual(
+                mcp_server._resolve_delegate_models(),
+                ("qwen2.5-coder:14b", "qwen3.6:35b-a3b-coding-nvfp4"),
+            )
+
+    def test_effectively_empty_override_fails_closed_to_builtin(self):
+        with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_MODELS": " ,,  , "}):
+            self.assertEqual(
+                mcp_server._resolve_delegate_models(),
+                mcp_server._OLLAMA_BUILTIN_DELEGATE_MODELS,
+            )
 
 
 if __name__ == "__main__":
