@@ -579,6 +579,25 @@ class TestResolveOllamaChain(unittest.TestCase):
         with self.assertRaises(ValueError):
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://user:pw@localhost:11434"})
 
+    def test_embedded_credentials_password_not_leaked_in_error(self):
+        # An arbitrary password has no secret "shape" redact_secrets can
+        # match (unlike a JWT/API-key pattern), so the embedded-credentials
+        # branch must never echo the raw url back — it must build a
+        # display-safe form before formatting the error message.
+        with self.assertRaises(ValueError) as ctx:
+            self._chain(
+                {"AI_TOOLS_OLLAMA_URLS": "http://user:hunter2-plain@localhost:11434"}
+            )
+        self.assertNotIn("hunter2-plain", str(ctx.exception))
+
+    def test_invalid_scheme_with_userinfo_does_not_leak_password(self):
+        # The scheme-rejection branch runs before the embedded-credentials
+        # check, but it must still never echo a raw password back — it
+        # shares the same display-safe url construction.
+        with self.assertRaises(ValueError) as ctx:
+            self._chain({"AI_TOOLS_OLLAMA_URLS": "ftp://user:hunter2-plain@host"})
+        self.assertNotIn("hunter2-plain", str(ctx.exception))
+
     def test_garbage_url_rejected(self):
         with self.assertRaises(ValueError):
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://"})

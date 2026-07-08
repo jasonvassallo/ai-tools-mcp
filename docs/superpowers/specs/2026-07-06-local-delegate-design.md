@@ -50,7 +50,7 @@ Two tools, mirroring the `agent_research` / `agent_research_result` precedent.
 | `model` | string | `qwen3.6:35b-a3b-coding-nvfp4` | **Server-side allowlist**: base, `-32k`, `-256k` tags only. Anything else → error listing allowed values. |
 | `think` | bool | `false` | Passed natively to `/api/chat`. |
 | `background` | bool | `false` | `false`: block until the answer returns. `true`: return a `job_id` immediately. |
-| `keep_alive` | string | omitted *(v1.1; was "5m")* | Passed through to Ollama when set; `"0"` unloads immediately after the call (useful after a big `-256k` job on the 32 GB box). Validated against a strict pattern (`0` or `<int><s|m|h>`). Default changed to omitted in v1.1 so the call inherits the server's `OLLAMA_KEEP_ALIVE` instead of shortening the warm window — see the v1.1 amendment below. |
+| `keep_alive` | string | omitted *(v1.1; was "5m")* | Passed through to Ollama when set; `"0"` unloads immediately after the call (useful after a big `-256k` job on the 32 GB box). Validated against a strict pattern (`0` or `<int><s\|m\|h>`). Default changed to omitted in v1.1 so the call inherits the server's `OLLAMA_KEEP_ALIVE` instead of shortening the warm window — see the v1.1 amendment below. |
 | `timeout_s` | int | 300 | Sync read timeout; capped at 600. |
 
 Returns: the model's answer as plain `TextContent` (sync), or

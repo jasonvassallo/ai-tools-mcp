@@ -73,6 +73,7 @@ The following identifiers are meant to stay stable unless intentionally changed:
 ### `local_delegate` / `local_delegate_result`
 
 - Provider: **local-first Ollama endpoint chain** — default `http://localhost:11434` → `https://ollama-mbp.djvassallo.com` (Cloudflare-Access-gated); override via `AI_TOOLS_OLLAMA_URLS` comma-separated env (singular `AI_TOOLS_OLLAMA_URL` honored for compat), Keychain `OLLAMA_URL` appended; per-call `/api/tags` probe picks the first endpoint serving the tag, cached 60s; remote endpoints require https + CF Access service-token creds in Keychain, else skipped
+- The `https://ollama-mbp.djvassallo.com` remote entry is the repo owner's own Access-gated host — a **placeholder** for everyone else; set `AI_TOOLS_OLLAMA_URLS` (or the Desktop extension's `ollama_endpoints` setting) to your own endpoint(s) instead of relying on the default chain
 - Models: three qwen3.6 tags, server-side allowlist; default base tag inherits each host's window — 64k JVMBPro / 32k jvmacmini; env `AI_TOOLS_OLLAMA_DEFAULT_MODEL` may pick a different allowlisted tag
 - Purpose: privacy / quota offload / second opinion / background jobs
 - Latency: seconds-to-minutes, synchronous by default, or pass `background=true` to get a `job_id` and poll `local_delegate_result`

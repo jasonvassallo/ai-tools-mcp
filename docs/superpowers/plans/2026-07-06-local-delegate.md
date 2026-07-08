@@ -1141,8 +1141,8 @@ Check whether `import requests` exists at the top of `mcp_server.py` (it is in t
 
 - [ ] **Step 4: Update `.github/workflows/tests.yml`**
 
-Line 72: append ` test_local_delegate.py` to the pytest file list.
-Line 75: append ` test_local_delegate.py` to the ruff format --check file list.
+Line 72: append `test_local_delegate.py` to the pytest file list.
+Line 75: append `test_local_delegate.py` to the ruff format --check file list.
 
 - [ ] **Step 5: Run — verify PASS + live smoke**
 
@@ -1182,7 +1182,7 @@ Make these edits (prose may be adapted, facts must be exact):
 1. Replace the charter bullets:
    - `- It is for hosted API-backed MCP tooling.` → `- It exposes hosted AI providers and the machine's local Ollama server behind one MCP surface.`
    - `- It is not a local-model repo.` → `- No model weights live in this repo — the local family only calls an already-running Ollama.`
-   - `- It currently exposes eleven tools across two families:` → `- It currently exposes thirteen tools across three families:` and add to the family list: `  - Local delegate: \`local_delegate\` / \`local_delegate_result\` (Ollama, on-device)`
+   - `- It currently exposes eleven tools across two families:` → `- It currently exposes thirteen tools across three families:` and add to the family list: `- Local delegate: \`local_delegate\` / \`local_delegate_result\` (Ollama, on-device)`
 2. Stable Public Surface: add a `Tool names (local delegate):` block listing both names.
 3. Provider Mapping: add a `### \`local_delegate\` / \`local_delegate_result\`` section documenting: provider (**local-first Ollama endpoint chain** — default `http://localhost:11434` → `https://ollama-mbp.djvassallo.com` (Cloudflare-Access-gated); override via `AI_TOOLS_OLLAMA_URLS` comma-separated env (singular `AI_TOOLS_OLLAMA_URL` honored for compat), Keychain `OLLAMA_URL` appended; per-call `/api/tags` probe picks the first endpoint serving the tag, cached 60 s; remote endpoints require https + CF Access service-token creds in Keychain, else skipped); model allowlist (three qwen3.6 tags; default base tag inherits each host's window — 64k JVMBPro / 32k jvmacmini; env `AI_TOOLS_OLLAMA_DEFAULT_MODEL` may pick a different allowlisted tag); purpose (privacy / quota offload / second opinion / background jobs); latency (seconds-to-minutes, background via `job_id` + poll); privacy note (**input stays on your machines** — on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API; nothing written to disk; jobs in-memory and single-collect); `think` semantics and `keep_alive` (omit to inherit the server's `OLLAMA_KEEP_ALIVE`).
 4. In the "How It Works" bullet list, add: `- calls the local Ollama server (native /api/chat) for the local_delegate family`.
@@ -1192,7 +1192,7 @@ Make these edits (prose may be adapted, facts must be exact):
 
 In the `mcp_server.py` docstring, change "four families of tools" to "five families of tools" and insert after the gemini bullet:
 
-```
+```text
 - ``local_delegate`` / ``local_delegate_result``: local-first Ollama
   delegation — send a task to the qwen3.6 coding model (native
   /api/chat, think off by default) via an ordered endpoint chain:

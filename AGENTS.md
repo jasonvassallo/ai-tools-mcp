@@ -19,6 +19,9 @@ This repository contains a small MCP server that exposes hosted AI APIs and the 
   - `agent_research_result`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
+- Tool names (local delegate):
+  - `local_delegate`
+  - `local_delegate_result`
 - Tool names (session management):
   - `list_sessions`
   - `save_session`
@@ -52,6 +55,8 @@ The same `mcp_server.py` is wrapped three ways. When making changes, update all 
   - Provider: Google Gemini Deep Research (`/v1beta/interactions`)
   - Models: `deep-research-preview-04-2026` (fast), `deep-research-max-preview-04-2026` (max)
   - Asynchronous; start returns an `interaction_id`, result polls until `status="completed"`.
+- `local_delegate` / `local_delegate_result`:
+  - Provider: local-first Ollama endpoint chain (localhost first, then the user's own Access-gated remote) — on-device/own-infra, never a third-party API
 
 ## Dependencies
 

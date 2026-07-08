@@ -1284,20 +1284,34 @@ def _validate_ollama_endpoint(url: str) -> str:
     remote endpoint is only ever the Access-gated tunnel).
     """
     parsed = urllib.parse.urlparse(url)
+    # Display-safe form for every error branch below: never echo userinfo
+    # back to the caller. redact_secrets only masks known secret SHAPES
+    # (JWT, Google API key, ...) — an arbitrary password like "hunter2"
+    # has no shape it can match, so it would otherwise reach the MCP
+    # error verbatim. Masking the netloc's userinfo here closes that gap
+    # regardless of which branch raises. (IPv6 hosts lose their brackets
+    # in this display-only string — acceptable, this is never re-parsed.)
+    if parsed.username is not None or parsed.password is not None:
+        masked_netloc = "***@" + (parsed.hostname or "")
+        if parsed.port:
+            masked_netloc += f":{parsed.port}"
+        display = urllib.parse.urlunparse(parsed._replace(netloc=masked_netloc))
+    else:
+        display = url
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise ValueError(
-            f"Invalid Ollama endpoint {redact_secrets(url)!r}: must be "
+            f"Invalid Ollama endpoint {redact_secrets(display)!r}: must be "
             "http(s)://host[:port]"
         )
     if parsed.scheme == "http" and not _is_localhost_endpoint(url):
         raise ValueError(
             f"Refusing plain-http non-localhost Ollama endpoint "
-            f"{redact_secrets(url)!r} — remote endpoints must be https"
+            f"{redact_secrets(display)!r} — remote endpoints must be https"
         )
     if parsed.username is not None or parsed.password is not None:
         raise ValueError(
             f"Refusing Ollama endpoint with embedded credentials "
-            f"{redact_secrets(url)!r} — auth belongs in the Keychain "
+            f"{redact_secrets(display)!r} — auth belongs in the Keychain "
             "(CF Access service token), never in the URL"
         )
     return url.rstrip("/")
