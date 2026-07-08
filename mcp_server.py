@@ -745,10 +745,10 @@ def _get_perplexity_client() -> OpenAI:
     """Lazy accessor for the Perplexity client.
 
     Builds and caches a single ``OpenAI`` client on first call. Raises
-    whatever ``get_api_key_from_keychain`` raises (typically
-    ``ValueError`` for a missing key, or ``FileNotFoundError`` if the
-    macOS ``security`` CLI itself is absent). Per PR #4 round-10
-    review, Codex P2 L38.
+    whatever ``get_api_key_from_keychain`` raises — since v1.2 that is
+    always ``ValueError`` (a missing key, or a missing ``security(1)``
+    binary on non-macOS, both folded into the same actionable error).
+    Per PR #4 round-10 review, Codex P2 L38.
     """
     global _perplexity_client_cache
     if _perplexity_client_cache is None:
