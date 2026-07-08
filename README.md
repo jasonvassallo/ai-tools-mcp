@@ -4,10 +4,11 @@
 
 This repository is intentionally narrow in scope:
 
-- It is for hosted API-backed MCP tooling.
-- It is not a local-model repo.
-- It currently exposes eleven tools across two families:
+- It exposes hosted AI providers and the machine's local Ollama server behind one MCP surface.
+- No model weights live in this repo — the local family only calls an already-running Ollama.
+- It currently exposes thirteen tools across three families:
   - Research: `quick_research` (Perplexity Sonar), `deep_research` (Perplexity Sonar Pro), `agent_research` / `agent_research_result` (Perplexity Agent API, Search-as-Code), `gemini_deep_research_start`, `gemini_deep_research_result`
+  - Local delegate: `local_delegate` / `local_delegate_result` (Ollama, on-device)
   - Sessions: `list_sessions`, `save_session`, `load_session`, `update_session`, `delete_session`
 
 The same `mcp_server.py` is shipped three ways: standalone MCP server (installer registers it directly in `~/.claude/.mcp.json`), Claude Code plugin (`.claude-plugin/` + commands/skills/hooks), and Claude Desktop extension (`.mcpb` archive). Pick whichever fits your client.
@@ -24,6 +25,9 @@ The following identifiers are meant to stay stable unless intentionally changed:
   - `agent_research_result`
   - `gemini_deep_research_start`
   - `gemini_deep_research_result`
+- Tool names (local delegate):
+  - `local_delegate`
+  - `local_delegate_result`
 - Tool names (sessions):
   - `list_sessions`
   - `save_session`
@@ -66,10 +70,23 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Latency: minutes (up to 60); asynchronous, polled via the `_result` tool
 - Use when: you need a standalone, multi-page report — not a quick answer
 
+### `local_delegate` / `local_delegate_result`
+
+- Provider: **local-first Ollama endpoint chain** — default `http://localhost:11434` → `https://ollama-mbp.djvassallo.com` (Cloudflare-Access-gated); override via `AI_TOOLS_OLLAMA_URLS` comma-separated env (singular `AI_TOOLS_OLLAMA_URL` honored for compat), Keychain `OLLAMA_URL` appended; per-call `/api/tags` probe picks the first endpoint serving the tag, cached 60s; remote endpoints require https + CF Access service-token creds in Keychain, else skipped
+- The `https://ollama-mbp.djvassallo.com` remote entry is the repo owner's own Access-gated host — a **placeholder** for everyone else; set `AI_TOOLS_OLLAMA_URLS` (or the Desktop extension's `ollama_endpoints` setting) to your own endpoint(s) instead of relying on the default chain
+- Models: three qwen3.6 tags, server-side allowlist; default base tag inherits each host's window — 64k JVMBPro / 32k jvmacmini; env `AI_TOOLS_OLLAMA_DEFAULT_MODEL` may pick a different allowlisted tag
+- Purpose: privacy / quota offload / second opinion / background jobs
+- Latency: seconds-to-minutes, synchronous by default, or pass `background=true` to get a `job_id` and poll `local_delegate_result`
+- Privacy: **input stays on your machines** — on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API; nothing written to disk; jobs are in-memory and single-collect
+- `think`: off by default (faster); set `true` only for reasoning-heavy asks
+- `keep_alive`: omit to inherit the server's `OLLAMA_KEEP_ALIVE`
+
 Together these complement Claude's built-in `WebSearch`: use `WebSearch` for
 quick lookups, `deep_research` for thorough inline investigation,
-`agent_research` for bulk/enumerable tasks where coverage matters, and the
-`gemini_deep_research_*` pair when the deliverable IS the report.
+`agent_research` for bulk/enumerable tasks where coverage matters, the
+`gemini_deep_research_*` pair when the deliverable IS the report, and
+`local_delegate` when the input must stay on-device or the task is cheap
+mechanical work.
 
 ## How It Works
 
@@ -80,9 +97,10 @@ It:
 - starts an MCP server named `ai-tools-mcp`
 - reads API credentials from the macOS Keychain
 - calls the Perplexity API through the `openai` Python client
+- calls the local Ollama server (native /api/chat) for the local_delegate family
 - returns plain text MCP responses
 
-There are no local model weights, no background service, and no embedded secrets in the repo.
+There are no local model weights, no persistent background service, and no embedded secrets in the repo. (The local_delegate family only calls an already-running Ollama server; background jobs are in-process asyncio tasks.)
 
 ## Repository Layout
 
@@ -98,7 +116,7 @@ Standalone install:
 Claude Code plugin (loaded via `claude --plugin-dir .`):
 - `.claude-plugin/plugin.json`: Plugin manifest (name, version, author)
 - `.mcp.json`: MCP server registration (points at `mcp_server.py` via `${CLAUDE_PLUGIN_ROOT}`)
-- `commands/`: Eight slash commands (`/ai-tools-mcp:deep-research`, `:gemini-start`, `:gemini-result`, `:sessions`, `:save-session`, `:load-session`, `:update-session`, `:delete-session`)
+- `commands/`: Eleven slash commands (`/ai-tools-mcp:quick-research`, `:deep-research`, `:agent-research`, `:gemini-start`, `:gemini-result`, `:local-delegate`, `:sessions`, `:save-session`, `:load-session`, `:update-session`, `:delete-session`)
 - `skills/using-ai-research/`: When-to-use routing skill (WebSearch vs. Perplexity vs. Gemini)
 - `skills/session-workflows/`: Save/load/rename/delete patterns
 - `hooks/hooks.json` + `hooks/preflight.sh`: `SessionStart` hook that runs `--check` and surfaces credential health to Claude

@@ -10,7 +10,7 @@
 # ]
 # ///
 """
-MCP server providing four families of tools:
+MCP server providing five families of tools:
 
 - ``quick_research`` / ``deep_research``: Perplexity Sonar / Sonar Pro
   — inline research with citations. ``quick_research`` uses the smaller
@@ -28,6 +28,12 @@ MCP server providing four families of tools:
   long-running (minutes, up to 60), citation-dense reports via
   Google's hosted research agent. Asynchronous: ``_start`` returns an
   interaction_id; poll ``_result`` until terminal status.
+- ``local_delegate`` / ``local_delegate_result``: local-first Ollama
+  delegation — send a task to the qwen3.6 coding model (native
+  /api/chat, think off by default) via an ordered endpoint chain:
+  localhost first, then the user's own Cloudflare-Access-gated
+  remote. Input text never leaves the user's machines; background
+  jobs are in-memory and single-collect.
 - ``list_sessions`` / ``save_session`` / ``load_session`` /
   ``update_session`` / ``delete_session``: local conversation-session
   persistence backed by ``~/.claude/sessions/``.
@@ -55,12 +61,15 @@ having been run; only the ``gemini_*`` tools will fail when invoked.
 """
 
 import asyncio
+import getpass
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.parse
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -70,6 +79,7 @@ from typing import Any
 import google.auth
 import google.auth.transport.requests
 import httpx
+import requests
 
 # fcntl is POSIX-only; on Windows the import fails. We catch
 # ImportError so the module can still be imported (e.g. for docs,
@@ -223,6 +233,50 @@ def run_check() -> None:
     except (ValueError, Exception) as e:  # noqa: BLE001 - report any auth issue
         print(f"fail: {e}")
         errors += 1
+
+    # Non-fatal: local_delegate family. Ollama being down must not fail
+    # installs or preflights of the hosted tool families — delegate calls
+    # themselves fail closed at call time.
+    try:
+        chain = _resolve_ollama_chain()
+    except ValueError as e:
+        print(
+            "warn: ollama endpoint chain invalid (local_delegate unavailable): "
+            f"{redact_secrets(str(e))}"
+        )
+        chain = []
+    for endpoint in chain:
+        try:
+            headers = _ollama_auth_headers(endpoint)
+            if headers is None:
+                print(
+                    "warn: ollama endpoint skipped (no Cloudflare Access creds "
+                    f"in Keychain): {endpoint}"
+                )
+                continue
+            # allow_redirects=False: a CF Access service-token header must
+            # never follow a redirect off-host — same rationale as the
+            # shared httpx client's follow_redirects=False.
+            resp = requests.get(
+                f"{endpoint}/api/version",
+                headers=headers,
+                timeout=3,
+                allow_redirects=False,
+            )
+            resp.raise_for_status()
+            version = resp.json().get("version", "?")
+            print(f"ok: ollama reachable at {endpoint} (version {version})")
+        except (ValueError, requests.RequestException) as e:
+            print(
+                f"warn: ollama not reachable at {endpoint} "
+                f"(local_delegate may fall back): {redact_secrets(str(e))}"
+            )
+    env_default = os.environ.get(_OLLAMA_DEFAULT_MODEL_ENV_VAR, "").strip()
+    if env_default and env_default not in OLLAMA_DELEGATE_MODELS:
+        print(
+            f"warn: {_OLLAMA_DEFAULT_MODEL_ENV_VAR}={env_default!r} not in "
+            f"allowlist; using {OLLAMA_DELEGATE_DEFAULT_MODEL}"
+        )
 
     sys.exit(errors)
 
@@ -637,9 +691,6 @@ def delete_session(session_id: str) -> dict[str, Any]:
     return {"success": True, "session_id": session_id}
 
 
-if "--check" in sys.argv:
-    run_check()
-
 # Perplexity client is constructed lazily so the module imports
 # cleanly even when the keychain CLI is unavailable (e.g. on Windows
 # or in a container without the macOS ``security`` binary). The round-9
@@ -735,19 +786,30 @@ async def _get_http_client() -> httpx.AsyncClient:
     return _http_client
 
 
-def _http_error_payload(exc: httpx.HTTPStatusError) -> dict[str, Any]:
+def _http_error_payload(
+    exc: httpx.HTTPStatusError, *, scrub: tuple[str, ...] = ()
+) -> dict[str, Any]:
     """Build a structured failure dict from an httpx HTTPStatusError.
 
     Keeps a short body snippet (≤500 chars) so the caller has enough context to
     diagnose without bloating the MCP response. Runs the snippet through
     `redact_secrets` because Gemini error bodies have, on occasion, echoed
     request headers or query content.
+
+    `scrub` is an optional set of exact secret values (e.g. live header
+    values a caller holds) to strip from the body — value-aware, precise
+    replacement for secret shapes `redact_secrets`'s patterns don't cover.
+    Applied to the FULL body, before the 500-char truncation: a secret
+    straddling the cutoff would otherwise leave an un-scrubbed fragment.
     """
     status_code = exc.response.status_code
     try:
         body = exc.response.text or ""
     except Exception:  # noqa: BLE001 - never let body extraction shadow the real error
         body = ""
+    for secret in scrub:
+        if secret:
+            body = body.replace(secret, "[REDACTED_CF_ACCESS]")
     snippet = redact_secrets(body[:500])
     return {"status": "failed", "error": f"{status_code}: {snippet}"}
 
@@ -1153,6 +1215,434 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
     return [TextContent(type="text", text="\n".join(lines))]
 
 
+# ─── Local delegate (Ollama) ──────────────────────────────────────────
+#
+# Third tool family: delegate tasks to a LOCAL Ollama model. Inverts the
+# data-flow of every other family — exists precisely so input text can
+# stay on-device (plus quota offload, second opinions, background/batch
+# work). The server only CALLS an already-running Ollama; it never reads
+# files, pulls models, or manages the Ollama service (least privilege).
+#
+# Native /api/chat (not the OpenAI-compat endpoint) because only the
+# native API accepts `think` — qwen3.6 is a thinking model and
+# think:false is required for fast structured work.
+
+OLLAMA_DELEGATE_MODELS: tuple[str, ...] = (
+    "qwen3.6:35b-a3b-coding-nvfp4",
+    "qwen3.6:35b-a3b-coding-nvfp4-32k",
+    "qwen3.6:35b-a3b-coding-nvfp4-256k",
+)
+OLLAMA_DELEGATE_DEFAULT_MODEL = OLLAMA_DELEGATE_MODELS[0]
+
+_OLLAMA_URL_ENV_VAR = "AI_TOOLS_OLLAMA_URL"
+_OLLAMA_URL_KEYCHAIN_SERVICE = "OLLAMA_URL"
+_CF_ACCESS_ID_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_ID"
+_CF_ACCESS_SECRET_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_SECRET"
+
+# `0` (unload immediately) or 1-9999 seconds/minutes/hours. Strict so a
+# malformed value cannot smuggle arbitrary JSON into the Ollama request.
+_DELEGATE_KEEP_ALIVE_RE = re.compile(r"^(0|[1-9][0-9]{0,3}(s|m|h))$")
+
+# Shared-client default is 30s; delegate calls pass explicit per-request
+# timeouts (same mechanism as _AGENT_API_TIMEOUT_SECONDS).
+_DELEGATE_TIMEOUT_DEFAULT_S = 300
+_DELEGATE_TIMEOUT_MAX_S = 600
+_DELEGATE_BG_CEILING_S = 1800.0
+
+# jvmacmini runs num_parallel=1 — queuing beyond a few jobs would lie to
+# the caller; fail fast instead.
+_DELEGATE_JOB_CAP = 4
+# Completed jobs the caller never collects via local_delegate_result would
+# otherwise accumulate forever on a long-lived server — bound the tail.
+_DELEGATE_DONE_RETAINED = 16
+_DELEGATE_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+_OLLAMA_URLS_ENV_VAR = "AI_TOOLS_OLLAMA_URLS"
+_OLLAMA_DEFAULT_MODEL_ENV_VAR = "AI_TOOLS_OLLAMA_DEFAULT_MODEL"
+
+# v1.1 (spec amendment): local-first endpoint chain. The remote defaults are
+# the user's own Cloudflare-Access-gated tunnels — never a third-party
+# service. Order: local → JVMBPro (64k/256k tags, laptop, may be off) →
+# jvmacmini (32k base tag, always-on server).
+_OLLAMA_DEFAULT_CHAIN: tuple[str, ...] = (
+    "http://localhost:11434",
+    "https://ollama-mbp.djvassallo.com",
+    "https://ollama.djvassallo.com",
+)
+_OLLAMA_PROBE_TIMEOUT_S = 2.0
+_OLLAMA_PROBE_CACHE_TTL_S = 60.0
+_LOCALHOST_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_localhost_endpoint(url: str) -> bool:
+    return (urllib.parse.urlparse(url).hostname or "") in _LOCALHOST_HOSTS
+
+
+def _validate_ollama_endpoint(url: str) -> str:
+    """Validate one chain entry; fail closed on anything not plain http(s).
+
+    Loopback may be http; every other host must be https (v1.1 rule — a
+    remote endpoint is only ever the Access-gated tunnel).
+    """
+    parsed = urllib.parse.urlparse(url)
+    # Display-safe form for every error branch below: never echo userinfo
+    # back to the caller. redact_secrets only masks known secret SHAPES
+    # (JWT, Google API key, ...) — an arbitrary password like "hunter2"
+    # has no shape it can match, so it would otherwise reach the MCP
+    # error verbatim. Masking the netloc's userinfo here closes that gap
+    # regardless of which branch raises. (IPv6 hosts lose their brackets
+    # in this display-only string — acceptable, this is never re-parsed.)
+    if parsed.username is not None or parsed.password is not None:
+        masked_netloc = "***@" + (parsed.hostname or "")
+        if parsed.port:
+            masked_netloc += f":{parsed.port}"
+        display = urllib.parse.urlunparse(parsed._replace(netloc=masked_netloc))
+    else:
+        display = url
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"Invalid Ollama endpoint {redact_secrets(display)!r}: must be "
+            "http(s)://host[:port]"
+        )
+    if parsed.scheme == "http" and not _is_localhost_endpoint(url):
+        raise ValueError(
+            f"Refusing plain-http non-localhost Ollama endpoint "
+            f"{redact_secrets(display)!r} — remote endpoints must be https"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError(
+            f"Refusing Ollama endpoint with embedded credentials "
+            f"{redact_secrets(display)!r} — auth belongs in the Keychain "
+            "(CF Access service token), never in the URL"
+        )
+    return url.rstrip("/")
+
+
+def _resolve_ollama_chain() -> list[str]:
+    """Ordered Ollama endpoint chain (v1.1).
+
+    Env `AI_TOOLS_OLLAMA_URLS` (comma-separated) wins; singular
+    `AI_TOOLS_OLLAMA_URL` is honored as a one-item chain for v1 compat;
+    otherwise the default local-first chain. A Keychain `OLLAMA_URL`
+    endpoint is appended when present. Every entry is validated; dupes
+    dropped preserving order. Blocking (Keychain) — async callers wrap
+    in asyncio.to_thread.
+    """
+    raw = os.environ.get(_OLLAMA_URLS_ENV_VAR, "").strip()
+    if raw:
+        entries = [e.strip() for e in raw.split(",") if e.strip()]
+    else:
+        single = os.environ.get(_OLLAMA_URL_ENV_VAR, "").strip()
+        entries = [single] if single else list(_OLLAMA_DEFAULT_CHAIN)
+    try:
+        keychain_url = get_api_key_from_keychain(
+            _OLLAMA_URL_KEYCHAIN_SERVICE, getpass.getuser()
+        ).strip()
+        if keychain_url:
+            entries.append(keychain_url)
+    except (ValueError, FileNotFoundError):
+        # ValueError: item not found (common case). FileNotFoundError: the
+        # `security` CLI itself is absent (non-macOS) — Keychain is optional
+        # config here, so degrade gracefully instead of crashing.
+        pass
+    chain: list[str] = []
+    for entry in entries:
+        validated = _validate_ollama_endpoint(entry)
+        if validated not in chain:
+            chain.append(validated)
+    return chain
+
+
+def _delegate_default_model() -> str:
+    """Default model tag; env override honored only if allowlisted.
+
+    Falls back silently to the base tag (run_check surfaces a warn) so a
+    typo'd Desktop setting cannot break tool listing.
+    """
+    env_model = os.environ.get(_OLLAMA_DEFAULT_MODEL_ENV_VAR, "").strip()
+    if env_model in OLLAMA_DELEGATE_MODELS:
+        return env_model
+    return OLLAMA_DELEGATE_DEFAULT_MODEL
+
+
+def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
+    """Auth headers for an Ollama endpoint; None means SKIP, never call bare.
+
+    localhost → {} (no auth). Non-localhost https → Cloudflare Access
+    service-token headers read from the Keychain per call (never cached,
+    never logged). Either credential absent → None (fail closed): the
+    caller treats the endpoint as unavailable rather than calling an
+    Access-gated host unauthenticated.
+    """
+    if _is_localhost_endpoint(endpoint):
+        return {}
+    user = getpass.getuser()
+    try:
+        client_id = get_api_key_from_keychain(_CF_ACCESS_ID_KEYCHAIN_SERVICE, user)
+        client_secret = get_api_key_from_keychain(
+            _CF_ACCESS_SECRET_KEYCHAIN_SERVICE, user
+        )
+    except (ValueError, FileNotFoundError):
+        # ValueError: item not found (common case). FileNotFoundError: the
+        # `security` CLI itself is absent (non-macOS) — Keychain is optional
+        # config here, so degrade gracefully (remote endpoint skipped)
+        # instead of crashing.
+        return None
+    if not client_id or not client_secret:
+        # A Keychain item can exist with an empty password — `security`
+        # returns "" with returncode 0 (no ValueError). Treat that the same
+        # as "absent" so we fail closed instead of calling the Access-gated
+        # host with a malformed header.
+        return None
+    return {
+        "CF-Access-Client-Id": client_id,
+        "CF-Access-Client-Secret": client_secret,
+    }
+
+
+_ollama_endpoint_cache: dict[str, tuple[str, float]] = {}
+
+
+async def _select_ollama_endpoint(model: str) -> str:
+    """First endpoint in the chain whose /api/tags lists `model`.
+
+    Results are cached per model for _OLLAMA_PROBE_CACHE_TTL_S. Raises
+    ValueError naming every endpoint tried and what each reported —
+    actionable and fail-closed.
+    """
+    cached = _ollama_endpoint_cache.get(model)
+    if cached is not None and time.monotonic() < cached[1]:
+        return cached[0]
+    chain = await asyncio.to_thread(_resolve_ollama_chain)
+    client = await _get_http_client()
+    attempts: list[str] = []
+    for endpoint in chain:
+        headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+        if headers is None:
+            attempts.append(
+                f"{endpoint}: skipped (Cloudflare Access credentials not in Keychain)"
+            )
+            continue
+        try:
+            response = await client.get(
+                f"{endpoint}/api/tags",
+                headers=headers,
+                timeout=_OLLAMA_PROBE_TIMEOUT_S,
+            )
+            response.raise_for_status()
+            data = response.json()
+            models = data.get("models", []) if isinstance(data, dict) else []
+            tags = [
+                str(m.get("name") or m.get("model") or "")
+                for m in models
+                if isinstance(m, dict)
+            ]
+        except httpx.HTTPStatusError as exc:
+            attempts.append(f"{endpoint}: HTTP {exc.response.status_code}")
+            continue
+        except httpx.RequestError:
+            attempts.append(f"{endpoint}: unreachable")
+            continue
+        except ValueError:
+            attempts.append(f"{endpoint}: invalid JSON from /api/tags")
+            continue
+        if model in tags:
+            _ollama_endpoint_cache[model] = (
+                endpoint,
+                time.monotonic() + _OLLAMA_PROBE_CACHE_TTL_S,
+            )
+            return endpoint
+        present = ", ".join(sorted(t for t in tags if t)) or "no models"
+        attempts.append(f"{endpoint}: model not present (has {present})")
+    detail = "; ".join(attempts) or "empty endpoint chain"
+    raise ValueError(f"No Ollama endpoint serves {model!r}: {redact_secrets(detail)}")
+
+
+async def _post_ollama_chat(
+    payload: dict[str, Any], timeout_s: float
+) -> dict[str, Any]:
+    """POST /api/chat to the first chain endpoint serving payload['model'].
+
+    Same structured-error contract as _post_agent_research: selection,
+    network, HTTP, and parse failures return {"status": "failed", ...}
+    instead of raising. Remote https endpoints get Cloudflare Access
+    service-token headers (absent creds → skipped at selection; the None
+    check here is defense in depth). No retries: an endpoint is either
+    serving or not.
+    """
+    model = str(payload.get("model", ""))
+    try:
+        endpoint = await _select_ollama_endpoint(model)
+    except ValueError as exc:
+        return {"status": "failed", "error": redact_secrets(str(exc))}
+    headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+    if headers is None:
+        return {
+            "status": "failed",
+            "error": f"no credentials for {redact_secrets(endpoint)}",
+        }
+    client = await _get_http_client()
+    try:
+        response = await client.post(
+            f"{endpoint}/api/chat", json=payload, headers=headers, timeout=timeout_s
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        # Value-aware scrub: an Access-gated host's error body can echo
+        # request headers; redact_secrets has no CF-token pattern, but we
+        # hold the exact header values, so scrub them precisely — before
+        # _http_error_payload truncates the body, so a secret straddling
+        # the truncation cutoff can't leave an un-scrubbed fragment.
+        failure = _http_error_payload(exc, scrub=tuple(headers.values()))
+        if exc.response.status_code == 404:
+            failure["error"] += (
+                f" — model may not be pulled on this host; try: ollama pull {model}"
+            )
+        return failure
+    except httpx.ConnectError:
+        # Answered the probe moments ago but refused the POST — drop the
+        # cached resolution so the next call re-probes the chain.
+        _ollama_endpoint_cache.pop(model, None)
+        return {
+            "status": "failed",
+            "error": (
+                f"Ollama not running at {redact_secrets(endpoint)} — is the "
+                "LaunchAgent up? "
+                "(launchctl kickstart -k gui/$UID/com.jasonvassallo.ollama)"
+            ),
+        }
+    except httpx.RequestError as exc:
+        return {
+            "status": "failed",
+            "error": f"request error: {redact_secrets(str(exc))}",
+        }
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "error": f"invalid JSON from Ollama: {redact_secrets(str(exc))}",
+        }
+
+
+def _render_delegate_answer(data: dict[str, Any]) -> list[TextContent]:
+    """Render an Ollama /api/chat response (or failure envelope) as MCP text.
+
+    message.thinking is deliberately discarded — the caller needs the
+    answer, not the model's scratchpad. Output passes through
+    redact_secrets for the same never-emit-secret-shapes contract as
+    every other family.
+    """
+    if data.get("status") == "failed":
+        return [
+            TextContent(
+                type="text",
+                text=f"Error: {redact_secrets(str(data.get('error', 'unknown failure')))}",
+            )
+        ]
+    message = data.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, str) or not content.strip():
+        return [TextContent(type="text", text="Error: Ollama returned no content")]
+    model = redact_secrets(str(data.get("model", "")))
+    return [
+        TextContent(
+            type="text",
+            text=f"## Local Delegate ({model})\n\n{redact_secrets(content)}",
+        )
+    ]
+
+
+# In-memory only, deliberately: delegated input may be exactly the
+# sensitive text kept off cloud APIs — it does not belong on disk. Jobs
+# die with the MCP server process; the polling Claude session dies with
+# it too, so nothing durable is lost.
+_delegate_jobs: dict[str, dict[str, Any]] = {}
+
+
+def _start_delegate_job(payload: dict[str, Any]) -> str:
+    """Launch a background delegate call; return its job id.
+
+    Raises ValueError when _DELEGATE_JOB_CAP jobs are already running —
+    the 32 GB host runs num_parallel=1, so queuing more would lie to the
+    caller; failing fast is honest.
+    """
+    # Bound the never-collected tail: a caller that starts jobs and never
+    # calls local_delegate_result would otherwise leak one dict entry per
+    # job forever on a long-lived server. Retain only the newest
+    # _DELEGATE_DONE_RETAINED completed jobs, evicting older ones
+    # oldest-first (by "started"). This does not change single-collect
+    # semantics — anything actually retrieved via local_delegate_result is
+    # deleted there as before; eviction here only reclaims memory for
+    # completed jobs nobody ever asks for.
+    done_ids = sorted(
+        (jid for jid, job in _delegate_jobs.items() if job["task"].done()),
+        key=lambda jid: _delegate_jobs[jid]["started"],
+    )
+    excess = len(done_ids) - _DELEGATE_DONE_RETAINED
+    if excess > 0:
+        for jid in done_ids[:excess]:
+            task = _delegate_jobs.pop(jid)["task"]
+            try:
+                # task.exception() marks the exception (if any) as
+                # retrieved, so asyncio never logs "exception was never
+                # retrieved" for an evicted-but-failed job. It raises
+                # CancelledError instead of returning for a cancelled
+                # task — swallow that the same way.
+                task.exception()
+            except asyncio.CancelledError:
+                pass
+
+    running = sum(1 for job in _delegate_jobs.values() if not job["task"].done())
+    if running >= _DELEGATE_JOB_CAP:
+        raise ValueError(
+            f"Delegate job cap ({_DELEGATE_JOB_CAP}) reached — collect finished "
+            "jobs via local_delegate_result or wait for one to complete."
+        )
+    job_id = uuid.uuid4().hex
+    coro = asyncio.wait_for(
+        _post_ollama_chat(payload, _DELEGATE_BG_CEILING_S),
+        timeout=_DELEGATE_BG_CEILING_S,
+    )
+    _delegate_jobs[job_id] = {
+        "task": asyncio.get_running_loop().create_task(coro),
+        "started": time.monotonic(),
+    }
+    return job_id
+
+
+def _collect_delegate_job(job_id: str | None) -> dict[str, Any]:
+    """Poll/collect a background job. Completed jobs are single-collect:
+    the registry entry is deleted on retrieval so memory stays clean."""
+    if not isinstance(job_id, str) or not _DELEGATE_JOB_ID_RE.fullmatch(job_id):
+        raise ValueError("job_id must be the 32-hex id returned by local_delegate.")
+    job = _delegate_jobs.get(job_id)
+    if job is None:
+        raise ValueError(
+            f"Unknown job_id {job_id!r} — results are single-collect and jobs "
+            "do not survive an MCP server restart."
+        )
+    task = job["task"]
+    if not task.done():
+        return {
+            "status": "running",
+            "elapsed_s": int(time.monotonic() - job["started"]),
+        }
+    del _delegate_jobs[job_id]
+    try:
+        return task.result()
+    except (TimeoutError, asyncio.CancelledError):
+        # asyncio.wait_for raises TimeoutError (== asyncio.TimeoutError on
+        # 3.12) past the ceiling; treat cancellation the same way.
+        return {
+            "status": "failed",
+            "error": (
+                f"background job exceeded the {int(_DELEGATE_BG_CEILING_S)}s "
+                "ceiling and was cancelled"
+            ),
+        }
+
+
 # Create MCP server
 server = Server("ai-tools-mcp")
 
@@ -1375,6 +1865,103 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["interaction_id"],
+            },
+        ),
+        Tool(
+            name="local_delegate",
+            description=(
+                "Delegate a task to the LOCAL Ollama qwen3.6 coding model — "
+                "input text never leaves the machine (unlike every research "
+                "tool here, which calls hosted APIs). Use for: private/"
+                "sensitive text that must stay on-device; cheap mechanical "
+                "work (summaries, boilerplate, drafts, bulk transforms) that "
+                "doesn't need frontier quality; an independent second opinion "
+                "on code or text; or long background jobs (pass "
+                "background=true, poll local_delegate_result). No web access "
+                "— for research use the research tools instead. The model is "
+                "strong at code and structured transforms but far below "
+                "frontier models on hard reasoning: keep tasks well-scoped."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The task. Include any needed file content inline — "
+                            "the server never reads the filesystem."
+                        ),
+                    },
+                    "system": {
+                        "type": "string",
+                        "description": "Optional system prompt framing the task.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "enum": list(OLLAMA_DELEGATE_MODELS),
+                        "default": _delegate_default_model(),
+                        "description": (
+                            "Server-side allowlist. The default (base tag) "
+                            "inherits each serving host's context window "
+                            "(64k on JVMBPro, 32k on jvmacmini); -32k/-256k "
+                            "pin explicit windows (-256k = several GB of KV "
+                            "cache, JVMBPro only). The endpoint chain is "
+                            "probed per call; the first endpoint serving "
+                            "the tag wins."
+                        ),
+                    },
+                    "think": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Enable the model's thinking mode. Off by default "
+                            "for speed; enable for reasoning-heavy asks."
+                        ),
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "true: return a job_id immediately; poll "
+                            "local_delegate_result. false: wait for the answer."
+                        ),
+                    },
+                    "keep_alive": {
+                        "type": "string",
+                        "description": (
+                            "Optional: how long Ollama keeps the model loaded "
+                            "after the call ('0' = unload immediately — use "
+                            "after a big -256k job). Omit to inherit the "
+                            "server's OLLAMA_KEEP_ALIVE. Pattern: 0 or "
+                            "<1-9999><s|m|h>."
+                        ),
+                    },
+                    "timeout_s": {
+                        "type": "integer",
+                        "default": 300,
+                        "description": "Sync timeout in seconds (1-600).",
+                    },
+                },
+                "required": ["prompt"],
+            },
+        ),
+        Tool(
+            name="local_delegate_result",
+            description=(
+                "Poll/collect a background local_delegate job by job_id. "
+                "Returns running status with elapsed seconds, or the answer. "
+                "Results are single-collect: once retrieved the job is gone. "
+                "Jobs live in server memory only and do not survive restarts."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The 32-hex job id returned by local_delegate.",
+                    },
+                },
+                "required": ["job_id"],
             },
         ),
         Tool(
@@ -1855,6 +2442,100 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
+    if name == "local_delegate":
+        prompt = arguments.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: prompt is required and must be a non-empty string.",
+                )
+            ]
+        model = arguments.get("model", _delegate_default_model())
+        if model not in OLLAMA_DELEGATE_MODELS:
+            allowed = ", ".join(OLLAMA_DELEGATE_MODELS)
+            return [
+                TextContent(type="text", text=f"Error: model must be one of: {allowed}")
+            ]
+        think = arguments.get("think", False)
+        if not isinstance(think, bool):
+            return [
+                TextContent(type="text", text="Error: think must be a JSON boolean.")
+            ]
+        background = arguments.get("background", False)
+        if not isinstance(background, bool):
+            return [
+                TextContent(
+                    type="text", text="Error: background must be a JSON boolean."
+                )
+            ]
+        keep_alive = arguments.get("keep_alive")
+        if keep_alive is not None and (
+            not isinstance(keep_alive, str)
+            or not _DELEGATE_KEEP_ALIVE_RE.fullmatch(keep_alive)
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: keep_alive must match 0 or <1-9999><s|m|h> (e.g. '5m', '0').",
+                )
+            ]
+        timeout_s = arguments.get("timeout_s", _DELEGATE_TIMEOUT_DEFAULT_S)
+        if (
+            isinstance(timeout_s, bool)
+            or not isinstance(timeout_s, int)
+            or not 1 <= timeout_s <= _DELEGATE_TIMEOUT_MAX_S
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "Error: timeout_s must be an integer between 1 and "
+                        f"{_DELEGATE_TIMEOUT_MAX_S}."
+                    ),
+                )
+            ]
+        system = arguments.get("system")
+        if system is not None and not isinstance(system, str):
+            return [TextContent(type="text", text="Error: system must be a string.")]
+
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        payload = {
+            "model": model,
+            "messages": messages,
+            "think": think,
+            "stream": False,
+        }
+        if keep_alive is not None:
+            payload["keep_alive"] = keep_alive
+
+        if background:
+            try:
+                job_id = _start_delegate_job(payload)
+            except ValueError as exc:
+                return [TextContent(type="text", text=f"Error: {exc}")]
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps({"job_id": job_id, "status": "started"}),
+                )
+            ]
+
+        data = await _post_ollama_chat(payload, float(timeout_s))
+        return _render_delegate_answer(data)
+
+    if name == "local_delegate_result":
+        try:
+            outcome = _collect_delegate_job(arguments.get("job_id"))
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"Error: {exc}")]
+        if outcome.get("status") == "running":
+            return [TextContent(type="text", text=json.dumps(outcome))]
+        return _render_delegate_answer(outcome)
+
     if name == "list_sessions":
         sessions = list_sessions()
         if not sessions:
@@ -1977,6 +2658,10 @@ async def main():
         await server.run(
             read_stream, write_stream, server.create_initialization_options()
         )
+
+
+if "--check" in sys.argv:
+    run_check()
 
 
 if __name__ == "__main__":
