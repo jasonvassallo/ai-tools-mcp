@@ -1177,6 +1177,9 @@ class TestLazyKeychainImport(unittest.TestCase):
         the actionable ValueError naming the env-var remedy, so the
         laziness still preserves a loud, actionable failure signal."""
         module = self._import_with_failing_keychain(drop_fcntl=False)
+        env_guard = mock.patch.dict(module.os.environ, {}, clear=False)
+        env_guard.start()
+        self.addCleanup(env_guard.stop)
         module.os.environ.pop("PERPLEXITY_API_KEY", None)
         with mock.patch.object(
             module,
