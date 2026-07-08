@@ -201,7 +201,9 @@ Access-gated endpoint (`https://ollama-mbp.djvassallo.com`, live since
    hardcode; editable in Desktop's extension UI). `AI_TOOLS_OLLAMA_URL`
    (singular, v1) remains honored as a one-item chain for compat.
 2. Keychain service `OLLAMA_URL` (optional, one endpoint, appended if set).
-3. Default chain: `http://localhost:11434`, `https://ollama-mbp.djvassallo.com`.
+3. Default chain: `http://localhost:11434`, `https://ollama-mbp.djvassallo.com`,
+   `https://ollama.djvassallo.com` (jvmacmini, base tag @ 32k, always-on —
+   added 2026-07-07; same CF Access service token as ollama-mbp).
 
 **Per-call selection:** for the requested model tag, probe each endpoint in
 order with `GET /api/tags` (2 s timeout) and pick the first whose tag list

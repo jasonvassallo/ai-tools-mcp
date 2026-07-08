@@ -1261,12 +1261,14 @@ _DELEGATE_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _OLLAMA_URLS_ENV_VAR = "AI_TOOLS_OLLAMA_URLS"
 _OLLAMA_DEFAULT_MODEL_ENV_VAR = "AI_TOOLS_OLLAMA_DEFAULT_MODEL"
 
-# v1.1 (spec amendment): local-first endpoint chain. The remote default is
-# the user's own Cloudflare-Access-gated JVMBPro tunnel — never a
-# third-party service.
+# v1.1 (spec amendment): local-first endpoint chain. The remote defaults are
+# the user's own Cloudflare-Access-gated tunnels — never a third-party
+# service. Order: local → JVMBPro (64k/256k tags, laptop, may be off) →
+# jvmacmini (32k base tag, always-on server).
 _OLLAMA_DEFAULT_CHAIN: tuple[str, ...] = (
     "http://localhost:11434",
     "https://ollama-mbp.djvassallo.com",
+    "https://ollama.djvassallo.com",
 )
 _OLLAMA_PROBE_TIMEOUT_S = 2.0
 _OLLAMA_PROBE_CACHE_TTL_S = 60.0
