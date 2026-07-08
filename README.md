@@ -220,6 +220,13 @@ security add-generic-password -s 'api_tokens' -a 'perplexity' -w 'YOUR_PERPLEXIT
 Windows setup: set per-user environment variables through **Settings →
 System → About → Advanced system settings → Environment Variables** (the GUI
 keeps secrets out of shell history). Never put them in files in the repo.
+Trade-off note: a persisted user env var is readable by any process running
+as the same user — weaker isolation than the macOS Keychain. Accepted,
+documented design choice for non-macOS hosts.
+
+Naming gotcha: `OLLAMA_URL` (above) **appends one extra endpoint** to the
+chain; the similarly named `AI_TOOLS_OLLAMA_URL`/`AI_TOOLS_OLLAMA_URLS`
+**replace the entire chain**. Use the `AI_TOOLS_*` vars to control ordering.
 
 ### Google Cloud Application Default Credentials (ADC)
 
