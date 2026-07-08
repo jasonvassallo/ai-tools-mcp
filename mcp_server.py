@@ -250,7 +250,9 @@ def run_check() -> None:
     errors = 0
     try:
         get_api_key_from_keychain("api_tokens", "perplexity")
-        source = "env" if os.environ.get("PERPLEXITY_API_KEY", "").strip() else "keychain"
+        source = (
+            "env" if os.environ.get("PERPLEXITY_API_KEY", "").strip() else "keychain"
+        )
         print(f"ok: perplexity key found ({source})")
     except ValueError as e:
         print(f"fail: {e}")

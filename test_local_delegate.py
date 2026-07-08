@@ -535,7 +535,9 @@ def _no_security_binary(service, account):
     # v1.2: get_api_key_from_keychain folds a missing `security` CLI
     # (non-macOS) into the same actionable ValueError as an ordinary
     # miss — callers only ever see ValueError.
-    raise ValueError("Credential not found. Set the OLLAMA_URL environment variable ...")
+    raise ValueError(
+        "Credential not found. Set the OLLAMA_URL environment variable ..."
+    )
 
 
 class TestResolveOllamaChain(unittest.TestCase):
@@ -1202,7 +1204,6 @@ class TestRunCheckOllamaLine(unittest.TestCase):
         self.assertEqual(kwargs.get("allow_redirects"), False)
 
 
-
 class TestCredentialResolution(unittest.TestCase):
     """v1.2 (issue #20): env-first credential lookup, Keychain fallback."""
 
@@ -1216,9 +1217,7 @@ class TestCredentialResolution(unittest.TestCase):
                 run.assert_not_called()
 
     def test_generic_env_name_is_the_service_name(self):
-        with mock.patch.dict(
-            os.environ, {"OLLAMA_CF_ACCESS_CLIENT_ID": "cid-env"}
-        ):
+        with mock.patch.dict(os.environ, {"OLLAMA_CF_ACCESS_CLIENT_ID": "cid-env"}):
             with mock.patch.object(mcp_server.subprocess, "run") as run:
                 self.assertEqual(
                     mcp_server.get_api_key_from_keychain(
