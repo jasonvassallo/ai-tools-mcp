@@ -287,13 +287,14 @@ class TestOllamaAuthHeaders(unittest.TestCase):
 
     def test_missing_security_binary_returns_none(self):
         # On non-macOS, `security` doesn't exist — subprocess.run raises
-        # FileNotFoundError. Cloudflare Access creds are optional config
-        # here too, so the remote endpoint must be skipped (None), not
-        # crash the whole delegate chain.
+        # a miss (v1.2: the helper folds a missing security(1) into the
+        # same ValueError as an ordinary miss). Cloudflare Access creds
+        # are optional config here too, so the remote endpoint must be
+        # skipped (None), not crash the whole delegate chain.
         with mock.patch.object(
             mcp_server,
             "get_api_key_from_keychain",
-            side_effect=FileNotFoundError("security: command not found"),
+            side_effect=ValueError("Credential not found. Set the ..."),
         ):
             self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
 
@@ -522,10 +523,10 @@ def _no_keychain(service, account):
 
 
 def _no_security_binary(service, account):
-    # subprocess.run raises FileNotFoundError when the `security` CLI
-    # itself is missing (non-macOS) — distinct from ValueError, which
-    # means the binary ran but the item wasn't found.
-    raise FileNotFoundError("security: command not found")
+    # v1.2: get_api_key_from_keychain folds a missing `security` CLI
+    # (non-macOS) into the same actionable ValueError as an ordinary
+    # miss — callers only ever see ValueError.
+    raise ValueError("Credential not found. Set the OLLAMA_URL environment variable ...")
 
 
 class TestResolveOllamaChain(unittest.TestCase):
@@ -603,9 +604,9 @@ class TestResolveOllamaChain(unittest.TestCase):
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://"})
 
     def test_missing_security_binary_degrades_gracefully(self):
-        # On non-macOS, `security` doesn't exist at all — subprocess.run
-        # raises FileNotFoundError rather than the "item not found"
-        # ValueError. The Keychain lookup here is optional config (an
+        # On non-macOS, `security` doesn't exist at all; v1.2 folds that
+        # into the same actionable ValueError as an ordinary miss.
+        # The Keychain lookup here is optional config (an
         # extra chain entry), so the chain must still resolve from
         # env/default instead of the whole call crashing.
         chain = self._chain(

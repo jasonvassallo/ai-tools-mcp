@@ -250,7 +250,8 @@ def run_check() -> None:
     errors = 0
     try:
         get_api_key_from_keychain("api_tokens", "perplexity")
-        print("ok: perplexity key found in keychain")
+        source = "env" if os.environ.get("PERPLEXITY_API_KEY", "").strip() else "keychain"
+        print(f"ok: perplexity key found ({source})")
     except ValueError as e:
         print(f"fail: {e}")
         errors += 1
@@ -282,7 +283,7 @@ def run_check() -> None:
             if headers is None:
                 print(
                     "warn: ollama endpoint skipped (no Cloudflare Access creds "
-                    f"in Keychain): {endpoint}"
+                    f"in env or Keychain): {endpoint}"
                 )
                 continue
             # allow_redirects=False: a CF Access service-token header must
@@ -1391,10 +1392,10 @@ def _resolve_ollama_chain() -> list[str]:
         ).strip()
         if keychain_url:
             entries.append(keychain_url)
-    except (ValueError, FileNotFoundError):
-        # ValueError: item not found (common case). FileNotFoundError: the
-        # `security` CLI itself is absent (non-macOS) — Keychain is optional
-        # config here, so degrade gracefully instead of crashing.
+    except ValueError:
+        # Not found in env or Keychain (get_api_key_from_keychain folds the
+        # non-macOS missing-security(1) case into ValueError) — this entry
+        # is optional config, so degrade gracefully instead of crashing.
         pass
     chain: list[str] = []
     for entry in entries:
@@ -1433,11 +1434,11 @@ def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
         client_secret = get_api_key_from_keychain(
             _CF_ACCESS_SECRET_KEYCHAIN_SERVICE, user
         )
-    except (ValueError, FileNotFoundError):
-        # ValueError: item not found (common case). FileNotFoundError: the
-        # `security` CLI itself is absent (non-macOS) — Keychain is optional
-        # config here, so degrade gracefully (remote endpoint skipped)
-        # instead of crashing.
+    except ValueError:
+        # Not found in env or Keychain (get_api_key_from_keychain folds the
+        # non-macOS missing-security(1) case into ValueError) — degrade
+        # gracefully (remote endpoint skipped, never called bare) instead
+        # of crashing.
         return None
     if not client_id or not client_secret:
         # A Keychain item can exist with an empty password — `security`
