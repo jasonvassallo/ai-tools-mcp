@@ -1,7 +1,7 @@
 {
   "name": "ai-tools-mcp",
   "description": "Hosted-API research, local Ollama delegation, and session-management MCP server. Exposes Perplexity Sonar (quick) and Sonar Pro (deep) research, Perplexity Agent API Search-as-Code (bulk, sandboxed), Google Gemini Deep Research (async, long-form), local Ollama for sensitive/private input and mechanical text work, and conversation-session persistence. Includes slash commands, routing skills, and a session-start preflight hook.",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "author": {
     "name": "Jason Vassallo",
     "email": "jasonvassallo@mac.com"
