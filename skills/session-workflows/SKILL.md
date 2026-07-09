@@ -43,8 +43,8 @@ Use `update_session` with `session_id` and the new `name`. The `last_modified` t
 
 ## Concurrency notes
 
-`update_session` and `delete_session` serialize via a per-session POSIX flock advisory lockfile at `~/.claude/sessions/<uuid>.lock`. Non-cooperating deleters (manual `rm`, foreign tools) can still slip past; `update_session` has a best-effort existence re-check inside the lock to catch this. If the user reports a "session was deleted concurrently during update" error, it means a non-cooperating process beat the update — just retry with a fresh `load_session` first.
+`update_session` and `delete_session` serialize via a per-session advisory lockfile at `~/.claude/sessions/<uuid>.lock` — `fcntl.flock` on POSIX, `msvcrt.locking` byte-range locks on Windows (same lockfile, same guarantees). Non-cooperating deleters (manual `rm`, foreign tools) can still slip past; `update_session` has a best-effort existence re-check inside the lock to catch this. If the user reports a "session was deleted concurrently during update" error, it means a non-cooperating process beat the update — just retry with a fresh `load_session` first.
 
 ## Platform note
 
-Session management requires POSIX (macOS/Linux). On Windows, `update_session` and `delete_session` raise `OSError` immediately because `fcntl` is unavailable. The other tools (`list_sessions`, `save_session`, `load_session`) work on any platform.
+All five session tools work on macOS, Linux, and Windows. (A platform providing neither `fcntl` nor `msvcrt` — neither POSIX nor Windows — gets a clean error from `update_session`/`delete_session`; the read-only tools work everywhere.)
