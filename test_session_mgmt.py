@@ -964,14 +964,96 @@ class TestAtomicWrites(_SessionMgmtBase):
         sid = save["session_id"]
         session_file = mcp_server.get_session_file(sid)
 
-        # Simulate a Windows environment by setting mcp_server.fcntl
-        # to None — the same state the conditional import produces
-        # when ImportError fires.
+        # Simulate a platform with NEITHER locking module (since the
+        # Windows msvcrt fallback landed, fcntl=None alone routes to
+        # msvcrt — both must be absent to hit the guard).
         with mock.patch.object(mcp_server, "fcntl", None):
-            with self.assertRaises(ValueError) as ctx:
+            with mock.patch.object(mcp_server, "msvcrt", None):
+                with self.assertRaises(ValueError) as ctx:
+                    with mcp_server._session_lock(session_file):
+                        pass  # pragma: no cover — should not reach
+                self.assertIn("POSIX", str(ctx.exception))
+                self.assertIn("msvcrt", str(ctx.exception))
+
+    def _fake_msvcrt(self, lock_side_effect=None):
+        """A stand-in msvcrt module: records (mode, nbytes) calls and
+        optionally raises from LK_LOCK attempts via lock_side_effect."""
+        fake = mock.Mock()
+        fake.LK_LOCK, fake.LK_UNLCK = 0, 2
+        fake.calls = []
+
+        def locking(fd, mode, nbytes):
+            fake.calls.append((mode, nbytes))
+            if mode == fake.LK_LOCK and lock_side_effect is not None:
+                lock_side_effect()
+
+        fake.locking = mock.Mock(side_effect=locking)
+        return fake
+
+    def test_session_lock_uses_msvcrt_when_fcntl_absent(self):
+        """Windows session locking: with fcntl absent and msvcrt present
+        — the real Windows import state — _session_lock must acquire a
+        1-byte range lock (LK_LOCK) and release it (LK_UNLCK) instead of
+        raising, making update/delete_session functional on Windows."""
+        save = mcp_server.save_session(name="w", messages=[])
+        session_file = mcp_server.get_session_file(save["session_id"])
+        fake = self._fake_msvcrt()
+        entered = False
+        with mock.patch.object(mcp_server, "fcntl", None):
+            with mock.patch.object(mcp_server, "msvcrt", fake):
                 with mcp_server._session_lock(session_file):
-                    pass  # pragma: no cover — should not reach
-            self.assertIn("POSIX", str(ctx.exception))
+                    entered = True
+        self.assertTrue(entered)
+        # Exactly one acquire then one release, both on a 1-byte range.
+        self.assertEqual(fake.calls, [(fake.LK_LOCK, 1), (fake.LK_UNLCK, 1)])
+
+    def test_msvcrt_lock_retries_on_contention_then_acquires(self):
+        """msvcrt.LK_LOCK gives up with EACCES/EDEADLK after its internal
+        ~10 retries while another process holds the range; _session_lock
+        must keep waiting (emulating flock LOCK_EX) rather than surface
+        the contention error."""
+        import errno as _errno
+
+        save = mcp_server.save_session(name="w2", messages=[])
+        session_file = mcp_server.get_session_file(save["session_id"])
+        attempts = {"n": 0}
+
+        def contended_twice():
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise OSError(_errno.EACCES, "region locked")
+
+        fake = self._fake_msvcrt(lock_side_effect=contended_twice)
+        with mock.patch.object(mcp_server, "fcntl", None):
+            with mock.patch.object(mcp_server, "msvcrt", fake):
+                with mcp_server._session_lock(session_file):
+                    pass
+        self.assertEqual(attempts["n"], 3)  # two contended, third acquired
+        self.assertEqual(fake.calls[-1], (fake.LK_UNLCK, 1))
+
+    def test_msvcrt_lock_propagates_non_contention_errors(self):
+        """A real error (EBADF etc.) from msvcrt.locking must propagate,
+        not spin the retry loop forever — only contention errnos retry."""
+        import errno as _errno
+
+        save = mcp_server.save_session(name="w3", messages=[])
+        session_file = mcp_server.get_session_file(save["session_id"])
+
+        def bad_fd():
+            raise OSError(_errno.EBADF, "bad file descriptor")
+
+        fake = self._fake_msvcrt(lock_side_effect=bad_fd)
+        with mock.patch.object(mcp_server, "fcntl", None):
+            with mock.patch.object(mcp_server, "msvcrt", fake):
+                with self.assertRaises(OSError) as ctx:
+                    with mcp_server._session_lock(session_file):
+                        pass  # pragma: no cover — should not reach
+        self.assertEqual(ctx.exception.errno, _errno.EBADF)
+        # And it must NOT have retried: exactly one LK_LOCK attempt —
+        # a retry-then-propagate implementation would still raise EBADF
+        # but spin first (per CodeRabbit CLI review of this change).
+        lock_attempts = [c for c in fake.calls if c[0] == fake.LK_LOCK]
+        self.assertEqual(len(lock_attempts), 1)
 
     def test_session_lock_finally_survives_fcntl_set_to_none_mid_context(self):
         """PR #4 round-11 review (Gemini medium L258): if

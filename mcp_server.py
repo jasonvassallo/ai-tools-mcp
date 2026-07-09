@@ -49,16 +49,15 @@ MCP server providing five families of tools:
 Designed to complement Claude's built-in WebSearch tool (quick factual
 lookups, single-answer questions).
 
-PLATFORM: macOS / POSIX only. The session helpers use ``fcntl.flock``
-(Unix-specific) and the Perplexity-key lookup uses macOS's ``security``
-CLI. Importing this module on Windows succeeds (so docs/inspection
-tools work) but invoking ``update_session`` / ``delete_session`` will
-raise OSError with a clear message (per PR #4 round-9 review, Gemini
-medium L17: "fcntl module is Unix-specific"), and invoking
-``deep_research`` will raise the keychain-lookup error from the
-lazy ``_get_perplexity_client`` accessor (per PR #4 round-10 review,
-Codex P2 L38: keychain lookup must be deferred so ``import mcp_server``
-succeeds even when the ``security`` CLI is unavailable).
+PLATFORM: macOS / POSIX and Windows. The session helpers lock via
+``fcntl.flock`` on POSIX and ``msvcrt.locking`` byte-range locks on
+Windows (same dedicated lockfile, byte 0 by convention), so all
+thirteen tools work on both families; a platform with neither module
+gets a clean ValueError from ``update_session`` / ``delete_session``.
+Credentials resolve env-first everywhere; the macOS Keychain is the
+fallback where ``security(1)`` exists (per PR #4 round-10 review,
+Codex P2 L38: lookups are deferred so ``import mcp_server`` succeeds
+on any platform).
 
 For the Gemini tools, Application Default Credentials (ADC) are
 likewise loaded lazily on first ``gemini_*`` call rather than at
@@ -69,6 +68,7 @@ having been run; only the ``gemini_*`` tools will fail when invoked.
 """
 
 import asyncio
+import errno
 import getpass
 import json
 import os
@@ -92,12 +92,21 @@ import requests
 # fcntl is POSIX-only; on Windows the import fails. We catch
 # ImportError so the module can still be imported (e.g. for docs,
 # tool discovery, or the deep_research path which doesn't need
-# locking) — _session_lock raises a clean error if invoked on a
-# non-POSIX platform (per PR #4 round-9 review, Gemini medium L17).
+# locking) — _session_lock falls back to msvcrt on Windows, or raises
+# a clean error when neither is available (per PR #4 round-9 review,
+# Gemini medium L17).
 try:
     import fcntl
 except ImportError:  # pragma: no cover - exercised via mocked import
     fcntl = None  # type: ignore[assignment]
+
+# msvcrt is the Windows counterpart (byte-range locking); absent on
+# POSIX. _session_lock uses whichever module is available, so
+# update_session / delete_session work on both platform families.
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - absent on POSIX; mocked in tests
+    msvcrt = None  # type: ignore[assignment]
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -376,7 +385,7 @@ def _atomic_temp_for(target: Path) -> Path:
 
 @contextmanager
 def _session_lock(session_file: Path):
-    """Cooperative per-session lockfile (POSIX flock).
+    """Cooperative per-session lockfile (POSIX flock / Windows msvcrt).
 
     Used by ``update_session`` / ``delete_session`` to serialize their
     critical sections against each other. This closes the resurrection
@@ -403,26 +412,42 @@ def _session_lock(session_file: Path):
     on Linux, ``renamex_np`` on macOS), which aren't portably
     exposed in stdlib Python.
     """
-    if fcntl is None:
-        # Non-POSIX platform (Windows). The session-mgmt path requires
-        # advisory locking that fcntl provides; fail clearly rather
-        # than fall through to a no-op lock that would silently let
-        # the resurrection race re-open. (Per PR #4 round-9 review,
-        # Gemini medium L17: "fcntl module is Unix-specific".)
-        # ValueError (not OSError) so the tool dispatcher's existing
-        # `except ValueError` surfaces this as a clean tool error on
-        # Windows installs instead of an internal exception (Codex
-        # P2, PR #22).
+    if fcntl is None and msvcrt is None:
+        # Neither POSIX flock nor Windows byte-range locking exists on
+        # this platform. Fail clearly rather than fall through to a
+        # no-op lock that would silently let the resurrection race
+        # re-open. ValueError (not OSError) so the tool dispatcher's
+        # existing `except ValueError` surfaces this as a clean tool
+        # error instead of an internal exception (Codex P2, PR #22).
         raise ValueError(
-            "update_session/delete_session require POSIX advisory locking "
-            "(fcntl), which this platform lacks — these two tools are "
-            "unavailable on Windows; all other tools work."
+            "update_session/delete_session require OS advisory file "
+            "locking (fcntl on POSIX, msvcrt on Windows), and this "
+            "platform provides neither — these two tools are "
+            "unavailable here; all other tools work."
         )
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
     lock_path = session_file.with_suffix(".lock")
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        else:
+            # Windows: msvcrt.locking locks a byte RANGE starting at the
+            # current file position — seek to 0 so every cooperating
+            # process locks the same byte (whole-file convention on a
+            # dedicated lockfile). LK_LOCK internally retries ~10 times
+            # a second apart, then raises OSError with EACCES/EDEADLK
+            # while the region is still held; loop on exactly those
+            # errnos to emulate flock's indefinite LOCK_EX blocking,
+            # and propagate anything else (EBADF etc.) as a real error.
+            os.lseek(fd, 0, os.SEEK_SET)
+            while True:
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                        raise
         yield
     finally:
         # Defensive: if mcp_server.fcntl was monkey-patched to None
@@ -438,6 +463,15 @@ def _session_lock(session_file: Path):
             except OSError:
                 # Lock release on a closed-or-already-released fd is
                 # benign; we close the fd next anyway.
+                pass
+        elif msvcrt is not None:
+            try:
+                # Same seek-to-0 convention as acquisition: unlock the
+                # exact byte range that was locked.
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                # Benign for the same reason as the flock branch.
                 pass
         os.close(fd)
 

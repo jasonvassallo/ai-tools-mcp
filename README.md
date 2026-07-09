@@ -187,7 +187,7 @@ Everything runs from env vars on Windows — no Keychain, no installer script.
 
    Optional per-machine env (set alongside the credentials): `AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,qwen3.6:35b-a3b-coding-nvfp4,qwen3.6:35b-a3b-coding-nvfp4-256k` — the small model serves locally; the qwen3.6 tags miss the local probe and fall through the remote chain.
 4. **Claude Desktop:** install the `.mcpb` as in (C), then in the extension settings set `uv_path` to your `uv.exe` (find it with `where uv` — the default is a macOS Homebrew path) and `ollama_models` as above.
-5. **Platform caveat:** `update_session`/`delete_session` are POSIX-only (they need `fcntl` advisory locking) and return a clean error on Windows; the other 11 tools are fully functional.
+5. **Platform note:** all 13 tools work on Windows. `update_session`/`delete_session` lock via `msvcrt.locking` byte-range locks there (`fcntl.flock` on POSIX) — same lockfile, same serialization guarantees.
 6. **Verify:** `uv run C:\path\to\mcp_server.py --check` — hosted-tool credentials must pass; the Ollama line is non-fatal (`warn:` when the local server is down and calls will use the remote chain).
 
 ## Requirements
