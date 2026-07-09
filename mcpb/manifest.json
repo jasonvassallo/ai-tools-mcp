@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "ai-tools-mcp",
   "display_name": "AI Tools MCP",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Perplexity Sonar (quick), Sonar Pro (deep), and Agent API Search-as-Code (bulk) research, Google Gemini Deep Research (async, long-form reports), local Ollama delegation, and local conversation-session persistence \u2014 exposed as 13 MCP tools.",
   "long_description": "Five families of tools: (1) quick_research uses Perplexity Sonar for fast single-source citation-backed answers, and deep_research uses Sonar Pro for inline multi-source synthesis. (2) agent_research drives Perplexity's Agent API with the sandbox tool (Search as Code): a hosted agent writes and runs code that searches programmatically, covering every item in bulk/enumerable research tasks \u2014 synchronous or background via agent_research_result polling. (3) gemini_deep_research_start/_result run long-form research tasks (5\u201360 minutes) on Google's Deep Research model and poll for results. (4) local_delegate sends a task to a local-first Ollama endpoint chain \u2014 input stays on your own machines: on-device when localhost serves the model, otherwise only your own Cloudflare-Access-gated endpoint, never a third-party API \u2014 synchronously or in the background via local_delegate_result polling. (5) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
   "author": {
@@ -57,13 +57,15 @@
       "type": "string",
       "title": "Default delegate model",
       "description": "Optional: pin the default delegate model (must be on the allowlist). Leave blank to use the first entry of the model allowlist.",
-      "required": false
+      "required": false,
+      "default": ""
     },
     "ollama_models": {
       "type": "string",
       "title": "Ollama model allowlist",
       "description": "Comma-separated model tags local_delegate may use; first entry is the default model. Leave blank for the built-in qwen3.6 tags. On constrained machines set e.g. 'qwen2.5-coder:14b,qwen3.6:35b-a3b-coding-nvfp4' so small tasks run locally and qwen requests fall through to the remote chain.",
-      "required": false
+      "required": false,
+      "default": ""
     }
   },
   "tools": [
