@@ -187,17 +187,28 @@ Everything runs from env vars on Windows — no Keychain, no installer script.
    claude mcp add ai-tools-mcp --scope user --env GOOGLE_CLOUD_PROJECT=YOUR_PROJECT -- C:\path\to\uv.exe run C:\path\to\ai-tools-mcp\mcp_server.py
    ```
 
-   `--env GOOGLE_CLOUD_PROJECT=...` is baked into the registration because google-auth discovers the project by shelling out to `gcloud`, which is likewise off the desktop app's PATH. Optional per-machine env (append more `--env` flags or set them alongside the credentials): `AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,qwen3.6:35b-a3b-coding-nvfp4,qwen3.6:35b-a3b-coding-nvfp4-256k` — the small model serves locally; the qwen3.6 tags miss the local probe and fall through the remote chain.
+   `--env GOOGLE_CLOUD_PROJECT=...` is baked into the registration because GUI-launched servers don't inherit your shell environment: user-credential ADC files carry no project id, and google-auth's fallback discovery (which consults the gcloud CLI) isn't reliable from a GUI-spawned process — pinning the project in the registration sidesteps both. Optional per-machine env (append more `--env` flags or set them alongside the credentials): `AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,qwen3.6:35b-a3b-coding-nvfp4,qwen3.6:35b-a3b-coding-nvfp4-256k` — the small model serves locally; the qwen3.6 tags miss the local probe and fall through the remote chain.
 4. **Claude Desktop:** install the `.mcpb` as in (C), then in the extension settings set `uv_path` to your `uv.exe` (find it with `where uv` — the default is a macOS Homebrew path) and `ollama_models` as above.
 5. **Platform note:** all 13 tools work on Windows. `update_session`/`delete_session` lock via `msvcrt.locking` byte-range locks there (`fcntl.flock` on POSIX) — same lockfile, same serialization guarantees.
 6. **Verify:** `uv run C:\path\to\mcp_server.py --check` — hosted-tool credentials must pass; the Ollama line is non-fatal (`warn:` when the local server is down and calls will use the remote chain).
 
-### Troubleshooting: "Server disconnected" in the desktop app
+### Troubleshooting: "Server disconnected" in a desktop app
 
-If the Claude Code **desktop app** (or Claude Desktop) shows *"MCP ai-tools-mcp:
-Server disconnected"* while `claude mcp list` in a **terminal** shows the same
-server ✔ Connected, the cause is almost always one of two things — both are
-about how GUI apps launch servers, not about the server itself:
+The two Claude desktop apps register this server differently, so start by
+identifying which one is complaining:
+
+- **Claude Code desktop app** shares the CLI's registration (`claude mcp
+  list/add/remove`, stored in `~/.claude.json`) — its fixes are the first two
+  bullets below.
+- **Claude Desktop** runs the `.mcpb` extension (shown as "AI Tools MCP") —
+  see the Desktop-specific items at the end. A banner naming lowercase
+  `ai-tools-mcp` in Claude Desktop usually means a **legacy `mcpServers` entry
+  in `claude_desktop_config.json`** is also registered — the third bullet.
+
+If the app shows *"MCP ai-tools-mcp: Server disconnected"* while `claude mcp
+list` in a **terminal** shows the same server ✔ Connected, the cause is almost
+always one of these — all about how GUI apps launch servers, not about the
+server itself:
 
 - **Bare command name / minimal PATH.** GUI-launched apps spawn MCP servers
   with a stripped-down PATH that omits `/opt/homebrew/bin`, `~/.local/bin`,
@@ -235,10 +246,21 @@ about how GUI apps launch servers, not about the server itself:
   This is the single most common reason a corrected registration still shows
   the old error.
 
-For Claude Desktop `.mcpb` extensions specifically: a same-id local `.mcpb`
-dragged in on top of an installed one is a **no-op** — Desktop keeps the old
-copy. Uninstall the extension in Settings → Extensions first, then install the
-new `.mcpb`, then fully quit and reopen.
+- **A registration points at a deleted path (survives every restart).** If a
+  server was ever installed via a copy (e.g. `install.sh`'s
+  `~/.local/share/ai-tools-mcp/`) and that copy was later removed, any config
+  still referencing it fails on every launch. Check **all** of:
+  `~/.claude.json` (`mcpServers`), `~/.claude/.mcp.json`, and — for Claude
+  Desktop — `claude_desktop_config.json`'s `mcpServers` block. Delete stale
+  entries (the `.mcpb` extension makes a config-file entry redundant in
+  Claude Desktop anyway), then fully quit and reopen.
+
+Claude Desktop `.mcpb`-specific notes: a same-id local `.mcpb` dragged in on
+top of an installed one is a **no-op** — Desktop keeps the old copy. Uninstall
+the extension in Settings → Extensions first, then install the new `.mcpb`,
+then fully quit and reopen. Launch problems for the extension itself are
+usually the `uv_path` setting (must be an absolute path valid on *this*
+machine).
 
 ## Requirements
 
