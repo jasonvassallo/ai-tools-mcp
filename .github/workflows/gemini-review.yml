@@ -68,16 +68,19 @@ jobs:
           # Review via the GitHub MCP server (the supported path). Expose its
           # full toolset (no includeTools allowlist) so the model can read the
           # PR and post a review; a too-narrow allowlist previously caused
-          # tool-not-found loops. tools.core is a strict read-only allowlist:
-          # without it, run_shell_command remains available (the action runs
-          # `gemini --yolo`), and a prompt injection in reviewed PR content
-          # could execute shell with GITHUB_TOKEN/Gemini auth in the env.
-          # (tools.core is the current schema; top-level coreTools is the
-          # legacy pre-v0.50 key kept alive only by settings migration.)
+          # tool-not-found loops. tools.exclude removes the dangerous built-ins
+          # from discovery: without it, run_shell_command is available (the
+          # action runs `gemini --yolo`), so a prompt injection in reviewed PR
+          # content could execute shell with GITHUB_TOKEN/Gemini auth in the
+          # env; write_file/replace and web_fetch are likewise injection-
+          # controllable write/exfil channels a reviewer never needs.
+          # NOT tools.core: an allowlist of built-ins also filters out the
+          # GitHub MCP tools (verified empirically -- reviews silently stopped
+          # posting), turning the reviewer into a no-op.
           settings: |-
             {
               "model": { "maxSessionTurns": 50 },
-              "tools": { "core": ["read_file", "read_many_files", "glob", "search_file_content"] },
+              "tools": { "exclude": ["run_shell_command", "write_file", "replace", "web_fetch", "save_memory"] },
               "mcpServers": {
                 "github": {
                   "command": "docker",
