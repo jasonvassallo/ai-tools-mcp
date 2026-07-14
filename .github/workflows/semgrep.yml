@@ -26,7 +26,7 @@ jobs:
     # Skip dependabot PRs (they can't access secrets / Actions context cleanly).
     if: (github.actor != 'dependabot[bot]')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - run: semgrep ci
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
