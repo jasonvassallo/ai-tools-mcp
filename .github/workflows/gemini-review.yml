@@ -79,11 +79,14 @@ jobs:
           # posting), turning the reviewer into a no-op.
           # experimental.enableAgents: false blocks PR-shipped .gemini/agents
           # subagents, whose frontmatter can declare arbitrary mcpServers commands.
+          # skills.enabled: false blocks PR-shipped .gemini/skills the same way;
+          # google_web_search is excluded as a query-based exfil channel.
           settings: |-
             {
               "model": { "maxSessionTurns": 50 },
-              "tools": { "exclude": ["run_shell_command", "write_file", "replace", "web_fetch", "save_memory"] },
+              "tools": { "exclude": ["run_shell_command", "write_file", "replace", "web_fetch", "save_memory", "google_web_search", "activate_skill"] },
               "experimental": { "enableAgents": false },
+              "skills": { "enabled": false },
               "mcpServers": {
                 "github": {
                   "command": "docker",
