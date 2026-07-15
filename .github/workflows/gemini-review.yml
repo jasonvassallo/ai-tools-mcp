@@ -77,10 +77,13 @@ jobs:
           # NOT tools.core: an allowlist of built-ins also filters out the
           # GitHub MCP tools (verified empirically -- reviews silently stopped
           # posting), turning the reviewer into a no-op.
+          # experimental.enableAgents: false blocks PR-shipped .gemini/agents
+          # subagents, whose frontmatter can declare arbitrary mcpServers commands.
           settings: |-
             {
               "model": { "maxSessionTurns": 50 },
               "tools": { "exclude": ["run_shell_command", "write_file", "replace", "web_fetch", "save_memory"] },
+              "experimental": { "enableAgents": false },
               "mcpServers": {
                 "github": {
                   "command": "docker",
