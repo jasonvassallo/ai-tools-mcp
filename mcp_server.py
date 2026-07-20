@@ -3,7 +3,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "openai>=1.0.0",
-#     "mcp>=1.0.0",
+#     "mcp>=1.0.0,<2",
 #     "httpx>=0.27",
 #     "google-auth>=2.30",
 #     "requests>=2.31",
