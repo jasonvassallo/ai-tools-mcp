@@ -1750,8 +1750,14 @@ async def _post_ollama_chat(
         return failure
     except httpx.ConnectError:
         # Answered the probe moments ago but refused the POST — drop the
-        # cached resolution so the next call re-probes the chain.
+        # cached resolution so the next call re-probes the chain. The
+        # implicit-resolution cache pins (model, endpoint) pairs too, so it
+        # must go as well or omitted-model calls would keep chasing the dead
+        # endpoint for up to a TTL (Codex P2 on PR #32). It is a dict of at
+        # most one entry per configured default — clearing wholesale is
+        # cheaper than matching endpoints and can never be wrong.
         _ollama_endpoint_cache.pop(model, None)
+        _implicit_resolution_cache.clear()
         return {
             "status": "failed",
             "error": (

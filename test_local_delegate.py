@@ -459,6 +459,22 @@ class TestPostOllamaChat(unittest.TestCase):
         self.assertIn("LaunchAgent", out["error"])
         self.assertIn("http://localhost:11434", out["error"])
 
+    def test_connect_error_invalidates_implicit_resolution_cache(self):
+        # Codex P2 (PR #32): the implicit cache pins (model, endpoint) pairs;
+        # a dead endpoint must evict it too, or omitted-model calls keep
+        # resolving to the corpse for up to a TTL.
+        mcp_server._implicit_resolution_cache["gemma4:12b-nvfp4"] = (
+            "qwen3.6:35b-a3b-coding-nvfp4",
+            "http://localhost:11434",
+            "Note: substituted.\n\n",
+            mcp_server.time.monotonic() + 60,
+        )
+        client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
+        with self._with_selection():
+            out = self._post(client)
+        self.assertEqual(out["status"], "failed")
+        self.assertEqual(mcp_server._implicit_resolution_cache, {})
+
     def test_404_adds_pull_hint(self):
         client = _FakeClient(
             response=_FakeResponse(status_code=404, text="model not found")
