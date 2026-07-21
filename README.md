@@ -176,6 +176,10 @@ First-run note: macOS may show a one-time Keychain access prompt when the server
 
 Everything runs from env vars on Windows — no Keychain, no installer script.
 
+## Benchmarks
+
+`benchmarks/local-model-bench/` holds the ground-truth A/B harness behind the delegate-model defaults (planted-defect review corpus, machine-graded delegate tasks, blind adversarial judging). See its [README](benchmarks/local-model-bench/README.md) and [RESULTS](benchmarks/local-model-bench/RESULTS.md) for the 2026-07 measurements that set gemma4 as the default.
+
 1. **Prerequisites:** [uv](https://docs.astral.sh/uv/) (`winget install astral-sh.uv`), and for `local_delegate` a local [Ollama for Windows](https://ollama.com/download/windows) with a model pulled — on a 32 GB CPU-only box use `ollama pull qwen2.5-coder:14b` (~9 GB; the qwen3-coder line starts at 30B and will not fit alongside office apps).
 2. **Credentials:** set the env vars from the Credentials table above via the System Environment Variables GUI. For Gemini tools, install the Google Cloud SDK and run `gcloud auth application-default login` then `gcloud auth application-default set-quota-project YOUR_PROJECT` (ADC is fully portable; no key files).
 3. **Claude Code (CLI and the desktop app share one config):**
@@ -187,7 +191,7 @@ Everything runs from env vars on Windows — no Keychain, no installer script.
    claude mcp add ai-tools-mcp --scope user --env GOOGLE_CLOUD_PROJECT=YOUR_PROJECT -- C:\path\to\uv.exe run C:\path\to\ai-tools-mcp\mcp_server.py
    ```
 
-   `--env GOOGLE_CLOUD_PROJECT=...` is baked into the registration because GUI-launched servers don't inherit your shell environment: user-credential ADC files carry no project id, and google-auth's fallback discovery (which consults the gcloud CLI) isn't reliable from a GUI-spawned process — pinning the project in the registration sidesteps both. Optional per-machine env (append more `--env` flags or set them alongside the credentials): `AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,qwen3.6:35b-a3b-coding-nvfp4,qwen3.6:35b-a3b-coding-nvfp4-256k` — the small model serves locally; the qwen3.6 tags miss the local probe and fall through the remote chain.
+   `--env GOOGLE_CLOUD_PROJECT=...` is baked into the registration because GUI-launched servers don't inherit your shell environment: user-credential ADC files carry no project id, and google-auth's fallback discovery (which consults the gcloud CLI) isn't reliable from a GUI-spawned process — pinning the project in the registration sidesteps both. Optional per-machine env (append more `--env` flags or set them alongside the credentials): `AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,gemma4:12b-nvfp4,qwen3.6:35b-a3b-coding-nvfp4,qwen3.6:35b-a3b-coding-nvfp4-256k` — the small model serves locally; the gemma4 and qwen3.6 tags miss the local probe (the box is CPU-only — nvfp4 is Apple-silicon-served) and fall through the remote chain to ollama-mbp when the MBP is awake. Implicit calls still resolve to the local small model first by design; name gemma explicitly when quality matters more than locality.
 4. **Claude Desktop:** install the `.mcpb` as in (C), then in the extension settings set `uv_path` to your `uv.exe` (find it with `where uv` — the default is a macOS Homebrew path) and `ollama_models` as above.
 5. **Platform note:** all 13 tools work on Windows. `update_session`/`delete_session` lock via `msvcrt.locking` byte-range locks there (`fcntl.flock` on POSIX) — same lockfile, same serialization guarantees.
 6. **Verify:** `uv run C:\path\to\mcp_server.py --check` — hosted-tool credentials must pass; the Ollama line is non-fatal (`warn:` when the local server is down and calls will use the remote chain).

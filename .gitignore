@@ -19,3 +19,12 @@ zshrc_debug.txt
 # payload inside the build dir (refreshed on every build_mcpb.sh run).
 dist/
 mcpb/server/
+
+# local-model-bench generated artifacts (contain assembled token-shaped fixtures)
+benchmarks/local-model-bench/tasks/
+benchmarks/local-model-bench/out/
+benchmarks/local-model-bench/out_degraded/
+benchmarks/local-model-bench/units*/
+benchmarks/local-model-bench/*.jsonl
+benchmarks/local-model-bench/*.json
+benchmarks/local-model-bench/*.log
