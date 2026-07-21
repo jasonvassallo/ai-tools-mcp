@@ -1,1 +1,1 @@
-{"strictness":3,"commentTypes":["logic","syntax","style"],"fileChangeLimit":100,"triggerOnUpdates":true,"summarySection":{"included":true,"collapsible":true},"comment":"Greptile AI review — flags all issues incl. nits; author triages."}
+{"strictness":3,"commentTypes":["logic","syntax","style"],"fileChangeLimit":100,"triggerOnUpdates":true,"summarySection":{"included":true,"collapsible":true},"comment":"Greptile AI review — flags all issues incl. nits; author triages.","labels":["greptile"]}
