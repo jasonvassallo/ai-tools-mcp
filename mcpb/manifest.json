@@ -63,7 +63,7 @@
     "ollama_models": {
       "type": "string",
       "title": "Ollama model allowlist",
-      "description": "Comma-separated model tags local_delegate may use; first entry is the default model. Leave blank for the built-in qwen3.6 tags. On constrained machines set e.g. 'qwen2.5-coder:14b,qwen3.6:35b-a3b-coding-nvfp4' so small tasks run locally and qwen requests fall through to the remote chain.",
+      "description": "Comma-separated model tags local_delegate may use; first entry is the default model. Leave blank for the built-in tags (default gemma4:12b-nvfp4, then the qwen3.6 tags). On constrained machines set e.g. 'qwen2.5-coder:14b,qwen3.6:35b-a3b-coding-nvfp4' so small tasks run locally and qwen requests fall through to the remote chain.",
       "required": false,
       "default": ""
     }
@@ -95,7 +95,7 @@
     },
     {
       "name": "local_delegate",
-      "description": "Delegate a task to the local Ollama qwen3.6 coding model via a local-first endpoint chain \u2014 input stays on your own machines: on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API (synchronous by default, or background=true returns a job_id)."
+      "description": "Delegate a task to a local Ollama model (default gemma4:12b-nvfp4) via a local-first endpoint chain \u2014 input stays on your own machines: on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API (synchronous by default, or background=true returns a job_id)."
     },
     {
       "name": "local_delegate_result",

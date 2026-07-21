@@ -37,8 +37,8 @@ MCP server providing five families of tools:
   Google's hosted research agent. Asynchronous: ``_start`` returns an
   interaction_id; poll ``_result`` until terminal status.
 - ``local_delegate`` / ``local_delegate_result``: local-first Ollama
-  delegation — send a task to the qwen3.6 coding model (native
-  /api/chat, think off by default) via an ordered endpoint chain:
+  delegation — send a task to a local model (native /api/chat, think
+  off by default) via an ordered endpoint chain:
   localhost first, then the user's own Cloudflare-Access-gated
   remote. Input text never leaves the user's machines; background
   jobs are in-memory and single-collect.
@@ -1306,10 +1306,31 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 #
 # Native /api/chat (not the OpenAI-compat endpoint) because only the
 # native API accepts `think` — qwen3.6 is a thinking model and
-# think:false is required for fast structured work.
-
+# think:false is required for fast structured work. gemma4 is not a
+# thinking model; it ignores the flag.
+#
+# Default is gemma4:12b-nvfp4. Measured 2026-07-20 over a 16-task machine-graded
+# delegate benchmark (3 trials, the no-options/default-temperature regime
+# this tool actually sends):
+#
+#   gemma4:12b-nvfp4   mean 0.917    0% cross-task contamination
+#   qwen3.6 35B  mean 0.732   20% cross-task contamination
+#
+# "Cross-task contamination" = the model returns the completion belonging
+# to a DIFFERENT recently-seen prompt. It is 0% on a prompt's first call and
+# ~25% on repeat calls, so it hits exactly the short, structurally-similar
+# codegen/transform prompts this tool is used for. Pinning temperature 0 cuts
+# it to 6% but does NOT recover the score (0.733) — the failures just become
+# deterministic, which is why the default is a model change and not an
+# options change. Suspected serving-side cause (unproven):
+# OLLAMA_KV_CACHE_TYPE=q8_0 with OLLAMA_KEEP_ALIVE=-1.
+#
+# The qwen tags remain selectable and are still the better pick for
+# long-context code work; neither model can be trusted to count or aggregate
+# over long inputs (both scored 0.33 on that task).
 _OLLAMA_MODELS_ENV_VAR = "AI_TOOLS_OLLAMA_MODELS"
 _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
+    "gemma4:12b-nvfp4",
     "qwen3.6:35b-a3b-coding-nvfp4",
     "qwen3.6:35b-a3b-coding-nvfp4-32k",
     "qwen3.6:35b-a3b-coding-nvfp4-256k",
@@ -1321,7 +1342,7 @@ def _resolve_delegate_models() -> tuple[str, ...]:
 
     Comma-separated, order-preserving, deduplicated; the first entry becomes
     the default model. Blank or effectively-empty values fall back to the
-    built-in qwen tags (fail closed — a typo'd setting cannot yield an empty
+    built-in tags (fail closed — a typo'd setting cannot yield an empty
     allowlist that rejects everything).
     """
     raw = os.environ.get(_OLLAMA_MODELS_ENV_VAR, "").strip()
@@ -1978,7 +1999,7 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="local_delegate",
             description=(
-                "Delegate a task to the LOCAL Ollama qwen3.6 coding model — "
+                "Delegate a task to a LOCAL Ollama model — "
                 "input text never leaves the machine (unlike every research "
                 "tool here, which calls hosted APIs). Use for: private/"
                 "sensitive text that must stay on-device; cheap mechanical "
@@ -2009,13 +2030,22 @@ async def list_tools() -> list[Tool]:
                         "enum": list(OLLAMA_DELEGATE_MODELS),
                         "default": _delegate_default_model(),
                         "description": (
-                            "Server-side allowlist. The default (base tag) "
-                            "inherits each serving host's context window "
-                            "(64k on JVMBPro, 32k on jvmacmini); -32k/-256k "
-                            "pin explicit windows (-256k = several GB of KV "
-                            "cache, JVMBPro only). The endpoint chain is "
-                            "probed per call; the first endpoint serving "
-                            "the tag wins."
+                            "Server-side allowlist; the authoritative default "
+                            "is the `default` field above (it follows the "
+                            "allowlist's first entry, which AI_TOOLS_OLLAMA_"
+                            "MODELS can override per machine). Out of the box "
+                            "that is gemma4:12b-nvfp4 — it outscored the qwen tags "
+                            "on mechanical delegate work (0.92 vs 0.73) and is "
+                            "the safer pick for short repeated prompts. Prefer "
+                            "a qwen tag for "
+                            "long-context code work. Neither is reliable at "
+                            "counting or aggregating over long inputs. The "
+                            "qwen base tag inherits each serving host's "
+                            "context window (64k on JVMBPro, 32k on "
+                            "jvmacmini); -32k/-256k pin explicit windows "
+                            "(-256k = several GB of KV cache, JVMBPro only). "
+                            "The endpoint chain is probed per call; the first "
+                            "endpoint serving the tag wins."
                         ),
                     },
                     "think": {
@@ -2023,7 +2053,12 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                         "description": (
                             "Enable the model's thinking mode. Off by default "
-                            "for speed; enable for reasoning-heavy asks."
+                            "for speed; enable for reasoning-heavy asks. Only "
+                            "the qwen3.6 tags think — gemma4:12b-nvfp4 "
+                            "ignores this flag, so pass a qwen tag as well if "
+                            "you actually need reasoning. Note qwen thinking "
+                            "can consume the whole output budget on large "
+                            "inputs and return no answer at all."
                         ),
                     },
                     "background": {
