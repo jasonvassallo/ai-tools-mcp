@@ -71,9 +71,15 @@ def call(model: str, system: str, prompt: str, think: bool, timeout: int = 600):
                 headers={"Content-Type": "application/json"},
             )
             t0 = time.monotonic()
-            # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
-            with urllib.request.urlopen(req2, timeout=timeout) as resp:
-                payload = json.loads(resp.read())
+            try:
+                # nosemgrep: python.lang.security.audit.dynamic-urllib-use-detected.dynamic-urllib-use-detected
+                with urllib.request.urlopen(req2, timeout=timeout) as resp:
+                    payload = json.loads(resp.read())
+            except Exception as retry_exc:  # noqa: BLE001 - harness must not die (Gemini)
+                return {
+                    "error": f"retry failed: {type(retry_exc).__name__}: {retry_exc}",
+                    "wall_s": round(time.monotonic() - t0, 2),
+                }
         else:
             return {
                 "error": f"HTTP {exc.code}: {detail}",
@@ -117,8 +123,14 @@ def main():
             for trial in range(1, n + 1):
                 jobs.append((t, arm, model, think, trial))
 
-    # Interleave arms so drift over the run hits every arm equally.
-    jobs.sort(key=lambda j: (j[4], j[0]["id"], j[1]))
+    # Group by (trial, arm) then task: within a trial each arm sweeps every
+    # task before the next arm starts. The previous (trial, task, arm) order
+    # ran qwen-think immediately after qwen-nothink ON THE SAME PROMPT, so
+    # the think arm always enjoyed a warm prefix cache and its latency read
+    # artificially low (Codex). Arm-major ordering removes same-prompt
+    # adjacency while still interleaving arms across the run at trial
+    # granularity for drift fairness.
+    jobs.sort(key=lambda j: (j[4], j[1], j[0]["id"]))
 
     total = len(jobs)
     print(f"[harness] {len(tasks)} tasks, {total} calls, sequential", flush=True)

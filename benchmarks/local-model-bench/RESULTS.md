@@ -1,5 +1,23 @@
 # Results — 2026-07-19/20, JVMBPro
 
+> **Harness v2 note (2026-07-21):** PR review (Codex 8 findings, Gemini 6)
+> tightened the graders and corpus after these figures were recorded —
+> stricter pytest/redaction/shell/regex grading, a D03 field the grader had
+> omitted, a discriminative trap field in E03, contamination-signature
+> coverage 8→14 tasks, and a behavioral canary. The numbers below are from
+> the archived v1 harness (`~/Documents/security-audits/model-bench-2026-07-19/`)
+> and are NOT directly comparable with v2 re-runs — expect v2 absolute
+> scores to read slightly lower for both models; the comparative deltas and
+> failure modes are the durable findings.
+>
+> **f16 addendum (2026-07-21):** the suspected q8_0-KV root cause was
+> tested and FALSIFIED — with `OLLAMA_KV_CACHE_TYPE=f16`, qwen still
+> contaminated 7/48 (0/16 trial 1, 3/16 and 4/16 on repeats), the same
+> repeat-call signature as q8_0's 20%. Cause remains unattributed
+> (mlx-engine prefix handling and KEEP_ALIVE=-1 are the remaining
+> suspects); the config was reverted to q8_0 and the model swap stands as
+> the only proven mitigation.
+
 **Environment:** Apple M5 Pro, 64 GB. Ollama 0.31.1 (`--mlx-engine`), both
 models VRAM-resident. Serving env: `OLLAMA_KV_CACHE_TYPE=q8_0`,
 `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KEEP_ALIVE=-1`,

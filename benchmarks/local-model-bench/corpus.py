@@ -329,6 +329,9 @@ DELEGATE = [
             "service": "billing-api",
             "latency_ms": 4213,
         },
+        # message wording varies by model; require the key to exist rather
+        # than exact-matching free text (Codex P2: prompt/grader mismatch).
+        expect_keys=["message"],
     ),
     D(
         "D02",
@@ -370,6 +373,8 @@ DELEGATE = [
             "API_PORT": 8443,
             "RETRY_BUDGET": "5",
             "FEATURE_FLAGS": "a,b,c",
+            # was missing — a model mishandling DEBUG went ungraded (Gemini).
+            "DEBUG": "false",
         },
     ),
     D(

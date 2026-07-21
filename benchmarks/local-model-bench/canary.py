@@ -23,8 +23,29 @@ SYSTEM = "You output a single Python code block and nothing else."
 
 
 def ok(text: str) -> bool:
+    """Execute the candidate and check behavior (Codex+Gemini): substring
+    matching flagged stylistic variants (`return b + a`, intermediate
+    variables) as degradation events."""
+    import subprocess
+    import sys
+    import tempfile
+
     t = text.replace("```python", "").replace("```", "")
-    return "def add_two" in t and ("a + b" in t or "a+b" in t)
+    prog = t + "\nassert add_two(2, 3) == 5\nassert add_two(-1, 1) == 0\nprint('OK')\n"
+    with tempfile.TemporaryDirectory() as td:
+        f = pathlib.Path(td) / "cand.py"
+        f.write_text(prog)
+        try:
+            r = subprocess.run(
+                [sys.executable, str(f)],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                cwd=td,
+            )
+        except subprocess.TimeoutExpired:
+            return False
+    return r.returncode == 0 and r.stdout.strip().endswith("OK")
 
 
 def main():

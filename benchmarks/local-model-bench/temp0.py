@@ -30,12 +30,24 @@ QWEN = "qwen3.6:35b-a3b-coding-nvfp4"
 GEMMA = "gemma4:12b-nvfp4"
 
 SIG = {
+    # One distinctive artefact of each task's CORRECT answer. Coverage is
+    # every delegate task except D04/E07 (bullet summaries with no reliably
+    # unique token) and D06 (its correct output is a strict shape-subset of
+    # E05's, so every candidate signature also appears in a correct E05
+    # answer — a false-positive source, caught in review). Previously only
+    # 8 of 16 were covered, so contamination into the uncovered half went
+    # undetected (Codex).
+    "D01": ['"timestamp"'],
     "D02": ["chunk_ranges"],
-    "D05": ["#!/usr/bin/env bash"],
+    "D03": ["API_HOST"],
+    "D05": ["#!/usr/bin/env bash", "#!/bin/bash"],
+    "D07": ['"pattern"'],
     "D08": ["redact_secrets"],
+    "E01": ['"total_lines"'],
     "E02": ["compare_semver"],
     "E03": ["TIMESTAMPTZ"],
     "E04": ["parse_port"],
+    "E05": ["aws_access_key_id"],
     "E06": ["parse_hunk_header"],
     "E08": ["merge_ranges"],
 }

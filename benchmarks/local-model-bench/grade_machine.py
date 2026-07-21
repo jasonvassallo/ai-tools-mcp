@@ -68,7 +68,9 @@ def run_python(source: str, checks: list[str], timeout: int = 20):
             )
         except subprocess.TimeoutExpired:
             return False, "timeout"
-    if "ALL_OK" in r.stdout:
+    # returncode gate (Codex): a solution that prints the sentinel and then
+    # crashes — or emits it from its own code — must not pass.
+    if r.returncode == 0 and r.stdout.strip().endswith("ALL_OK"):
         return True, ""
     err = (r.stderr or r.stdout).strip().splitlines()
     return False, (err[-1] if err else "no output")[:200]
@@ -84,15 +86,29 @@ def g_json_schema(task, text):
     if not isinstance(obj, dict):
         return 0.0, "not a JSON object"
     exp = task["expect"]
+    # presence-only keys: free-text fields the prompt demands but whose
+    # exact wording varies by model (Codex: grade existence, not phrasing).
+    presence = task.get("expect_keys", [])
     hits, misses = 0, []
     for k, v in exp.items():
         got = obj.get(k)
+        # JSON booleans normalize to their JSON spelling so a model output
+        # of `false` matches an expected "false" (review: D03 would have
+        # rejected the boolean while accepting the number for API_PORT).
+        if isinstance(got, bool):
+            got = "true" if got else "false"
         ok = (str(got).strip() == str(v).strip()) if got is not None else False
         if ok:
             hits += 1
         else:
             misses.append(f"{k}={got!r}!={v!r}")
-    return hits / len(exp), "; ".join(misses)
+    for k in presence:
+        if k in obj and str(obj.get(k)).strip():
+            hits += 1
+        else:
+            misses.append(f"{k}=<missing>")
+    total = len(exp) + len(presence)
+    return hits / total, "; ".join(misses)
 
 
 def g_pytest(task, text):
@@ -156,7 +172,12 @@ def g_shellcheck(task, text):
                 timeout=20,
                 cwd=td,
             )
-            behaves = r2.returncode == 0 and "3" in r2.stdout
+            # exact final-line match (Codex+Gemini): "13", "30", or an
+            # error message containing a 3 must not pass.
+            out_lines = [x for x in r2.stdout.strip().splitlines() if x.strip()]
+            behaves = (
+                r2.returncode == 0 and bool(out_lines) and out_lines[-1].strip() == "3"
+            )
             r3 = subprocess.run(
                 ["bash", str(p)], capture_output=True, text=True, timeout=20, cwd=td
             )
@@ -183,16 +204,23 @@ def g_shellcheck(task, text):
 
 
 def g_redact(task, text):
-    leaked = [s for s in task["secrets"] if s in text]
+    leaked = [x for x in task["secrets"] if x in text]
     dropped = [k for k in task["keep"] if k not in text]
+    # Deleting secret-bearing lines wholesale used to grade as a perfect
+    # redaction (Codex). The instruction is substitution: REDACTED must
+    # appear at least once per secret.
+    missing_sub = max(0, len(task["secrets"]) - text.count("REDACTED"))
     score = 0.0
-    score += 0.6 * (1 - len(leaked) / len(task["secrets"]))
-    score += 0.4 * (1 - len(dropped) / len(task["keep"]))
+    score += 0.5 * (1 - len(leaked) / len(task["secrets"]))
+    score += 0.3 * (1 - len(dropped) / len(task["keep"]))
+    score += 0.2 * (1 - missing_sub / len(task["secrets"]))
     notes = []
     if leaked:
         notes.append(f"LEAKED {len(leaked)} secret(s)")
     if dropped:
         notes.append(f"dropped non-secret: {dropped}")
+    if missing_sub:
+        notes.append(f"{missing_sub} secret(s) deleted instead of REDACTED")
     return score, "; ".join(notes)
 
 
@@ -208,8 +236,10 @@ def g_regex(task, text):
         rx = re.compile(pat)
     except re.error as exc:
         return 0.0, f"invalid regex: {exc}"
-    good = sum(1 for s in task["match"] if rx.fullmatch(s) or rx.match(s))
-    bad = sum(1 for s in task["nomatch"] if rx.fullmatch(s) or rx.match(s))
+    # fullmatch only (Gemini): the spec demands whole-string anchoring; the
+    # old `or rx.match` fallback silently accepted unanchored patterns.
+    good = sum(1 for x in task["match"] if rx.fullmatch(x))
+    bad = sum(1 for x in task["nomatch"] if rx.fullmatch(x))
     total = len(task["match"]) + len(task["nomatch"])
     score = (good + (len(task["nomatch"]) - bad)) / total
     notes = []
@@ -218,6 +248,20 @@ def g_regex(task, text):
     if bad:
         notes.append(f"wrongly matched {bad} must-NOT-match")
     return score, "; ".join(notes)
+
+
+def _body_statement_count(src: str, func_name: str):
+    """Statement count of `func_name`'s body, or None if unparseable."""
+    import ast
+
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            return len(node.body)
+    return None
 
 
 def g_forbid(task, text):
@@ -233,6 +277,17 @@ def g_forbid(task, text):
         notes.append(f"missing {missing}")
     if violated:
         notes.append(f"VIOLATED ban: {violated}")
+    # Structural check (Codex): the ban list alone never enforced the
+    # "body must be exactly one statement" constraint.
+    fn = task.get("one_line_func")
+    if fn:
+        n = _body_statement_count(src, fn)
+        if n is None:
+            score *= 0.5
+            notes.append("unparseable for one-line check")
+        elif n != 1:
+            score *= 0.5
+            notes.append(f"body has {n} statements, constraint says 1")
     return score, "; ".join(notes)
 
 

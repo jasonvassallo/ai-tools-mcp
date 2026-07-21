@@ -55,6 +55,11 @@ BULK = [
     ("bio", "string"),
     ("is_verified", "bool"),
     ("referrer_id", "uuid"),
+    # Trap: name ends in _at but stated type is int. Without it, a model that
+    # ignored the exception rule entirely still scored 100% because every _at
+    # field already happened to be a timestamp (Gemini). CORPUS v2 — E03
+    # scores are not comparable with runs before 2026-07-21.
+    ("archived_at", "int"),
 ]
 # rule: SQL type per logical type, EXCEPT any name ending in _at -> TIMESTAMPTZ
 SQLMAP = {
@@ -182,6 +187,8 @@ TIER2 = [
         ),
         must_not=["try:", "except", "raise", "assert", '"""', "if ", "logging"],
         must=["def parse_port", "int("],
+        # structural enforcement of the one-line constraint (Codex)
+        one_line_func="parse_port",
     ),
     D(
         "E05",
