@@ -769,6 +769,114 @@ class TestSelectOllamaEndpoint(unittest.TestCase):
         self.assertEqual(self._select(client), self.EP2)
 
 
+class TestThinkingModelAdvisory(unittest.TestCase):
+    """think=true on a non-thinking model must not pass silently.
+
+    Ollama drops the flag without erroring, so a caller that forgets to also
+    set model= would otherwise get a plainly-generated answer that looks
+    reasoned. This became reachable by default when gemma4 became the default.
+    """
+
+    def test_qwen_tags_are_thinking_models(self):
+        for tag in (
+            "qwen3.6:35b-a3b-coding-nvfp4",
+            "qwen3.6:35b-a3b-coding-nvfp4-32k",
+            "qwen3.6:35b-a3b-coding-nvfp4-256k",
+        ):
+            self.assertTrue(mcp_server._is_thinking_model(tag), tag)
+
+    def test_gemma_is_not_a_thinking_model(self):
+        self.assertFalse(mcp_server._is_thinking_model("gemma4:12b-nvfp4"))
+
+    def test_unknown_tag_treated_as_non_thinking(self):
+        # Fail toward advising rather than silently dropping the flag.
+        self.assertFalse(mcp_server._is_thinking_model("llama9:70b"))
+
+    def test_prefix_is_prepended_to_answer(self):
+        out = mcp_server._render_delegate_answer(
+            {"model": "gemma4:12b-nvfp4", "message": {"content": "answer"}},
+            prefix="Note: think=true was ignored.\n\n",
+        )
+        self.assertTrue(out[0].text.startswith("Note: think=true was ignored."))
+        self.assertIn("answer", out[0].text)
+
+    def test_prefix_absent_by_default(self):
+        out = mcp_server._render_delegate_answer(
+            {"model": "gemma4:12b-nvfp4", "message": {"content": "answer"}}
+        )
+        self.assertTrue(out[0].text.startswith("## Local Delegate"))
+
+    def test_sync_path_note_reaches_rendered_answer(self):
+        """End-to-end: think=true on the default model surfaces the advisory.
+
+        Closes the join between building think_note and _render_delegate_answer
+        applying it — each half was covered, the pass-through was not.
+        """
+        fake = mock.AsyncMock(
+            return_value={"model": "gemma4:12b-nvfp4", "message": {"content": "ok"}}
+        )
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            out = _call("local_delegate", {"prompt": "hi", "think": True})
+        self.assertTrue(out[0].text.startswith("Note: think=true was ignored"))
+        self.assertIn("ok", out[0].text)
+        self.assertIn("## Local Delegate", out[0].text)
+
+    def test_sync_path_no_note_for_thinking_model(self):
+        fake = mock.AsyncMock(
+            return_value={
+                "model": "qwen3.6:35b-a3b-coding-nvfp4",
+                "message": {"content": "ok"},
+            }
+        )
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            out = _call(
+                "local_delegate",
+                {
+                    "prompt": "hi",
+                    "think": True,
+                    "model": "qwen3.6:35b-a3b-coding-nvfp4",
+                },
+            )
+        self.assertTrue(out[0].text.startswith("## Local Delegate"))
+        self.assertNotIn("was ignored", out[0].text)
+
+    def test_background_envelope_stays_parseable_json(self):
+        """The advisory must not break json.loads on the background envelope."""
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            started = _call(
+                "local_delegate",
+                {"prompt": "hi", "think": True, "background": True},
+            )
+        env = json.loads(started[0].text)  # must not raise
+        self.assertIn("job_id", env)
+        self.assertEqual(env["status"], "started")
+        self.assertIn("think=true was ignored", env["warning"])
+
+    def test_background_envelope_has_no_warning_key_when_not_needed(self):
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            started = _call(
+                "local_delegate",
+                {
+                    "prompt": "hi",
+                    "think": True,
+                    "background": True,
+                    "model": "qwen3.6:35b-a3b-coding-nvfp4",
+                },
+            )
+        env = json.loads(started[0].text)
+        self.assertNotIn("warning", env)
+
+    def test_error_returns_are_not_prefixed(self):
+        # Callers may pattern-match the "Error:" shape; keep it unpolluted.
+        out = mcp_server._render_delegate_answer(
+            {"status": "failed", "error": "boom"}, prefix="Note: ignored.\n\n"
+        )
+        self.assertTrue(out[0].text.startswith("Error"))
+        self.assertNotIn("Note:", out[0].text)
+
+
 class TestRenderDelegateAnswer(unittest.TestCase):
     def test_happy_path(self):
         out = mcp_server._render_delegate_answer(

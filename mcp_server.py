@@ -1337,6 +1337,19 @@ _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
 )
 
 
+_THINKING_MODEL_PREFIXES: tuple[str, ...] = ("qwen3.6:",)
+
+
+def _is_thinking_model(model: str) -> bool:
+    """Whether `model` honors the native API's `think` flag.
+
+    Allowlist-shaped on purpose: an unrecognized tag is treated as
+    non-thinking, so a new model silently ignoring `think` produces an
+    advisory rather than a confidently non-reasoned answer.
+    """
+    return model.startswith(_THINKING_MODEL_PREFIXES)
+
+
 def _resolve_delegate_models() -> tuple[str, ...]:
     """v1.2 (issue #20): allowlist overridable per machine via env/user_config.
 
@@ -1654,13 +1667,20 @@ async def _post_ollama_chat(
         }
 
 
-def _render_delegate_answer(data: dict[str, Any]) -> list[TextContent]:
+def _render_delegate_answer(
+    data: dict[str, Any], prefix: str = ""
+) -> list[TextContent]:
     """Render an Ollama /api/chat response (or failure envelope) as MCP text.
 
     message.thinking is deliberately discarded — the caller needs the
     answer, not the model's scratchpad. Output passes through
     redact_secrets for the same never-emit-secret-shapes contract as
     every other family.
+
+    `prefix` carries caller advisories (e.g. a dropped `think` flag). It is
+    server-authored, never model output, so it is emitted verbatim ahead of
+    the answer — and deliberately not prepended to error returns, which have
+    their own shape callers may match on.
     """
     if data.get("status") == "failed":
         return [
@@ -1677,7 +1697,7 @@ def _render_delegate_answer(data: dict[str, Any]) -> list[TextContent]:
     return [
         TextContent(
             type="text",
-            text=f"## Local Delegate ({model})\n\n{redact_secrets(content)}",
+            text=f"{prefix}## Local Delegate ({model})\n\n{redact_secrets(content)}",
         )
     ]
 
@@ -2605,6 +2625,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [
                 TextContent(type="text", text="Error: think must be a JSON boolean.")
             ]
+        # think=true on a non-thinking model is silently dropped by Ollama. That
+        # became reachable by default when the default model stopped being a
+        # qwen tag, so say so rather than returning a non-reasoned answer that
+        # looks like a reasoned one. Advisory, not an error: the call is still
+        # valid and the answer is still useful.
+        think_note = (
+            f"Note: think=true was ignored — {model} is not a thinking model. "
+            f"Pass a qwen3.6 tag as `model` if you need reasoning.\n\n"
+            if think and not _is_thinking_model(model)
+            else ""
+        )
         background = arguments.get("background", False)
         if not isinstance(background, bool):
             return [
@@ -2660,15 +2691,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 job_id = _start_delegate_job(payload)
             except ValueError as exc:
                 return [TextContent(type="text", text=f"Error: {exc}")]
+            # Carried as a JSON field, NOT prepended: this envelope is
+            # json.loads()-ed by callers, so a bare prefix would break parsing.
+            envelope = {"job_id": job_id, "status": "started"}
+            if think_note:
+                envelope["warning"] = think_note.strip()
             return [
                 TextContent(
                     type="text",
-                    text=json.dumps({"job_id": job_id, "status": "started"}),
+                    text=json.dumps(envelope),
                 )
             ]
 
         data = await _post_ollama_chat(payload, float(timeout_s))
-        return _render_delegate_answer(data)
+        return _render_delegate_answer(data, prefix=think_note)
 
     if name == "local_delegate_result":
         try:
