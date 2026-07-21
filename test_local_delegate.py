@@ -459,6 +459,22 @@ class TestPostOllamaChat(unittest.TestCase):
         self.assertIn("LaunchAgent", out["error"])
         self.assertIn("http://localhost:11434", out["error"])
 
+    def test_connect_error_invalidates_implicit_resolution_cache(self):
+        # Codex P2 (PR #32): the implicit cache pins (model, endpoint) pairs;
+        # a dead endpoint must evict it too, or omitted-model calls keep
+        # resolving to the corpse for up to a TTL.
+        mcp_server._implicit_resolution_cache["gemma4:12b-nvfp4"] = (
+            "qwen3.6:35b-a3b-coding-nvfp4",
+            "http://localhost:11434",
+            "Note: substituted.\n\n",
+            mcp_server.time.monotonic() + 60,
+        )
+        client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
+        with self._with_selection():
+            out = self._post(client)
+        self.assertEqual(out["status"], "failed")
+        self.assertEqual(mcp_server._implicit_resolution_cache, {})
+
     def test_404_adds_pull_hint(self):
         client = _FakeClient(
             response=_FakeResponse(status_code=404, text="model not found")
@@ -769,6 +785,315 @@ class TestSelectOllamaEndpoint(unittest.TestCase):
         self.assertEqual(self._select(client), self.EP2)
 
 
+class _FakeShowClient(_FakeTagsClient):
+    """_FakeTagsClient plus a programmable /api/show for capability reads."""
+
+    def __init__(self, caps_by_model=None, show_exc=None, **kw):
+        super().__init__(**kw)
+        self.caps_by_model = caps_by_model or {}
+        self.show_exc = show_exc
+        self.post_calls: list = []
+
+    async def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        if self.show_exc is not None:
+            raise self.show_exc
+        model = (kwargs.get("json") or {}).get("model", "")
+        caps = self.caps_by_model.get(model)
+        if caps is None:
+            return _FakeResponse(json_data={})  # old Ollama: no capabilities key
+        return _FakeResponse(json_data={"capabilities": list(caps)})
+
+
+class TestResolveImplicitModel(unittest.TestCase):
+    EP1 = "http://localhost:11434"
+    EP2 = "http://127.0.0.1:11435"
+    DEFAULT = "gemma4:12b-nvfp4"
+    QWEN = "qwen3.6:35b-a3b-coding-nvfp4"
+
+    def setUp(self):
+        mcp_server._ollama_endpoint_cache.clear()
+        mcp_server._implicit_resolution_cache.clear()
+        env = mock.patch.dict(
+            os.environ,
+            {
+                "AI_TOOLS_OLLAMA_URLS": f"{self.EP1},{self.EP2}",
+                "AI_TOOLS_OLLAMA_URL": "",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        kc = mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", side_effect=_no_keychain
+        )
+        kc.start()
+        self.addCleanup(kc.stop)
+
+    def _resolve(self, client):
+        with mock.patch.object(
+            mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+        ):
+            return asyncio.run(mcp_server._resolve_implicit_model())
+
+    def test_default_served_locally_no_note(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [self.DEFAULT, self.QWEN]})
+        model, endpoint, note = self._resolve(client)
+        self.assertEqual((model, endpoint, note), (self.DEFAULT, self.EP1, ""))
+
+    def test_local_qwen_beats_remote_default(self):
+        # The CWE-200 case from PR #32 review: gemma only remote, qwen local.
+        # A local option must win so the prompt never leaves the machine.
+        client = _FakeTagsClient(
+            tags_by_url={self.EP1: [self.QWEN], self.EP2: [self.DEFAULT]}
+        )
+        model, endpoint, note = self._resolve(client)
+        self.assertEqual(model, self.QWEN)
+        self.assertEqual(endpoint, self.EP1)
+        self.assertIn("default model gemma4:12b-nvfp4 is not served", note)
+
+    def test_falls_through_to_later_endpoint(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [], self.EP2: [self.QWEN]})
+        model, endpoint, note = self._resolve(client)
+        self.assertEqual((model, endpoint), (self.QWEN, self.EP2))
+        self.assertIn("using qwen3.6:35b-a3b-coding-nvfp4", note)
+
+    def test_nothing_served_anywhere_raises(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [], self.EP2: []})
+        with self.assertRaises(ValueError) as ctx:
+            self._resolve(client)
+        self.assertIn("any allowlisted model", str(ctx.exception))
+
+    def test_resolution_is_cached(self):
+        client = _FakeTagsClient(tags_by_url={self.EP1: [self.DEFAULT]})
+        self._resolve(client)
+        first = len(client.get_calls)
+        self._resolve(client)
+        self.assertEqual(len(client.get_calls), first)  # served from cache
+
+
+class TestModelCapabilities(unittest.TestCase):
+    EP = "http://localhost:11434"
+
+    def setUp(self):
+        mcp_server._ollama_capability_cache.clear()
+        kc = mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", side_effect=_no_keychain
+        )
+        kc.start()
+        self.addCleanup(kc.stop)
+
+    def _caps(self, client, model="gemma4:12b-nvfp4"):
+        with mock.patch.object(
+            mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+        ):
+            return asyncio.run(mcp_server._model_capabilities(self.EP, model))
+
+    def test_reports_capabilities(self):
+        client = _FakeShowClient(
+            caps_by_model={"gemma4:12b-nvfp4": ["completion", "tools", "thinking"]}
+        )
+        self.assertEqual(
+            self._caps(client), frozenset({"completion", "tools", "thinking"})
+        )
+
+    def test_missing_capabilities_key_is_none(self):
+        client = _FakeShowClient()  # /api/show returns {} (older Ollama)
+        self.assertIsNone(self._caps(client))
+
+    def test_transport_error_is_none(self):
+        client = _FakeShowClient(show_exc=mcp_server.httpx.ConnectError("refused"))
+        self.assertIsNone(self._caps(client))
+
+    def test_result_is_cached(self):
+        client = _FakeShowClient(caps_by_model={"gemma4:12b-nvfp4": ["thinking"]})
+        self._caps(client)
+        self._caps(client)
+        self.assertEqual(len(client.post_calls), 1)
+
+
+class TestThinkingModelAdvisory(unittest.TestCase):
+    """Capability-driven `think` handling, measured — not assumed.
+
+    2026-07-20: an earlier version hardcoded qwen-only thinking and shipped
+    the claim "gemma4 is not a thinking model". /api/show says otherwise —
+    BOTH built-in defaults report the 'thinking' capability. These tests pin
+    the corrected behavior: capabilities come from the endpoint, a
+    non-thinking tag gets `think` stripped plus an advisory (never Ollama's
+    hard 400), and an indeterminate read changes nothing.
+    """
+
+    THINKING = frozenset({"completion", "tools", "thinking"})
+    NO_THINKING = frozenset({"completion", "tools"})
+
+    @staticmethod
+    def _env(caps, resolved="gemma4:12b-nvfp4", note=""):
+        """Patch endpoint resolution + capability lookup for one call."""
+        ep = "http://127.0.0.1:11434"
+        return (
+            mock.patch.object(
+                mcp_server,
+                "_resolve_implicit_model",
+                mock.AsyncMock(return_value=(resolved, ep, note)),
+            ),
+            mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value=ep),
+            ),
+            mock.patch.object(
+                mcp_server,
+                "_model_capabilities",
+                mock.AsyncMock(return_value=caps),
+            ),
+        )
+
+    def _delegate(self, args, caps, post=None, resolved="gemma4:12b-nvfp4", note=""):
+        fake = post or mock.AsyncMock(
+            return_value={"model": resolved, "message": {"content": "ok"}}
+        )
+        r1, r2, r3 = self._env(caps, resolved=resolved, note=note)
+        with r1, r2, r3, mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            out = _call("local_delegate", args)
+        return out, fake
+
+    def test_thinking_capable_default_passes_think_through(self):
+        # Regression pin for the shipped bug: gemma4 DOES think; think=true
+        # on the default must produce NO advisory and stay in the payload.
+        out, fake = self._delegate({"prompt": "hi", "think": True}, self.THINKING)
+        self.assertTrue(out[0].text.startswith("## Local Delegate"))
+        self.assertNotIn("Note:", out[0].text)
+        payload, _ = fake.call_args.args
+        self.assertIs(payload["think"], True)
+
+    def test_non_thinking_model_strips_flag_and_advises(self):
+        out, fake = self._delegate(
+            {"prompt": "hi", "think": True, "model": "gemma4:12b-nvfp4"},
+            self.NO_THINKING,
+        )
+        self.assertTrue(out[0].text.startswith("Note: think=true was disabled"))
+        self.assertIn("## Local Delegate", out[0].text)
+        payload, _ = fake.call_args.args
+        self.assertIs(payload["think"], False)
+
+    def test_indeterminate_capabilities_change_nothing(self):
+        # /api/show unavailable → no advisory, payload untouched (fail
+        # neutral; a wrong "flag ignored" note is worse than Ollama's error).
+        out, fake = self._delegate({"prompt": "hi", "think": True}, None)
+        self.assertNotIn("Note:", out[0].text)
+        payload, _ = fake.call_args.args
+        self.assertIs(payload["think"], True)
+
+    def test_think_false_never_consults_capabilities(self):
+        fake = mock.AsyncMock(
+            return_value={"model": "gemma4:12b-nvfp4", "message": {"content": "ok"}}
+        )
+        caps = mock.AsyncMock(return_value=self.THINKING)
+        r1, _, _ = self._env(self.THINKING)
+        with (
+            r1,
+            mock.patch.object(mcp_server, "_model_capabilities", caps),
+            mock.patch.object(mcp_server, "_post_ollama_chat", fake),
+        ):
+            _call("local_delegate", {"prompt": "hi"})
+        caps.assert_not_awaited()
+
+    def test_implicit_substitution_note_reaches_answer(self):
+        out, _ = self._delegate(
+            {"prompt": "hi"},
+            self.THINKING,
+            resolved="qwen3.6:35b-a3b-coding-nvfp4",
+            note="Note: default model gemma4:12b-nvfp4 is not served by any "
+            "reachable endpoint checked before localhost; using "
+            "qwen3.6:35b-a3b-coding-nvfp4 (localhost) instead.\n\n",
+        )
+        self.assertTrue(out[0].text.startswith("Note: default model"))
+        self.assertIn("## Local Delegate", out[0].text)
+
+    def test_explicit_model_bypasses_implicit_resolver(self):
+        fake = mock.AsyncMock(
+            return_value={"model": "gemma4:12b-nvfp4", "message": {"content": "ok"}}
+        )
+        resolver = mock.AsyncMock()
+        with (
+            mock.patch.object(mcp_server, "_resolve_implicit_model", resolver),
+            mock.patch.object(mcp_server, "_post_ollama_chat", fake),
+        ):
+            _call("local_delegate", {"prompt": "hi", "model": "gemma4:12b-nvfp4"})
+        resolver.assert_not_awaited()
+
+    def test_implicit_resolution_failure_is_an_error(self):
+        resolver = mock.AsyncMock(side_effect=ValueError("no endpoint serves"))
+        with mock.patch.object(mcp_server, "_resolve_implicit_model", resolver):
+            out = _call("local_delegate", {"prompt": "hi"})
+        self.assertTrue(out[0].text.startswith("Error:"))
+        self.assertIn("no endpoint serves", out[0].text)
+
+    def test_prefix_is_prepended_to_answer(self):
+        out = mcp_server._render_delegate_answer(
+            {"model": "gemma4:12b-nvfp4", "message": {"content": "answer"}},
+            prefix="Note: think=true was disabled.\n\n",
+        )
+        self.assertTrue(out[0].text.startswith("Note: think=true was disabled."))
+        self.assertIn("answer", out[0].text)
+
+    def test_prefix_absent_by_default(self):
+        out = mcp_server._render_delegate_answer(
+            {"model": "gemma4:12b-nvfp4", "message": {"content": "answer"}}
+        )
+        self.assertTrue(out[0].text.startswith("## Local Delegate"))
+
+    def test_both_advisories_compose(self):
+        # Substituted default AND a non-thinking resolved model: both notes
+        # must survive, implicit first, and the answer still renders.
+        note = (
+            "Note: default model gemma4:12b-nvfp4 is not served by any "
+            "reachable endpoint checked before localhost; using "
+            "qwen2.5-coder:14b (localhost) instead.\n\n"
+        )
+        out, fake = self._delegate(
+            {"prompt": "hi", "think": True},
+            self.NO_THINKING,
+            resolved="qwen3.6:35b-a3b-coding-nvfp4",
+            note=note,
+        )
+        text = out[0].text
+        self.assertTrue(text.startswith("Note: default model"))
+        self.assertIn("think=true was disabled", text)
+        self.assertLess(
+            text.index("default model"), text.index("think=true was disabled")
+        )
+        self.assertIn("## Local Delegate", text)
+        payload, _ = fake.call_args.args
+        self.assertIs(payload["think"], False)
+
+    def test_background_envelope_stays_parseable_json(self):
+        """Advisories ride as a JSON field, never a prefix, on this path."""
+        out, _ = self._delegate(
+            {"prompt": "hi", "think": True, "background": True},
+            self.NO_THINKING,
+            resolved="gemma4:12b-nvfp4",
+        )
+        env = json.loads(out[0].text)  # must not raise
+        self.assertIn("job_id", env)
+        self.assertEqual(env["status"], "started")
+        self.assertIn("think=true was disabled", env["warning"])
+
+    def test_background_envelope_has_no_warning_key_when_not_needed(self):
+        out, _ = self._delegate(
+            {"prompt": "hi", "think": True, "background": True}, self.THINKING
+        )
+        env = json.loads(out[0].text)
+        self.assertNotIn("warning", env)
+
+    def test_error_returns_are_not_prefixed(self):
+        # Callers may pattern-match the "Error:" shape; keep it unpolluted.
+        out = mcp_server._render_delegate_answer(
+            {"status": "failed", "error": "boom"}, prefix="Note: ignored.\n\n"
+        )
+        self.assertTrue(out[0].text.startswith("Error"))
+        self.assertNotIn("Note:", out[0].text)
+
+
 class TestRenderDelegateAnswer(unittest.TestCase):
     def test_happy_path(self):
         out = mcp_server._render_delegate_answer(
@@ -1015,7 +1340,34 @@ class TestLocalDelegateValidation(unittest.TestCase):
         self.assertIn("system", out[0].text)
 
 
+def _stub_resolution(case: unittest.TestCase, caps=frozenset({"thinking"})):
+    """Stub endpoint/capability resolution for handler-level delegate tests.
+
+    Without this, tests that omit `model` (or set think=true) would probe the
+    real endpoint chain — green on a dev box running Ollama, red in CI. The
+    stubs mirror the healthy-localhost case: default model resolves locally
+    with no advisory, capabilities report 'thinking'.
+    """
+    ep = "http://127.0.0.1:11434"
+    for target, repl in (
+        (
+            "_resolve_implicit_model",
+            mock.AsyncMock(
+                return_value=(mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL, ep, "")
+            ),
+        ),
+        ("_select_ollama_endpoint", mock.AsyncMock(return_value=ep)),
+        ("_model_capabilities", mock.AsyncMock(return_value=caps)),
+    ):
+        patcher = mock.patch.object(mcp_server, target, repl)
+        patcher.start()
+        case.addCleanup(patcher.stop)
+
+
 class TestLocalDelegateSync(unittest.TestCase):
+    def setUp(self):
+        _stub_resolution(self)
+
     def test_payload_construction_defaults(self):
         fake = mock.AsyncMock(return_value={"model": "m", "message": {"content": "ok"}})
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
@@ -1067,6 +1419,7 @@ class TestLocalDelegateSync(unittest.TestCase):
 class TestLocalDelegateBackground(unittest.TestCase):
     def setUp(self):
         mcp_server._delegate_jobs.clear()
+        _stub_resolution(self)
 
     def test_background_returns_job_id_then_result_collects(self):
         async def scenario():

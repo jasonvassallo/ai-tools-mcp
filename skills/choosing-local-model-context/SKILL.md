@@ -1,11 +1,18 @@
 ---
 name: choosing-local-model-context
-description: Pick the right qwen3.6 context-window tag (32k, 64k, or 256k) for a local_delegate call, and the host it implies. Use whenever calling local_delegate with anything other than a trivially small prompt, when a delegate call fails because the prompt exceeded the model window, when choosing the model param explicitly, or when deciding whether a task can run on the always-on 32k endpoint vs the laptop-only 256k one.
+description: Pick the right qwen3.6 context-window tag (32k, 64k, or 256k) for a local_delegate call, and the host it implies. Applies only when explicitly choosing a qwen tag — the tool-wide default is gemma4:12b-nvfp4. Use whenever calling local_delegate with anything other than a trivially small prompt, when a delegate call fails because the prompt exceeded the model window, when choosing the model param explicitly, or when deciding whether a task can run on the always-on 32k endpoint vs the laptop-only 256k one.
 ---
 
 # Choosing a Context Window for local_delegate
 
-One model (`qwen3.6:35b-a3b-coding-nvfp4`, 35B MoE, nvfp4) is served under
+**The default model is `gemma4:12b-nvfp4`, not qwen.** This skill is about the
+qwen tags, so it only applies once you've decided to pass `model=` explicitly.
+Reach for a qwen tag when the prompt is large or the work is genuinely
+code-heavy; leave the default alone for short mechanical tasks, where gemma
+scored better (0.92 vs 0.73) and never returned another prompt's answer.
+Neither model can be trusted to count or aggregate over long inputs.
+
+The qwen model (`qwen3.6:35b-a3b-coding-nvfp4`, 35B MoE, nvfp4) is served under
 three tags that differ **only** in max context window, and the endpoint chain
 means the tag you pick also decides **which machine can serve you**.
 
@@ -22,7 +29,7 @@ and **worst-case bounding on small machines**.
 
 | Tag | Window | Served by | Notes |
 |---|---|---|---|
-| `qwen3.6:35b-a3b-coding-nvfp4` (base) | host's default: **64k** on JVMBPro / **32k** on jvmacmini | localhost (JVMBPro), `ollama-mbp.djvassallo.com` (64k), `ollama.djvassallo.com` (jvmacmini, 32k, always-on) | Default. Window depends on which host answers. |
+| `qwen3.6:35b-a3b-coding-nvfp4` (base) | host's default: **64k** on JVMBPro / **32k** on jvmacmini | localhost (JVMBPro), `ollama-mbp.djvassallo.com` (64k), `ollama.djvassallo.com` (jvmacmini, 32k, always-on) | Default **qwen** tag (gemma4:12b-nvfp4 is the tool-wide default). Window depends on which host answers. |
 | `-32k` | 32,768 | JVMBPro only (tag exists there) | Rarely needed — prefer base. |
 | `-256k` | 262,144 | JVMBPro only (localhost or `ollama-mbp`) | **Kept warm/pinned on JVMBPro.** Not on the mini (32 GB — a full window would exceed the machine). |
 
