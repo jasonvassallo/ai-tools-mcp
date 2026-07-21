@@ -1337,6 +1337,7 @@ _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "gemma4:12b-nvfp4",
     "qwen3.6:35b-a3b-coding-nvfp4",
     "qwen3.6:35b-a3b-coding-nvfp4-32k",
+    "qwen3.6:35b-a3b-coding-nvfp4-64k",
     "qwen3.6:35b-a3b-coding-nvfp4-256k",
 )
 
