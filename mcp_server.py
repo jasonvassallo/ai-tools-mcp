@@ -1305,9 +1305,13 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # files, pulls models, or manages the Ollama service (least privilege).
 #
 # Native /api/chat (not the OpenAI-compat endpoint) because only the
-# native API accepts `think` — qwen3.6 is a thinking model and
-# think:false is required for fast structured work. gemma4 is not a
-# thinking model; it ignores the flag.
+# native API accepts `think` — and think:false is required for fast
+# structured work on thinking models. Whether a given tag can think is NOT
+# hardcoded here: it is read per call from the endpoint's /api/show
+# `capabilities` list (measured 2026-07-20: BOTH built-in defaults report
+# 'thinking' — an earlier comment claiming gemma4 does not was wrong, an
+# assertion that had never been tested). Non-thinking override tags get
+# `think` stripped plus an advisory instead of Ollama's hard 400.
 #
 # Default is gemma4:12b-nvfp4. Measured 2026-07-20 over a 16-task machine-graded
 # delegate benchmark (3 trials, the no-options/default-temperature regime
@@ -1335,19 +1339,6 @@ _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "qwen3.6:35b-a3b-coding-nvfp4-32k",
     "qwen3.6:35b-a3b-coding-nvfp4-256k",
 )
-
-
-_THINKING_MODEL_PREFIXES: tuple[str, ...] = ("qwen3.6:",)
-
-
-def _is_thinking_model(model: str) -> bool:
-    """Whether `model` honors the native API's `think` flag.
-
-    Allowlist-shaped on purpose: an unrecognized tag is treated as
-    non-thinking, so a new model silently ignoring `think` produces an
-    advisory rather than a confidently non-reasoned answer.
-    """
-    return model.startswith(_THINKING_MODEL_PREFIXES)
 
 
 def _resolve_delegate_models() -> tuple[str, ...]:
@@ -1536,6 +1527,55 @@ def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
 
 
 _ollama_endpoint_cache: dict[str, tuple[str, float]] = {}
+_implicit_resolution_cache: dict[str, tuple[str, str, str, float]] = {}
+_ollama_capability_cache: dict[tuple[str, str], tuple[frozenset[str], float]] = {}
+_OLLAMA_CAPABILITY_CACHE_TTL_S = 300.0
+
+
+async def _probe_endpoint_tags(endpoint: str, attempts: list[str]) -> list[str] | None:
+    """Model tags served by `endpoint`, or None with the reason in `attempts`.
+
+    Single shared probe for both selection paths so the auth handling and
+    its security rationale live in exactly one place.
+    """
+    headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+    if headers is None:
+        attempts.append(
+            f"{endpoint}: skipped (Cloudflare Access credentials not in "
+            "env or Keychain)"
+        )
+        return None
+    client = await _get_http_client()
+    try:
+        # Auth is server-sourced (CF Access service-token creds from env
+        # or Keychain via _ollama_auth_headers), never a caller-supplied
+        # credential. The endpoint comes from operator config (env /
+        # user_config / Keychain / built-in defaults), validated
+        # https-only for non-localhost with URL userinfo rejected — no
+        # tool parameter can redirect the credential to an attacker
+        # host. Same false-positive class as the PR #15 suppressions.
+        response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+            f"{endpoint}/api/tags",
+            headers=headers,
+            timeout=_OLLAMA_PROBE_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except httpx.HTTPStatusError as exc:
+        attempts.append(f"{endpoint}: HTTP {exc.response.status_code}")
+        return None
+    except httpx.RequestError:
+        attempts.append(f"{endpoint}: unreachable")
+        return None
+    except ValueError:
+        attempts.append(f"{endpoint}: invalid JSON from /api/tags")
+        return None
+    models = data.get("models", []) if isinstance(data, dict) else []
+    return [
+        str(m.get("name") or m.get("model") or "")
+        for m in models
+        if isinstance(m, dict)
+    ]
 
 
 async def _select_ollama_endpoint(model: str) -> str:
@@ -1549,45 +1589,10 @@ async def _select_ollama_endpoint(model: str) -> str:
     if cached is not None and time.monotonic() < cached[1]:
         return cached[0]
     chain = await asyncio.to_thread(_resolve_ollama_chain)
-    client = await _get_http_client()
     attempts: list[str] = []
     for endpoint in chain:
-        headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
-        if headers is None:
-            attempts.append(
-                f"{endpoint}: skipped (Cloudflare Access credentials not in "
-                "env or Keychain)"
-            )
-            continue
-        try:
-            # Auth is server-sourced (CF Access service-token creds from env
-            # or Keychain via _ollama_auth_headers), never a caller-supplied
-            # credential. The endpoint comes from operator config (env /
-            # user_config / Keychain / built-in defaults), validated
-            # https-only for non-localhost with URL userinfo rejected — no
-            # tool parameter can redirect the credential to an attacker
-            # host. Same false-positive class as the PR #15 suppressions.
-            response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
-                f"{endpoint}/api/tags",
-                headers=headers,
-                timeout=_OLLAMA_PROBE_TIMEOUT_S,
-            )
-            response.raise_for_status()
-            data = response.json()
-            models = data.get("models", []) if isinstance(data, dict) else []
-            tags = [
-                str(m.get("name") or m.get("model") or "")
-                for m in models
-                if isinstance(m, dict)
-            ]
-        except httpx.HTTPStatusError as exc:
-            attempts.append(f"{endpoint}: HTTP {exc.response.status_code}")
-            continue
-        except httpx.RequestError:
-            attempts.append(f"{endpoint}: unreachable")
-            continue
-        except ValueError:
-            attempts.append(f"{endpoint}: invalid JSON from /api/tags")
+        tags = await _probe_endpoint_tags(endpoint, attempts)
+        if tags is None:
             continue
         if model in tags:
             _ollama_endpoint_cache[model] = (
@@ -1599,6 +1604,106 @@ async def _select_ollama_endpoint(model: str) -> str:
         attempts.append(f"{endpoint}: model not present (has {present})")
     detail = "; ".join(attempts) or "empty endpoint chain"
     raise ValueError(f"No Ollama endpoint serves {model!r}: {redact_secrets(detail)}")
+
+
+async def _resolve_implicit_model() -> tuple[str, str, str]:
+    """(model, endpoint, advisory_note) for a call that omitted `model`.
+
+    Walks the endpoint chain once and picks the first endpoint serving ANY
+    allowlisted tag; among that endpoint's tags, allowlist order decides.
+    Chain order already encodes the operator's locality preference
+    (localhost first by default), which yields two properties the naive
+    "resolve allowlist[0]" default lacked (both flagged on PR #32):
+
+    - An install that has only the qwen tags pulled locally keeps resolving
+      locally instead of silently shipping prompt text to a remote host
+      just because the tool-wide default isn't present there (CWE-200
+      concern — the whole point of this tool is that input stays local
+      when a local option exists).
+    - A host where the default tag isn't served by anything reachable
+      falls back to the next allowlisted tag instead of hard-failing.
+
+    Any substitution (resolved model != allowlist[0]) is reported in the
+    returned note. Explicit `model=` calls never come through here — they
+    keep strict fail-loud semantics via _select_ollama_endpoint. Raises
+    ValueError when no endpoint serves any allowlisted tag.
+    """
+    default = _delegate_default_model()
+    cached = _implicit_resolution_cache.get(default)
+    if cached is not None and time.monotonic() < cached[3]:
+        return cached[0], cached[1], cached[2]
+    chain = await asyncio.to_thread(_resolve_ollama_chain)
+    attempts: list[str] = []
+    ordered = (default, *(m for m in OLLAMA_DELEGATE_MODELS if m != default))
+    for endpoint in chain:
+        tags = await _probe_endpoint_tags(endpoint, attempts)
+        if tags is None:
+            continue
+        for tag in ordered:
+            if tag not in tags:
+                continue
+            note = ""
+            if tag != default:
+                where = (
+                    "localhost"
+                    if _is_localhost_endpoint(endpoint)
+                    else redact_secrets(endpoint)
+                )
+                note = (
+                    f"Note: default model {default} is not served by any "
+                    f"reachable endpoint checked before {where}; using {tag} "
+                    f"({where}) instead.\n\n"
+                )
+            expiry = time.monotonic() + _OLLAMA_PROBE_CACHE_TTL_S
+            _ollama_endpoint_cache[tag] = (endpoint, expiry)
+            _implicit_resolution_cache[default] = (tag, endpoint, note, expiry)
+            return tag, endpoint, note
+        present = ", ".join(sorted(t for t in tags if t)) or "no models"
+        attempts.append(f"{endpoint}: no allowlisted model (has {present})")
+    detail = "; ".join(attempts) or "empty endpoint chain"
+    raise ValueError(
+        f"No Ollama endpoint serves any allowlisted model: {redact_secrets(detail)}"
+    )
+
+
+async def _model_capabilities(endpoint: str, model: str) -> frozenset[str] | None:
+    """Capabilities `endpoint` reports for `model` via /api/show, or None.
+
+    None means "could not determine" (endpoint too old to report
+    capabilities, transient failure, unexpected shape) and callers MUST
+    treat it as neutral: no advisory, request payload untouched — a wrong
+    "your flag was ignored" note is worse than letting Ollama surface its
+    own error. Cached per (endpoint, model); capabilities are a property
+    of the tag so a longer TTL than the serving probe is safe.
+    """
+    key = (endpoint, model)
+    cached = _ollama_capability_cache.get(key)
+    now = time.monotonic()
+    if cached is not None and now < cached[1]:
+        return cached[0]
+    headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+    if headers is None:
+        return None
+    client = await _get_http_client()
+    try:
+        # Same server-sourced-auth / operator-configured-endpoint rationale
+        # as _probe_endpoint_tags above.
+        response = await client.post(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+            f"{endpoint}/api/show",
+            json={"model": model},
+            headers=headers,
+            timeout=_OLLAMA_PROBE_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (httpx.HTTPStatusError, httpx.RequestError, ValueError):
+        return None
+    caps = data.get("capabilities") if isinstance(data, dict) else None
+    if not isinstance(caps, list):
+        return None
+    result = frozenset(str(c) for c in caps)
+    _ollama_capability_cache[key] = (result, now + _OLLAMA_CAPABILITY_CACHE_TTL_S)
+    return result
 
 
 async def _post_ollama_chat(
@@ -2064,8 +2169,15 @@ async def list_tools() -> list[Tool]:
                             "context window (64k on JVMBPro, 32k on "
                             "jvmacmini); -32k/-256k pin explicit windows "
                             "(-256k = several GB of KV cache, JVMBPro only). "
-                            "The endpoint chain is probed per call; the first "
-                            "endpoint serving the tag wins."
+                            "Explicit tags resolve strictly: the endpoint "
+                            "chain is probed per call and the first endpoint "
+                            "serving the tag wins, else the call fails. "
+                            "Omitting this field resolves local-first across "
+                            "the allowlist instead — the first endpoint "
+                            "serving ANY allowlisted tag picks the model, so "
+                            "prompts stay on-device whenever a local option "
+                            "exists and a missing default falls back with an "
+                            "advisory note rather than failing."
                         ),
                     },
                     "think": {
@@ -2073,12 +2185,13 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                         "description": (
                             "Enable the model's thinking mode. Off by default "
-                            "for speed; enable for reasoning-heavy asks. Only "
-                            "the qwen3.6 tags think — gemma4:12b-nvfp4 "
-                            "ignores this flag, so pass a qwen tag as well if "
-                            "you actually need reasoning. Note qwen thinking "
-                            "can consume the whole output budget on large "
-                            "inputs and return no answer at all."
+                            "for speed; enable for reasoning-heavy asks. Every "
+                            "built-in allowlist tag reports the 'thinking' "
+                            "capability; if an overridden tag does not, the "
+                            "server disables the flag and prefixes an advisory "
+                            "instead of letting Ollama reject the call. Note "
+                            "qwen thinking can consume the whole output budget "
+                            "on large inputs and return no answer at all."
                         ),
                     },
                     "background": {
@@ -2614,28 +2727,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     text="Error: prompt is required and must be a non-empty string.",
                 )
             ]
-        model = arguments.get("model", _delegate_default_model())
-        if model not in OLLAMA_DELEGATE_MODELS:
+        model_arg = arguments.get("model")
+        if model_arg is not None and model_arg not in OLLAMA_DELEGATE_MODELS:
             allowed = ", ".join(OLLAMA_DELEGATE_MODELS)
             return [
                 TextContent(type="text", text=f"Error: model must be one of: {allowed}")
             ]
+        model = model_arg if model_arg is not None else _delegate_default_model()
         think = arguments.get("think", False)
         if not isinstance(think, bool):
             return [
                 TextContent(type="text", text="Error: think must be a JSON boolean.")
             ]
-        # think=true on a non-thinking model is silently dropped by Ollama. That
-        # became reachable by default when the default model stopped being a
-        # qwen tag, so say so rather than returning a non-reasoned answer that
-        # looks like a reasoned one. Advisory, not an error: the call is still
-        # valid and the answer is still useful.
-        think_note = (
-            f"Note: think=true was ignored — {model} is not a thinking model. "
-            f"Pass a qwen3.6 tag as `model` if you need reasoning.\n\n"
-            if think and not _is_thinking_model(model)
-            else ""
-        )
         background = arguments.get("background", False)
         if not isinstance(background, bool):
             return [
@@ -2673,6 +2776,47 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if system is not None and not isinstance(system, str):
             return [TextContent(type="text", text="Error: system must be a string.")]
 
+        # Implicit-model calls resolve local-first across the whole allowlist
+        # (see _resolve_implicit_model); explicit model= keeps strict
+        # fail-loud semantics and resolves at send time as before.
+        implicit_note = ""
+        endpoint_hint: str | None = None
+        if model_arg is None:
+            try:
+                model, endpoint_hint, implicit_note = await _resolve_implicit_model()
+            except ValueError as exc:
+                return [
+                    TextContent(type="text", text=f"Error: {redact_secrets(str(exc))}")
+                ]
+
+        # think=true on a model without the 'thinking' capability draws a hard
+        # 400 from current Ollama. Ask /api/show instead of hardcoding model
+        # families (an earlier hardcoded list wrongly claimed gemma4 cannot
+        # think): strip the flag and say so, keeping the call useful. An
+        # indeterminate capability read changes nothing — fail neutral, let
+        # Ollama speak for itself.
+        think_note = ""
+        if think:
+            endpoint_for_caps = endpoint_hint
+            if endpoint_for_caps is None:
+                try:
+                    endpoint_for_caps = await _select_ollama_endpoint(model)
+                except ValueError:
+                    endpoint_for_caps = None  # send path will surface the real error
+            caps = (
+                await _model_capabilities(endpoint_for_caps, model)
+                if endpoint_for_caps is not None
+                else None
+            )
+            if caps is not None and "thinking" not in caps:
+                think = False
+                think_note = (
+                    f"Note: think=true was disabled — {model} does not report "
+                    "the 'thinking' capability. Choose a tag that does (every "
+                    "built-in allowlist tag reports it) if you need reasoning.\n\n"
+                )
+        advisory = implicit_note + think_note
+
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -2694,8 +2838,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # Carried as a JSON field, NOT prepended: this envelope is
             # json.loads()-ed by callers, so a bare prefix would break parsing.
             envelope = {"job_id": job_id, "status": "started"}
-            if think_note:
-                envelope["warning"] = think_note.strip()
+            if advisory:
+                envelope["warning"] = advisory.strip()
             return [
                 TextContent(
                     type="text",
@@ -2704,7 +2848,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ]
 
         data = await _post_ollama_chat(payload, float(timeout_s))
-        return _render_delegate_answer(data, prefix=think_note)
+        return _render_delegate_answer(data, prefix=advisory)
 
     if name == "local_delegate_result":
         try:
