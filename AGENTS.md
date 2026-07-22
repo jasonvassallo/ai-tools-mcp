@@ -45,9 +45,13 @@ launch entries above, `hooks/preflight.sh`, `install.sh`'s check, and
 the README's manual `claude mcp add` examples), and the repo-level
 `uv.toml` pins the same policy for repo-cwd runs. There is no single
 source of truth, so if the prerelease policy ever changes, find every
-copy with `grep -r UV_PRERELEASE` and update them together — partial
-edits drift silently (see the comments in `uv.toml` for why the env pin
-is what actually protects installed runs).
+copy with `grep -r UV_PRERELEASE` and update them together (see the
+comments in `uv.toml` for why the env pin is what actually protects
+installed runs). CI's `prerelease-guard` job in
+`.github/workflows/tests.yml` enforces the pins on the executable
+surfaces and the `uv.toml` policy line, so partial edits fail CI
+instead of drifting silently — update its expectations alongside any
+policy change.
 
 ## Provider Mapping
 

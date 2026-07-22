@@ -75,3 +75,47 @@ jobs:
 
       - name: Ruff format check
         run: uv tool run ruff format --check mcp_server.py test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py
+
+  prerelease-guard:
+    # The UV_PRERELEASE=if-necessary-or-explicit pin is duplicated across
+    # every launch/check surface by necessity (uv config discovery is
+    # cwd-based and uv.toml has no include mechanism — see uv.toml's
+    # comments), so there is no single source of truth. This job turns the
+    # "update all copies together" convention documented in AGENTS.md into
+    # an enforced invariant: a future edit that drops or changes the pin on
+    # only some surfaces fails CI instead of drifting silently.
+    name: prerelease policy pin check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          persist-credentials: false
+
+      - name: Verify UV_PRERELEASE pins on all launch surfaces
+        run: |
+          set -euo pipefail
+          PIN='UV_PRERELEASE["=: ]+["]?if-necessary-or-explicit'
+          fail=0
+
+          # file:minimum-occurrences — install.sh has two call sites
+          # (the generated server entry and the post-install --check).
+          for spec in .mcp.json:1 mcpb/manifest.json:1 hooks/preflight.sh:1 install.sh:2; do
+            file="${spec%:*}"; want="${spec#*:}"
+            got=$(grep -Ec "$PIN" "$file" || true)
+            if [ "$got" -lt "$want" ]; then
+              echo "FAIL: $file has $got pin(s), expected >= $want"
+              fail=1
+            else
+              echo "ok: $file ($got pin(s))"
+            fi
+          done
+
+          # Repo-cwd runs are covered by uv.toml rather than an env pin.
+          if grep -q '^prerelease = "if-necessary-or-explicit"$' uv.toml; then
+            echo "ok: uv.toml policy line present"
+          else
+            echo "FAIL: uv.toml is missing the prerelease policy line"
+            fail=1
+          fi
+
+          exit "$fail"
