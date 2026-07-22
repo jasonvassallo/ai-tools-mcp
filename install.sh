@@ -189,11 +189,15 @@ print_step "Registering MCP server"
 UV_PATH="$(command -v uv)"
 SCRIPT_PATH="${INSTALL_DIR}/${SCRIPT_NAME}"
 
-# Build the server entry (same format for both clients)
+# Build the server entry (same format for both clients).
+# UV_PRERELEASE is pinned in the launch env because uv discovers uv.toml
+# from the invocation cwd, not the script path — so the repo's uv.toml
+# never applies to installed runs, and an ambient UV_PRERELEASE=allow
+# (or user-level uv.toml) would otherwise flip resolution to prereleases.
 SERVER_ENTRY=$(jq -n \
     --arg cmd "$UV_PATH" \
     --arg script "$SCRIPT_PATH" \
-    '{command: $cmd, args: ["run", $script]}')
+    '{command: $cmd, args: ["run", $script], env: {UV_PRERELEASE: "if-necessary-or-explicit"}}')
 
 # --- Claude Code: ~/.claude/.mcp.json ---
 mkdir -p "$(dirname "$CLAUDE_CODE_CONFIG")"
