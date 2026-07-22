@@ -1,0 +1,10 @@
+# Resolution policy for uv script runs in this repo.
+#
+# Pins prerelease handling to the uv default so an ambient user-level
+# uv.toml cannot silently opt this project into prerelease resolution
+# (mcp 2.0.0b2 removed mcp.types and breaks mcp_server.py at import).
+#
+# Known limit: the UV_PRERELEASE environment variable takes precedence
+# over this file. The "mcp>=1.0.0,<2" pin in mcp_server.py is the guard
+# that holds in that case (verified 2026-07-22, uv 0.11.29).
+prerelease = "if-necessary-or-explicit"

@@ -28,3 +28,7 @@ benchmarks/local-model-bench/units*/
 benchmarks/local-model-bench/*.jsonl
 benchmarks/local-model-bench/*.json
 benchmarks/local-model-bench/*.log
+
+# uv-generated per-script lockfiles (uv lock --script). Stale ones bake in
+# the resolver mode at lock time and silently override later dependency edits.
+*.py.lock
