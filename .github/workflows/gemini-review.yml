@@ -8,7 +8,7 @@ name: Gemini Review
 
 on:
   pull_request:
-    types: [opened, synchronize]   # review on open + every new commit (iterate to green)
+    types: [opened]   # review once on open; re-review on demand via @gemini-cli comment
   issue_comment:
     types: [created]
 
@@ -55,8 +55,11 @@ jobs:
           REPOSITORY: '${{ github.repository }}'
           GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
         with:
-          # Pin model: run-gemini-cli default gemini-3-flash 404s on Vertex (not entitled).
-          gemini_model: "${{ vars.GEMINI_MODEL || 'gemini-3.5-flash' }}"
+          # Pin model — never the floating gemini-flash-latest alias (hot-swaps on
+          # each release; caused the 2026-07 3x price surprise). Fleet default
+          # gemini-3.5-flash-lite ($0.30/$2.50 per 1M) canary-verified on the
+          # Vertex global endpoint 2026-07-22.
+          gemini_model: "${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}"
           # --- Auth: prefers Vertex AI (your GCP project, no free-tier limits) via
           # Workload Identity Federation when these repo vars are set; otherwise
           # falls back to the GEMINI_API_KEY secret. Set via repo Variables:
