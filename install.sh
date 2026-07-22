@@ -268,7 +268,7 @@ done
 
 # Verify dependencies resolve and config is valid
 echo -e "  ${DIM}Running preflight check (uv run --check)...${NC}"
-CHECK_OUTPUT=$("$UV_PATH" run "$SCRIPT_PATH" --check 2>&1) && {
+CHECK_OUTPUT=$(UV_PRERELEASE="if-necessary-or-explicit" "$UV_PATH" run "$SCRIPT_PATH" --check 2>&1) && {
     print_ok "Dependencies resolve and config valid"
 } || {
     print_warn "Preflight check failed:"
