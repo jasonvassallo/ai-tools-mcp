@@ -1,9 +1,8 @@
-# CodeRabbit review gating (docs.coderabbit.ai/configuration/auto-review):
-# labels prefixed with ! are exclusions — review every PR EXCEPT ones
-# labeled 'trivial' (the fleet's opt-out tier, applied by the review
-# pipeline on version bumps / config one-liners / doc typos / renames).
+# CodeRabbit review gating (docs.coderabbit.ai/reference/configuration):
+# automatic reviews are OFF fleet-wide (2026-07-22) — reviews run ONLY when
+# explicitly requested with an "@coderabbitai review" (incremental) or
+# "@coderabbitai full review" PR comment. The review-pipeline skill posts
+# that request on Normal/Significant-tier PRs; trivial PRs stay silent.
 reviews:
   auto_review:
-    enabled: true
-    labels:
-      - "!trivial"
+    enabled: false
