@@ -105,7 +105,17 @@ jobs:
           # the same invariant as the executable surfaces.
           for spec in .mcp.json:1 mcpb/manifest.json:1 hooks/preflight.sh:1 install.sh:2 README.md:4; do
             file="${spec%:*}"; want="${spec#*:}"
+            # A renamed/deleted surface must FAIL loudly. Without this
+            # guard, grep on a missing file yields got="" and the
+            # integer test errors — which an if-condition treats as
+            # false, silently taking the ok branch.
+            if [ ! -f "$file" ]; then
+              echo "FAIL: $file is missing — renamed or deleted? Update this check alongside the move."
+              fail=1
+              continue
+            fi
             got=$(grep -Ec "$PIN" "$file" || true)
+            : "${got:=0}"  # any other grep failure counts as zero pins
             if [ "$got" -lt "$want" ]; then
               echo "FAIL: $file has $got pin(s), expected >= $want"
               fail=1
