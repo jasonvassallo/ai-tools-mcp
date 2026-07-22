@@ -13,4 +13,7 @@
 #   packaged launch paths (install.sh, plugin .mcp.json, mcpb manifest)
 #   instead pin UV_PRERELEASE in their launch env, which also defeats
 #   an ambient env var.
+# - Key and value verified on uv 0.11.29 (minimum verified version).
+#   An older uv that doesn't recognize them may silently ignore this
+#   file rather than error — don't assume the guard holds below that.
 prerelease = "if-necessary-or-explicit"
