@@ -99,7 +99,11 @@ jobs:
 
           # file:minimum-occurrences — install.sh has two call sites
           # (the generated server entry and the post-install --check).
-          for spec in .mcp.json:1 mcpb/manifest.json:1 hooks/preflight.sh:1 install.sh:2; do
+          # README.md carries four documented examples (two claude-mcp-add
+          # one-liners, the macOS multiline form, and the JSON snippet) —
+          # copy-paste sources for real launch configs, so they're held to
+          # the same invariant as the executable surfaces.
+          for spec in .mcp.json:1 mcpb/manifest.json:1 hooks/preflight.sh:1 install.sh:2 README.md:4; do
             file="${spec%:*}"; want="${spec#*:}"
             got=$(grep -Ec "$PIN" "$file" || true)
             if [ "$got" -lt "$want" ]; then
