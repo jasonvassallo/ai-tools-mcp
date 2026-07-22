@@ -351,7 +351,10 @@ The installer handles this. For manual setup, add to `~/.claude/.mcp.json`:
   "mcpServers": {
     "ai-tools-mcp": {
       "command": "uv",
-      "args": ["run", "/path/to/ai-tools-mcp/mcp_server.py"]
+      "args": ["run", "/path/to/ai-tools-mcp/mcp_server.py"],
+      "env": {
+        "UV_PRERELEASE": "if-necessary-or-explicit"
+      }
     }
   }
 }
