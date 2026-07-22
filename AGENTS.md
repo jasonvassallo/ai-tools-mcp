@@ -39,6 +39,13 @@ The same `mcp_server.py` is wrapped three ways. When making changes, update all 
 - Claude Code plugin: `.claude-plugin/plugin.json` + `.mcp.json` + `commands/` + `skills/` + `hooks/`
 - Claude Desktop extension: `mcpb/manifest.json` (built into `dist/ai-tools-mcp.mcpb` by `scripts/build_mcpb.sh`)
 
+All three launch entries pin `UV_PRERELEASE=if-necessary-or-explicit` in
+their `env`, and the repo-level `uv.toml` pins the same policy for
+repo-cwd runs. If the prerelease policy ever changes, update all four
+spots together — there is no single source of truth, so partial edits
+drift silently (see the comments in `uv.toml` for why the env pin is
+what actually protects installed runs).
+
 ## Provider Mapping
 
 - `quick_research`:
