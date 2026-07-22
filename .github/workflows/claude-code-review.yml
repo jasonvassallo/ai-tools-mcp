@@ -15,7 +15,8 @@ concurrency:
 jobs:
   claude-review:
     # Skip fork PRs: they don't receive repo secrets, so the run would fail.
-    if: github.event.pull_request.head.repo.fork == false
+    # Skip PRs labeled 'trivial': the fleet's review opt-out tier.
+    if: github.event.pull_request.head.repo.fork == false && !contains(github.event.pull_request.labels.*.name, 'trivial')
     runs-on: ubuntu-latest
     permissions:
       contents: read
