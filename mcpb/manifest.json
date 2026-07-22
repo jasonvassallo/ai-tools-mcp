@@ -34,7 +34,8 @@
       "env": {
         "AI_TOOLS_OLLAMA_URLS": "${user_config.ollama_endpoints}",
         "AI_TOOLS_OLLAMA_DEFAULT_MODEL": "${user_config.default_model}",
-        "AI_TOOLS_OLLAMA_MODELS": "${user_config.ollama_models}"
+        "AI_TOOLS_OLLAMA_MODELS": "${user_config.ollama_models}",
+        "UV_PRERELEASE": "if-necessary-or-explicit"
       }
     }
   },

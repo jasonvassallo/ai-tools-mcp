@@ -188,7 +188,7 @@ Everything runs from env vars on Windows — no Keychain, no installer script.
    git clone https://github.com/jasonvassallo/ai-tools-mcp
    # Use the ABSOLUTE path to uv (run `where uv`), not bare `uv` — the
    # desktop app spawns servers with a minimal PATH and won't find it.
-   claude mcp add ai-tools-mcp --scope user --env GOOGLE_CLOUD_PROJECT=YOUR_PROJECT -- C:\path\to\uv.exe run C:\path\to\ai-tools-mcp\mcp_server.py
+   claude mcp add ai-tools-mcp --scope user --env GOOGLE_CLOUD_PROJECT=YOUR_PROJECT --env UV_PRERELEASE=if-necessary-or-explicit -- C:\path\to\uv.exe run C:\path\to\ai-tools-mcp\mcp_server.py
    ```
 
    `--env GOOGLE_CLOUD_PROJECT=...` is baked into the registration because GUI-launched servers don't inherit your shell environment: user-credential ADC files carry no project id, and google-auth's fallback discovery (which consults the gcloud CLI) isn't reliable from a GUI-spawned process — pinning the project in the registration sidesteps both. Optional per-machine env (append more `--env` flags or set them alongside the credentials): `AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,gemma4:12b-nvfp4,qwen3.6:35b-a3b-coding-nvfp4,qwen3.6:35b-a3b-coding-nvfp4-256k` — the small model serves locally; the gemma4 and qwen3.6 tags miss the local probe (the box is CPU-only — nvfp4 is Apple-silicon-served) and fall through the remote chain to ollama-mbp when the MBP is awake. Implicit calls still resolve to the local small model first by design; name gemma explicitly when quality matters more than locality.
@@ -227,6 +227,7 @@ server itself:
   claude mcp remove ai-tools-mcp
   claude mcp add ai-tools-mcp --scope user \
     --env GOOGLE_CLOUD_PROJECT=YOUR_PROJECT \
+    --env UV_PRERELEASE=if-necessary-or-explicit \
     -- /absolute/path/to/uv run /absolute/path/to/ai-tools-mcp/mcp_server.py
   ```
 
@@ -234,7 +235,7 @@ server itself:
 
   ```powershell
   claude mcp remove ai-tools-mcp
-  claude mcp add ai-tools-mcp --scope user --env GOOGLE_CLOUD_PROJECT=YOUR_PROJECT -- C:\path\to\uv.exe run C:\path\to\ai-tools-mcp\mcp_server.py
+  claude mcp add ai-tools-mcp --scope user --env GOOGLE_CLOUD_PROJECT=YOUR_PROJECT --env UV_PRERELEASE=if-necessary-or-explicit -- C:\path\to\uv.exe run C:\path\to\ai-tools-mcp\mcp_server.py
   ```
 
 - **The app wasn't fully restarted.** Closing the window (⌘W, or the red
@@ -350,7 +351,10 @@ The installer handles this. For manual setup, add to `~/.claude/.mcp.json`:
   "mcpServers": {
     "ai-tools-mcp": {
       "command": "uv",
-      "args": ["run", "/path/to/ai-tools-mcp/mcp_server.py"]
+      "args": ["run", "/path/to/ai-tools-mcp/mcp_server.py"],
+      "env": {
+        "UV_PRERELEASE": "if-necessary-or-explicit"
+      }
     }
   }
 }
