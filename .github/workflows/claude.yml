@@ -4,9 +4,9 @@ name: Claude Code
 # PR or issue. Source: https://github.com/anthropics/claude-code-action
 # Canonical example: .../examples/claude.yml
 #
-# Prerequisite secret: ANTHROPIC_API_KEY must be set on the repo via:
-#   gh secret set ANTHROPIC_API_KEY -R jasonvassallo/ai-tools-mcp
-# (reads from stdin so the key is never in shell history).
+# Prerequisite secret: CLAUDE_CODE_OAUTH_TOKEN must be set on the repo via:
+#   gh secret set CLAUDE_CODE_OAUTH_TOKEN -R jasonvassallo/ai-tools-mcp
+# (reads from stdin so the token is never in shell history).
 #
 # Security note: the `contains()` calls in the `if:` block evaluate
 # untrusted comment bodies, but only for substring matching — they do
@@ -28,9 +28,14 @@ jobs:
     # Only run when @claude is mentioned in the relevant body.
     # Only trusted actors (OWNER/MEMBER/COLLABORATOR) can invoke @claude, so external
     # commenters on this public repo can't spend quota or steer a write-capable bot.
+    # PR review comments additionally require the PR head to live in this repo
+    # (fork guard — that payload carries head-repo, so the check is declarative);
+    # the issue_comment path resolves the same guard via the API in the first
+    # step below, since its payload has no PR-head-repo field
+    # (reference: jasonvassallo/dotfiles claude.yml).
     if: |
       (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude') && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) && github.event.pull_request.head.repo.full_name == github.repository) ||
       (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) && contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association))
     runs-on: ubuntu-latest
     permissions:
@@ -41,6 +46,22 @@ jobs:
       actions: read   # Required for Claude to read CI results on PRs
 
     steps:
+      # issue_comment payloads carry no PR-head-repo field, so the fork guard
+      # is resolved via the API instead. Runs BEFORE checkout so a fork PR's
+      # content is never fetched while this job's token is on disk; failing
+      # the job is fail-closed.
+      - name: Fail closed on fork PRs
+        if: ${{ github.event.issue.pull_request }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.issue.pull_request.url }}
+        run: |
+          head_repo="$(gh api "$PR_URL" --jq '.head.repo.full_name')"
+          if [ "$head_repo" != "$GITHUB_REPOSITORY" ]; then
+            echo "PR head is from fork '$head_repo' — refusing to run @claude with credentials." >&2
+            exit 1
+          fi
+
       - name: Checkout repository
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
