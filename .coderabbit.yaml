@@ -5,4 +5,4 @@
 # that request on Normal/Significant-tier PRs; trivial PRs stay silent.
 reviews:
   auto_review:
-    enabled: false
+    enabled: true
