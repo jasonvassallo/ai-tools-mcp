@@ -6,3 +6,9 @@
 reviews:
   auto_review:
     enabled: true
+    labels:
+      # Opt-out tier: review every PR EXCEPT ones labelled 'trivial'. This filter
+      # existed before 2026-07-22 and was dropped when auto_review was disabled;
+      # re-enabling without it would burn the limited Free-plan quota on changes
+      # deliberately excluded from review, rate-limiting substantive PRs.
+      - "!trivial"
