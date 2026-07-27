@@ -1,14 +1,21 @@
-# CodeRabbit review gating (docs.coderabbit.ai/reference/configuration):
-# automatic reviews are OFF fleet-wide (2026-07-22) — reviews run ONLY when
-# explicitly requested with an "@coderabbitai review" (incremental) or
-# "@coderabbitai full review" PR comment. The review-pipeline skill posts
-# that request on Normal/Significant-tier PRs; trivial PRs stay silent.
+# CodeRabbit review gating (docs.coderabbit.ai/reference/configuration).
+#
+# Automatic reviews are OFF — and on the FREE plan that costs nothing, because the
+# GitHub app cannot post code reviews on Free at all. Free is "PR summarization
+# only" (1 summary/hour); the on-demand "@coderabbitai review" chat command is a
+# Pro feature and silently does nothing. Verified 2026-07-26 on
+# mlx-omni-signal#17: enabling auto_review produced a walkthrough and ZERO
+# findings/inline comments.
+#
+# Real CodeRabbit reviews on this plan come from the CLI (3/hour), which the
+# Tier-2 pre-PR step already runs:
+#     coderabbit review --agent --type uncommitted
+# GitHub-side review coverage is Greptile + Claude + Codex + Semgrep.
+#
+# If this account ever moves to Pro, flip enabled to true and KEEP the "!trivial"
+# exclusion so the fleet's opt-out tier still applies.
 reviews:
   auto_review:
-    enabled: true
+    enabled: false
     labels:
-      # Opt-out tier: review every PR EXCEPT ones labelled 'trivial'. This filter
-      # existed before 2026-07-22 and was dropped when auto_review was disabled;
-      # re-enabling without it would burn the limited Free-plan quota on changes
-      # deliberately excluded from review, rate-limiting substantive PRs.
       - "!trivial"
