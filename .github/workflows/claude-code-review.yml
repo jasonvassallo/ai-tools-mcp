@@ -16,7 +16,13 @@ jobs:
   claude-review:
     # Skip fork PRs: they don't receive repo secrets, so the run would fail.
     # Skip PRs labeled 'trivial': the fleet's review opt-out tier.
-    if: github.event.pull_request.head.repo.fork == false && !contains(github.event.pull_request.labels.*.name, 'trivial')
+    # Skip dependabot PRs: same root cause as forks -- they run without access to
+    # repo secrets, so CLAUDE_CODE_OAUTH_TOKEN resolves empty and the action fails
+    # with a red `claude-review` check on every dependency bump. semgrep.yml already
+    # carries this guard; this keeps the two consistent.
+    if: >
+      github.actor != 'dependabot[bot]' &&
+      github.event.pull_request.head.repo.fork == false && !contains(github.event.pull_request.labels.*.name, 'trivial')
     runs-on: ubuntu-latest
     permissions:
       contents: read
