@@ -57,7 +57,11 @@ gets a clean ValueError from ``update_session`` / ``delete_session``.
 Credentials resolve env-first everywhere; the macOS Keychain is the
 fallback where ``security(1)`` exists (per PR #4 round-10 review,
 Codex P2 L38: lookups are deferred so ``import mcp_server`` succeeds
-on any platform).
+on any platform). On Windows the Cloudflare Access service token also
+resolves from Credential Manager, between those two tiers — the
+preferred store there, since a persisted env var is plaintext and
+Claude Desktop launches the packaged extension outside any shell and
+so cannot be handed one by a profile script.
 
 For the Gemini tools, Application Default Credentials (ADC) are
 likewise loaded lazily on first ``gemini_*`` call rather than at
@@ -69,6 +73,7 @@ having been run; only the ``gemini_*`` tools will fail when invoked.
 
 import asyncio
 import errno
+import functools
 import getpass
 import json
 import os
@@ -200,6 +205,34 @@ _CRED_ENV_OVERRIDES: dict[tuple[str, str], str] = {
     ("api_tokens", "perplexity"): "PERPLEXITY_API_KEY",
 }
 
+# Keychain service names for the Cloudflare Access service token that gates
+# the remote Ollama endpoints. Defined here rather than beside the delegate
+# code that consumes them because _CRED_VAULT_TARGETS keys off them.
+_CF_ACCESS_ID_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_ID"
+_CF_ACCESS_SECRET_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_SECRET"
+
+# Windows Credential Manager targets (generic credentials, user-scoped).
+#
+# Why a third tier at all: a persisted HKCU env var is plaintext, readable
+# by any process running as the same user. The vault is the stronger store,
+# but a shell profile cannot bridge to it — Claude Desktop launches the
+# packaged .mcpb extension outside any shell, so it inherits nothing. The
+# read therefore has to happen in-process, which is what this tier does.
+#
+# Only services listed here are ever looked up in the vault; everything
+# else keeps the exact two-tier behaviour it had before.
+_CRED_VAULT_TARGETS: dict[str, str] = {
+    _CF_ACCESS_ID_KEYCHAIN_SERVICE: "ai-tools-mcp-cf-access/client-id",
+    _CF_ACCESS_SECRET_KEYCHAIN_SERVICE: "ai-tools-mcp-cf-access/client-secret",
+}
+
+# Source labels. Safe to print — they name a tier, never a value.
+_CRED_SOURCE_ENV = "env"
+_CRED_SOURCE_VAULT = "windows-credential-manager"
+_CRED_SOURCE_KEYCHAIN = "macos-keychain"
+
+_CRED_TYPE_GENERIC = 1  # wincred.h CRED_TYPE_GENERIC
+
 
 def _cred_env_var(service: str, account: str) -> str:
     override = _CRED_ENV_OVERRIDES.get((service, account))
@@ -208,18 +241,153 @@ def _cred_env_var(service: str, account: str) -> str:
     return re.sub(r"[^A-Z0-9]", "_", service.upper())
 
 
-def get_api_key_from_keychain(service: str, account: str) -> str:
-    """Retrieve a credential: environment variable first, then macOS Keychain.
+def _decode_credential_blob(blob: bytes) -> str:
+    """Decode a CredentialBlob to text. Never raises; never logs the value.
 
-    Empty/whitespace env values are ignored (fail closed, never treat blank
-    as a credential). A miss in both sources raises naming both remedies.
-    On non-macOS hosts security(1) does not exist; that path degrades to the
-    same error rather than crashing.
+    Windows tooling writes generic-credential blobs as UTF-16LE — the
+    sibling CredVault.psm1 (``[Text.Encoding]::Unicode``), ``cmdkey``, and
+    Python's ``keyring`` all agree — but a blob written by some other tool
+    may be UTF-8. An undecodable blob yields "" so the caller fails closed
+    rather than forwarding garbage as a credential.
+
+    The discriminator is the SECOND byte, not "contains a NUL anywhere":
+    an ASCII character in UTF-16LE always has 0x00 as its high byte, so
+    ``blob[1] == 0`` identifies UTF-16LE reliably. "Contains a NUL" is not
+    a safe test — a NUL-terminated UTF-8 blob of even length (``b"abc\\x00"``,
+    which some C callers write via ``strlen + 1``) contains one, decodes as
+    UTF-16LE *without* raising, and would yield CJK garbage.
+
+    Caveat, deliberate: this assumes the UTF-16LE case starts with an ASCII
+    character. A UTF-16LE blob whose FIRST character is non-ASCII (e.g. CJK)
+    is misread as UTF-8. That trade is right for the only credentials this
+    decodes — CF Access service tokens are ASCII — but do not reuse this on
+    secrets that may lead with non-ASCII text.
+    """
+    if not blob:
+        return ""
+    looks_utf16 = len(blob) >= 2 and blob[1] == 0
+    encodings = ("utf-16-le", "utf-8") if looks_utf16 else ("utf-8", "utf-16-le")
+    for encoding in encodings:
+        try:
+            return blob.decode(encoding).rstrip("\x00")
+        except UnicodeDecodeError:
+            continue
+    return ""
+
+
+@functools.lru_cache(maxsize=1)
+def _windows_credential_api() -> tuple[Any, Any, Any] | None:
+    """Bind advapi32's CredReadW/CredFree plus the CREDENTIALW layout.
+
+    Returns None on any non-Windows host, which is what keeps macOS/Linux
+    resolution byte-for-byte unchanged. Bound lazily because
+    ``ctypes.wintypes`` does not import off Windows and this module is
+    imported on Linux by CI; cached because the delegate reads both CF
+    credentials on every endpoint probe.
+
+    ctypes over a package (keyring/pywin32) deliberately: the PEP 723
+    dependency block is resolved on every ``uv run`` of the server, so a
+    new wheel is a real cost on every launch and every install surface,
+    and this needs exactly two calls from a stdlib module that is already
+    present on the only platform that uses it.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except ImportError:  # pragma: no cover - ctypes is stdlib on Windows
+        return None
+
+    class CREDENTIALW(ctypes.Structure):
+        # Field order/types mirror wincred.h; ctypes applies the platform's
+        # natural alignment, which is the layout the API expects.
+        _fields_ = (
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.POINTER(ctypes.c_char)),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        )
+
+    try:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        cred_read = advapi32.CredReadW
+        cred_read.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.POINTER(CREDENTIALW)),
+        )
+        cred_read.restype = wintypes.BOOL
+        cred_free = advapi32.CredFree
+        cred_free.argtypes = (ctypes.c_void_p,)
+        cred_free.restype = None
+    except (AttributeError, OSError):  # pragma: no cover - advapi32 is always present
+        return None
+    return cred_read, cred_free, CREDENTIALW
+
+
+def _read_windows_credential(target: str) -> str | None:
+    """Read one generic credential from Windows Credential Manager.
+
+    Returns the stored secret, ``""`` when the entry exists but is empty,
+    or None when the target is absent or this host has no vault. Never
+    raises and never logs the value — the caller decides what to do with
+    a miss.
+    """
+    api = _windows_credential_api()
+    if api is None:
+        return None
+    import ctypes
+
+    cred_read, cred_free, credential_t = api
+    pcred = ctypes.POINTER(credential_t)()
+    if not cred_read(target, _CRED_TYPE_GENERIC, 0, ctypes.byref(pcred)):
+        # ERROR_NOT_FOUND (1168) or any other failure — both mean "nothing
+        # usable here", so fall through to the next tier rather than raise.
+        return None
+    try:
+        cred = pcred.contents
+        size = int(cred.CredentialBlobSize)
+        blob = ctypes.string_at(cred.CredentialBlob, size) if size > 0 else b""
+    finally:
+        cred_free(pcred)
+    return _decode_credential_blob(blob)
+
+
+def _resolve_credential(service: str, account: str) -> tuple[str, str]:
+    """Resolve a credential and report which tier supplied it.
+
+    Order: environment variable → Windows Credential Manager (Windows
+    only, and only for services in ``_CRED_VAULT_TARGETS``) → macOS
+    Keychain. Env stays first so an existing install keeps working
+    unchanged and a vault cutover is reversible by putting the env var
+    back.
+
+    Returns ``(value, source)``. The value goes to the caller and must
+    never be logged; ``source`` is a tier name and is safe to print.
     """
     env_var = _cred_env_var(service, account)
     env_val = os.environ.get(env_var, "").strip()
     if env_val:
-        return env_val
+        return env_val, _CRED_SOURCE_ENV
+
+    vault_target = _CRED_VAULT_TARGETS.get(service)
+    if vault_target:
+        # No-ops off Windows (_read_windows_credential returns None there),
+        # so non-Windows resolution is exactly what it was before.
+        vault_val = (_read_windows_credential(vault_target) or "").strip()
+        if vault_val:
+            return vault_val, _CRED_SOURCE_VAULT
+
     try:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
@@ -229,12 +397,37 @@ def get_api_key_from_keychain(service: str, account: str) -> str:
     except FileNotFoundError:
         result = None  # non-macOS: no security(1) binary
     if result is not None and result.returncode == 0:
-        return result.stdout.strip()
-    raise ValueError(
+        # Unconditional, including an empty password: callers that must
+        # fail closed on a blank credential already check for it
+        # (_ollama_auth_headers), and changing that here would move the
+        # decision away from the caller that documents why.
+        return result.stdout.strip(), _CRED_SOURCE_KEYCHAIN
+
+    message = (
         f"Credential not found. Set the {env_var} environment variable "
         f"(required on non-macOS), or add it to the macOS Keychain with:\n"
         f"  security add-generic-password -s '{service}' -a '{account}' -w 'YOUR_API_KEY'"
     )
+    if vault_target:
+        # ASCII only: this text reaches a Windows console via run_check's
+        # `print(f"fail: {e}")`, where a redirected stdout is cp1252.
+        message += (
+            f"\nOn Windows the preferred store is Credential Manager: add a "
+            f"generic credential targeting '{vault_target}' (see README, "
+            f"'Windows: Credential Manager vault')."
+        )
+    raise ValueError(message)
+
+
+def get_api_key_from_keychain(service: str, account: str) -> str:
+    """Retrieve a credential: env var, then Windows vault, then Keychain.
+
+    Thin wrapper over ``_resolve_credential`` for callers that only need
+    the value. Empty/whitespace env values are ignored (fail closed, never
+    treat blank as a credential). A miss in every available source raises
+    naming each remedy that applies to this host.
+    """
+    return _resolve_credential(service, account)[0]
 
 
 _ADC_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
@@ -262,14 +455,59 @@ def _load_adc() -> tuple[Any, str]:
     return creds, project
 
 
+def _report_cf_access_credentials() -> None:
+    """Print the resolution tier for each CF Access credential (--check only).
+
+    Values are never printed — only the tier that supplied them.
+
+    When an env var and a vault entry both hold a value for the same
+    credential and they DISAGREE, say so. Env wins by precedence, so a
+    stale env var silently shadows a rotated vault entry, and the only
+    other symptom is a 403 from the Access-gated endpoint that looks
+    identical to "no credentials at all". Comparing here costs nothing and
+    leaks nothing.
+    """
+    user = getpass.getuser()
+    for label, service in (
+        ("client id", _CF_ACCESS_ID_KEYCHAIN_SERVICE),
+        ("client secret", _CF_ACCESS_SECRET_KEYCHAIN_SERVICE),
+    ):
+        try:
+            value, source = _resolve_credential(service, user)
+        except ValueError:
+            value, source = "", ""
+        if not value:
+            # An existing-but-empty Keychain item resolves to ("", "keychain")
+            # rather than raising (see _resolve_credential). Reporting that as
+            # `ok` would be a FALSE SUCCESS on the one surface people use to
+            # verify a cutover, while _ollama_auth_headers rejects the blank
+            # and skips every remote endpoint. Treat blank as missing here.
+            print(
+                f"warn: cloudflare access {label} not found "
+                "(remote ollama endpoints will be skipped)"
+            )
+            continue
+        print(f"ok: cloudflare access {label} found ({source})")
+
+        target = _CRED_VAULT_TARGETS.get(service)
+        if source != _CRED_SOURCE_ENV or not target:
+            continue
+        vaulted = (_read_windows_credential(target) or "").strip()
+        if vaulted and vaulted != value:
+            # ASCII only (cp1252 console on a redirected Windows stdout).
+            print(
+                f"warn: cloudflare access {label} differs between the "
+                f"{_cred_env_var(service, user)} env var (winning) and vault "
+                f"target {target!r}. If remote endpoints return 403, the env "
+                "var is the stale copy: clear it to fall through to the vault."
+            )
+
+
 def run_check() -> None:
     """Validate configuration and exit. Used by install.sh to verify setup."""
     errors = 0
     try:
-        get_api_key_from_keychain("api_tokens", "perplexity")
-        source = (
-            "env" if os.environ.get("PERPLEXITY_API_KEY", "").strip() else "keychain"
-        )
+        _, source = _resolve_credential("api_tokens", "perplexity")
         print(f"ok: perplexity key found ({source})")
     except ValueError as e:
         print(f"fail: {e}")
@@ -284,6 +522,13 @@ def run_check() -> None:
     except (ValueError, Exception) as e:  # noqa: BLE001 - report any auth issue
         print(f"fail: {e}")
         errors += 1
+
+    # Report which tier supplied each Cloudflare Access credential. Only
+    # the tier name is printed, never a value — so `--check` is the safe
+    # way to confirm a Credential Manager cutover actually took effect
+    # (the installed .mcpb is a packaged copy, so "it works in the CLI"
+    # proves nothing about Desktop).
+    _report_cf_access_credentials()
 
     # Non-fatal: local_delegate family. Ollama being down must not fail
     # installs or preflights of the hosted tool families — delegate calls
@@ -1362,8 +1607,8 @@ OLLAMA_DELEGATE_DEFAULT_MODEL = OLLAMA_DELEGATE_MODELS[0]
 
 _OLLAMA_URL_ENV_VAR = "AI_TOOLS_OLLAMA_URL"
 _OLLAMA_URL_KEYCHAIN_SERVICE = "OLLAMA_URL"
-_CF_ACCESS_ID_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_ID"
-_CF_ACCESS_SECRET_KEYCHAIN_SERVICE = "OLLAMA_CF_ACCESS_CLIENT_SECRET"
+# _CF_ACCESS_{ID,SECRET}_KEYCHAIN_SERVICE live with the credential
+# resolver near the top of this file — _CRED_VAULT_TARGETS keys off them.
 
 # `0` (unload immediately) or 1-9999 seconds/minutes/hours. Strict so a
 # malformed value cannot smuggle arbitrary JSON into the Ollama request.
@@ -1496,10 +1741,11 @@ def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
     """Auth headers for an Ollama endpoint; None means SKIP, never call bare.
 
     localhost → {} (no auth). Non-localhost https → Cloudflare Access
-    service-token headers read from the Keychain per call (never cached,
-    never logged). Either credential absent → None (fail closed): the
-    caller treats the endpoint as unavailable rather than calling an
-    Access-gated host unauthenticated.
+    service-token headers resolved per call (never cached, never logged)
+    from env, the Windows Credential Manager vault, or the Keychain —
+    whichever answers first. Either credential absent → None (fail
+    closed): the caller treats the endpoint as unavailable rather than
+    calling an Access-gated host unauthenticated.
     """
     if _is_localhost_endpoint(endpoint):
         return {}
@@ -1510,16 +1756,17 @@ def _ollama_auth_headers(endpoint: str) -> dict[str, str] | None:
             _CF_ACCESS_SECRET_KEYCHAIN_SERVICE, user
         )
     except ValueError:
-        # Not found in env or Keychain (get_api_key_from_keychain folds the
+        # Not found in any source (get_api_key_from_keychain folds the
         # non-macOS missing-security(1) case into ValueError) — degrade
         # gracefully (remote endpoint skipped, never called bare) instead
         # of crashing.
         return None
     if not client_id or not client_secret:
-        # A Keychain item can exist with an empty password — `security`
-        # returns "" with returncode 0 (no ValueError). Treat that the same
-        # as "absent" so we fail closed instead of calling the Access-gated
-        # host with a malformed header.
+        # A Keychain or vault item can exist with an empty password —
+        # `security` returns "" with returncode 0 (no ValueError), and
+        # CredReadW succeeds with CredentialBlobSize 0. Treat both the same
+        # as "absent" so we fail closed instead of calling the
+        # Access-gated host with a malformed header.
         return None
     return {
         "CF-Access-Client-Id": client_id,
@@ -1543,7 +1790,7 @@ async def _probe_endpoint_tags(endpoint: str, attempts: list[str]) -> list[str] 
     if headers is None:
         attempts.append(
             f"{endpoint}: skipped (Cloudflare Access credentials not in "
-            "env or Keychain)"
+            "env, Windows Credential Manager, or Keychain)"
         )
         return None
     client = await _get_http_client()
