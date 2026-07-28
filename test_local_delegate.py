@@ -1825,10 +1825,23 @@ class TestCredentialBlobDecoding(unittest.TestCase):
         self.assertEqual(mcp_server._decode_credential_blob(blob), _FAKE_VAULT_SECRET)
 
     def test_ascii_utf8_is_not_misread_as_utf16(self):
-        # The discriminator is the NUL byte: an even-length ASCII UTF-8
-        # blob also decodes "successfully" as UTF-16LE, into garbage.
-        # Guards against a decoder that just tries UTF-16 first.
+        # An even-length ASCII UTF-8 blob also decodes "successfully" as
+        # UTF-16LE, into garbage. Guards against a decoder that just tries
+        # UTF-16 first.
         self.assertEqual(mcp_server._decode_credential_blob(b"abcd"), "abcd")
+
+    def test_nul_terminated_utf8_is_not_misread_as_utf16(self):
+        # Regression (PR #48 review): "contains a NUL anywhere" is NOT a
+        # safe UTF-16 discriminator. A C-style NUL-terminated UTF-8 blob of
+        # even length contains one, decodes as UTF-16LE WITHOUT raising, and
+        # yielded CJK garbage ("扡..."). The high byte of an ASCII
+        # UTF-16LE character is what actually distinguishes them, so the
+        # test is on blob[1].
+        self.assertEqual(mcp_server._decode_credential_blob(b"abc\x00"), "abc")
+        for text in ("a", "ab", "abc", "abcd", _FAKE_VAULT_SECRET):
+            with self.subTest(text=text):
+                blob = text.encode("utf-8") + b"\x00"
+                self.assertEqual(mcp_server._decode_credential_blob(blob), text)
 
     def test_trailing_nul_terminator_is_stripped(self):
         blob = (_FAKE_VAULT_ID + "\x00").encode("utf-16-le")
@@ -1898,6 +1911,26 @@ class TestCredentialSourceReporting(unittest.TestCase):
 
     def test_warns_when_credential_is_absent_everywhere(self):
         out = self._report({}, {})
+        self.assertIn("warn: cloudflare access client id not found", out)
+        self.assertIn("warn: cloudflare access client secret not found", out)
+
+    def test_empty_keychain_value_is_not_reported_as_found(self):
+        # Regression (PR #48 review): a Keychain item that exists with an
+        # empty password resolves to ("", "macos-keychain") instead of
+        # raising, which printed `ok: ... found (macos-keychain)` — a FALSE
+        # SUCCESS on the exact surface used to verify a vault cutover, while
+        # _ollama_auth_headers rejects the blank and skips every endpoint.
+        buf = io.StringIO()
+        empty = mock.Mock(returncode=0, stdout="   \n")
+        with _no_cf_env():
+            with mock.patch.object(mcp_server, "_read_windows_credential", _vault({})):
+                with mock.patch.object(
+                    mcp_server.subprocess, "run", return_value=empty
+                ):
+                    with contextlib.redirect_stdout(buf):
+                        mcp_server._report_cf_access_credentials()
+        out = buf.getvalue()
+        self.assertNotIn("ok:", out)
         self.assertIn("warn: cloudflare access client id not found", out)
         self.assertIn("warn: cloudflare access client secret not found", out)
 

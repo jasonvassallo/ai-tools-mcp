@@ -247,14 +247,26 @@ def _decode_credential_blob(blob: bytes) -> str:
     Windows tooling writes generic-credential blobs as UTF-16LE — the
     sibling CredVault.psm1 (``[Text.Encoding]::Unicode``), ``cmdkey``, and
     Python's ``keyring`` all agree — but a blob written by some other tool
-    may be UTF-8. A NUL byte discriminates them cleanly: UTF-8 text never
-    contains one, while UTF-16LE of ASCII is half NULs. An undecodable blob
-    yields "" so the caller fails closed rather than forwarding garbage as
-    a credential.
+    may be UTF-8. An undecodable blob yields "" so the caller fails closed
+    rather than forwarding garbage as a credential.
+
+    The discriminator is the SECOND byte, not "contains a NUL anywhere":
+    an ASCII character in UTF-16LE always has 0x00 as its high byte, so
+    ``blob[1] == 0`` identifies UTF-16LE reliably. "Contains a NUL" is not
+    a safe test — a NUL-terminated UTF-8 blob of even length (``b"abc\\x00"``,
+    which some C callers write via ``strlen + 1``) contains one, decodes as
+    UTF-16LE *without* raising, and would yield CJK garbage.
+
+    Caveat, deliberate: this assumes the UTF-16LE case starts with an ASCII
+    character. A UTF-16LE blob whose FIRST character is non-ASCII (e.g. CJK)
+    is misread as UTF-8. That trade is right for the only credentials this
+    decodes — CF Access service tokens are ASCII — but do not reuse this on
+    secrets that may lead with non-ASCII text.
     """
     if not blob:
         return ""
-    encodings = ("utf-16-le", "utf-8") if b"\x00" in blob else ("utf-8", "utf-16-le")
+    looks_utf16 = len(blob) >= 2 and blob[1] == 0
+    encodings = ("utf-16-le", "utf-8") if looks_utf16 else ("utf-8", "utf-16-le")
     for encoding in encodings:
         try:
             return blob.decode(encoding).rstrip("\x00")
@@ -463,6 +475,13 @@ def _report_cf_access_credentials() -> None:
         try:
             value, source = _resolve_credential(service, user)
         except ValueError:
+            value, source = "", ""
+        if not value:
+            # An existing-but-empty Keychain item resolves to ("", "keychain")
+            # rather than raising (see _resolve_credential). Reporting that as
+            # `ok` would be a FALSE SUCCESS on the one surface people use to
+            # verify a cutover, while _ollama_auth_headers rejects the blank
+            # and skips every remote endpoint. Treat blank as missing here.
             print(
                 f"warn: cloudflare access {label} not found "
                 "(remote ollama endpoints will be skipped)"

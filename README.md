@@ -332,7 +332,7 @@ Confirm which tier answered — this prints the source, never the value:
 uv run mcp_server.py --check
 ```
 
-```
+```text
 ok: cloudflare access client id found (windows-credential-manager)
 ok: cloudflare access client secret found (windows-credential-manager)
 ```
