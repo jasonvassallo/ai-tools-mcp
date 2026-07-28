@@ -72,7 +72,7 @@ The following identifiers are meant to stay stable unless intentionally changed:
 
 ### `local_delegate` / `local_delegate_result`
 
-- Provider: **local-first Ollama endpoint chain** — default `http://localhost:11434` → `https://ollama-mbp.djvassallo.com` → `https://ollama.djvassallo.com` (both Cloudflare-Access-gated); override via `AI_TOOLS_OLLAMA_URLS` comma-separated env (singular `AI_TOOLS_OLLAMA_URL` honored for compat), Keychain `OLLAMA_URL` appended; per-call `/api/tags` probe picks the first endpoint serving the tag, cached 60s; remote endpoints require https + CF Access service-token creds (env vars or macOS Keychain — see Credentials), else skipped
+- Provider: **local-first Ollama endpoint chain** — default `http://localhost:11434` → `https://ollama-mbp.djvassallo.com` → `https://ollama.djvassallo.com` (both Cloudflare-Access-gated); override via `AI_TOOLS_OLLAMA_URLS` comma-separated env (singular `AI_TOOLS_OLLAMA_URL` honored for compat), Keychain `OLLAMA_URL` appended; per-call `/api/tags` probe picks the first endpoint serving the tag, cached 60s; remote endpoints require https + CF Access service-token creds (env vars, Windows Credential Manager, or macOS Keychain — see Credentials), else skipped
 - The `https://ollama-mbp.djvassallo.com` remote entry is the repo owner's own Access-gated host — a **placeholder** for everyone else; set `AI_TOOLS_OLLAMA_URLS` (or the Desktop extension's `ollama_endpoints` setting) to your own endpoint(s) instead of relying on the default chain
 - Models: server-side allowlist, default = `gemma4:12b-nvfp4` followed by four qwen3.6 tags (the qwen base tag inherits each host's window — 64k JVMBPro / 32k jvmacmini — while `-32k`/`-64k`/`-256k` pin the window explicitly regardless of host; all four tags share one weight blob on disk); override the allowlist per machine via `AI_TOOLS_OLLAMA_MODELS` comma-separated env or the extension's `ollama_models` setting (first entry becomes the default model; blank/garbage fails closed to the built-ins). Omitted-model calls resolve local-first across the allowlist — the first chain endpoint serving any allowlisted tag picks the model, so a missing default falls back with an advisory instead of failing or silently going remote when a local option exists; `AI_TOOLS_OLLAMA_DEFAULT_MODEL` may pick a different allowlisted tag
 - Purpose: privacy / quota offload / second opinion / background jobs
@@ -95,7 +95,7 @@ The server is a single Python script (`mcp_server.py`) with PEP 723 inline depen
 It:
 
 - starts an MCP server named `ai-tools-mcp`
-- reads API credentials from environment variables or the macOS Keychain (env wins; env is the only source on non-macOS hosts)
+- reads API credentials from environment variables, Windows Credential Manager (CF Access token, Windows only), or the macOS Keychain — in that order, first non-empty wins
 - calls the Perplexity API through the `openai` Python client
 - calls the local Ollama server (native /api/chat) for the local_delegate family
 - returns plain text MCP responses
@@ -174,14 +174,17 @@ First-run note: macOS may show a one-time Keychain access prompt when the server
 
 ### D. Windows (Claude Code CLI, Claude Code desktop app, or Claude Desktop)
 
-Everything runs from env vars on Windows — no Keychain, no installer script.
+No Keychain and no installer script on Windows: credentials come from env
+vars, plus Windows Credential Manager for the Cloudflare Access service
+token (the preferred store there — see
+[Windows: Credential Manager vault](#windows-credential-manager-vault)).
 
 ## Benchmarks
 
 `benchmarks/local-model-bench/` holds the ground-truth A/B harness behind the delegate-model defaults (planted-defect review corpus, machine-graded delegate tasks, blind adversarial judging). See its [README](benchmarks/local-model-bench/README.md) and [RESULTS](benchmarks/local-model-bench/RESULTS.md) for the 2026-07 measurements that set gemma4 as the default.
 
 1. **Prerequisites:** [uv](https://docs.astral.sh/uv/) (`winget install astral-sh.uv`), and for `local_delegate` a local [Ollama for Windows](https://ollama.com/download/windows) with a model pulled — on a 32 GB CPU-only box use `ollama pull qwen2.5-coder:14b` (~9 GB; the qwen3-coder line starts at 30B and will not fit alongside office apps).
-2. **Credentials:** set the env vars from the Credentials table above via the System Environment Variables GUI. For Gemini tools, install the Google Cloud SDK and run `gcloud auth application-default login` then `gcloud auth application-default set-quota-project YOUR_PROJECT` (ADC is fully portable; no key files).
+2. **Credentials:** set the env vars from the Credentials table above via the System Environment Variables GUI — except the CF Access service token, which belongs in Credential Manager (`cmdkey /generic:ai-tools-mcp-cf-access/client-id /user:token /pass`, same for `client-secret`); verify with `uv run mcp_server.py --check`, which prints the resolving tier and never the value. For Gemini tools, install the Google Cloud SDK and run `gcloud auth application-default login` then `gcloud auth application-default set-quota-project YOUR_PROJECT` (ADC is fully portable; no key files).
 3. **Claude Code (CLI and the desktop app share one config):**
 
    ```powershell
@@ -275,19 +278,26 @@ machine).
 - `uv` installed and on `PATH`
 - `jq` installed (for installer only)
 
-### Credentials (environment variables or macOS Keychain)
+### Credentials (environment variable, Windows vault, or macOS Keychain)
 
-Every credential resolves **environment-first, then macOS Keychain** — a
-non-empty env var wins; on non-macOS hosts (Windows/Linux, where there is no
-`security(1)`) env vars are the only source. A miss in both raises one error
-naming both remedies.
+Every credential resolves in this order — first non-empty value wins:
 
-| Credential | Env var | Keychain (service / account) | Needed for |
-|---|---|---|---|
-| Perplexity API key | `PERPLEXITY_API_KEY` | `api_tokens` / `perplexity` | quick/deep/agent research |
-| CF Access client id | `OLLAMA_CF_ACCESS_CLIENT_ID` | `OLLAMA_CF_ACCESS_CLIENT_ID` / `$USER` | remote Ollama endpoints |
-| CF Access client secret | `OLLAMA_CF_ACCESS_CLIENT_SECRET` | `OLLAMA_CF_ACCESS_CLIENT_SECRET` / `$USER` | remote Ollama endpoints |
-| Extra Ollama endpoint (optional) | `OLLAMA_URL` | `OLLAMA_URL` / `$USER` | appended to the chain |
+1. **Environment variable**
+2. **Windows Credential Manager** — Windows only, and only for the
+   Cloudflare Access service token (the credentials with a vault target
+   in the table below)
+3. **macOS Keychain** — where `security(1)` exists
+
+Blank/whitespace values are ignored at every tier (fail closed — a blank is
+never treated as a credential). A miss everywhere raises one error naming
+each remedy that applies to the host.
+
+| Credential | Env var | Windows vault target | Keychain (service / account) | Needed for |
+|---|---|---|---|---|
+| Perplexity API key | `PERPLEXITY_API_KEY` | — | `api_tokens` / `perplexity` | quick/deep/agent research |
+| CF Access client id | `OLLAMA_CF_ACCESS_CLIENT_ID` | `ai-tools-mcp-cf-access/client-id` | `OLLAMA_CF_ACCESS_CLIENT_ID` / `$USER` | remote Ollama endpoints |
+| CF Access client secret | `OLLAMA_CF_ACCESS_CLIENT_SECRET` | `ai-tools-mcp-cf-access/client-secret` | `OLLAMA_CF_ACCESS_CLIENT_SECRET` / `$USER` | remote Ollama endpoints |
+| Extra Ollama endpoint (optional) | `OLLAMA_URL` | — | `OLLAMA_URL` / `$USER` | appended to the chain |
 
 macOS setup (the installer handles the Perplexity one automatically):
 
@@ -295,12 +305,54 @@ macOS setup (the installer handles the Perplexity one automatically):
 security add-generic-password -s 'api_tokens' -a 'perplexity' -w 'YOUR_PERPLEXITY_API_KEY'
 ```
 
-Windows setup: set per-user environment variables through **Settings →
-System → About → Advanced system settings → Environment Variables** (the GUI
-keeps secrets out of shell history). Never put them in files in the repo.
-Trade-off note: a persisted user env var is readable by any process running
-as the same user — weaker isolation than the macOS Keychain. Accepted,
-documented design choice for non-macOS hosts.
+#### Windows: Credential Manager vault
+
+**On Windows the vault is the preferred store for the Cloudflare Access
+service token.** A persisted user env var lives in `HKCU\Environment` as
+plaintext, readable by any process running as the same user; a Credential
+Manager generic credential is DPAPI-protected and scoped to the user
+profile.
+
+Store the pair (PowerShell). Omitting the value after `/pass` makes
+`cmdkey` prompt for it, which keeps the secret out of shell history:
+
+```powershell
+cmdkey /generic:ai-tools-mcp-cf-access/client-id /user:token /pass
+cmdkey /generic:ai-tools-mcp-cf-access/client-secret /user:token /pass
+```
+
+The server reads these in-process via `advapi32.CredReadW` (ctypes — no
+added dependency). That is what makes them reach **Claude Desktop**, which
+launches the packaged `.mcpb` extension outside any shell and so inherits
+nothing from a PowerShell profile.
+
+Confirm which tier answered — this prints the source, never the value:
+
+```powershell
+uv run mcp_server.py --check
+```
+
+```
+ok: cloudflare access client id found (windows-credential-manager)
+ok: cloudflare access client secret found (windows-credential-manager)
+```
+
+**Env vars still take precedence.** That ordering is deliberate: existing
+installs keep working untouched, and a cutover to the vault stays
+reversible by putting the env var back. It also means that until
+`OLLAMA_CF_ACCESS_*` is removed from the environment, the vault is never
+consulted and `--check` reports `(env)`.
+
+If both copies exist and disagree — e.g. after a service-token rotation,
+which preserves the client id but changes the secret — `--check` says so
+explicitly. That case is worth calling out because the env var silently
+shadows the newer vaulted value, and the only other symptom is a 403 from
+the Access-gated endpoint that looks identical to "no credentials
+configured".
+
+Env-var setup, if you use that tier instead: **Settings → System → About →
+Advanced system settings → Environment Variables** (the GUI keeps secrets
+out of shell history). Never put credentials in files in the repo.
 
 Naming gotcha: `OLLAMA_URL` (above) **appends one extra endpoint** to the
 chain; the similarly named `AI_TOOLS_OLLAMA_URL`/`AI_TOOLS_OLLAMA_URLS`
@@ -469,7 +521,7 @@ Output behavior:
 
 ## Secret Hygiene
 
-This repo is intended to be safe to publish publicly. The current design keeps secrets out of source control by using the macOS Keychain.
+This repo is intended to be safe to publish publicly. The current design keeps secrets out of source control by using the OS credential store — the macOS Keychain, or Windows Credential Manager on Windows.
 
 Rules for working in this repo:
 
@@ -477,7 +529,7 @@ Rules for working in this repo:
 - never commit `.env` files
 - never commit certificate or private key files
 - keep local debug dumps out of Git
-- prefer Keychain lookups over environment-file storage for this project
+- prefer OS credential-store lookups (Keychain / Windows Credential Manager) over environment-file or env-var storage for this project
 
 ## License
 

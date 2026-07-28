@@ -1489,7 +1489,9 @@ class TestLocalDelegateBackground(unittest.TestCase):
 
 
 class TestRunCheckOllamaLine(unittest.TestCase):
-    def _run_check_output(self, get_side_effect=None, json_version="0.9.0"):
+    def _run_check_output(
+        self, get_side_effect=None, json_version="0.9.0", vault=None, resolver=None
+    ):
         fake_resp = mock.Mock()
         fake_resp.raise_for_status = mock.Mock()
         fake_resp.json.return_value = {"version": json_version}
@@ -1499,32 +1501,46 @@ class TestRunCheckOllamaLine(unittest.TestCase):
         )
         self._last_fake_get = fake_requests.get
 
-        def fake_keychain(service, account):
+        def fake_resolve(service, account):
             # Perplexity key resolves; OLLAMA_URL absent so the chain comes
             # from the env var alone (a Keychain URL of "k" would fail
             # endpoint validation and mask what this test targets).
+            # Patching _resolve_credential rather than
+            # get_api_key_from_keychain covers both call paths —
+            # get_api_key_from_keychain is now a thin wrapper over it.
             if service == "OLLAMA_URL":
                 raise ValueError("not found")
-            return "k"
+            return "k", "env"
 
+        # The vault reader is stubbed by default so run_check's output is
+        # identical on every platform — otherwise a developer running the
+        # suite on Windows with real CF credentials vaulted gets extra
+        # divergence-warning lines that CI never sees.
         buf = io.StringIO()
         with mock.patch.object(mcp_server, "requests", fake_requests, create=True):
             with mock.patch.object(
-                mcp_server, "get_api_key_from_keychain", side_effect=fake_keychain
+                mcp_server,
+                "_read_windows_credential",
+                side_effect=vault or (lambda target: None),
             ):
                 with mock.patch.object(
-                    mcp_server, "_load_adc", side_effect=ValueError("no adc")
+                    mcp_server,
+                    "_resolve_credential",
+                    side_effect=resolver or fake_resolve,
                 ):
-                    with mock.patch.dict(
-                        os.environ,
-                        {
-                            "AI_TOOLS_OLLAMA_URL": "http://localhost:11434",
-                            "AI_TOOLS_OLLAMA_URLS": "",
-                        },
+                    with mock.patch.object(
+                        mcp_server, "_load_adc", side_effect=ValueError("no adc")
                     ):
-                        with contextlib.redirect_stdout(buf):
-                            with self.assertRaises(SystemExit) as ctx:
-                                mcp_server.run_check()
+                        with mock.patch.dict(
+                            os.environ,
+                            {
+                                "AI_TOOLS_OLLAMA_URL": "http://localhost:11434",
+                                "AI_TOOLS_OLLAMA_URLS": "",
+                            },
+                        ):
+                            with contextlib.redirect_stdout(buf):
+                                with self.assertRaises(SystemExit) as ctx:
+                                    mcp_server.run_check()
         return buf.getvalue(), ctx.exception.code
 
     def test_reachable_prints_ok(self):
@@ -1607,6 +1623,283 @@ class TestCredentialResolution(unittest.TestCase):
                 with self.assertRaises(ValueError) as ctx:
                     mcp_server.get_api_key_from_keychain("OLLAMA_URL", "u")
         self.assertIn("OLLAMA_URL", str(ctx.exception))
+
+
+# ─── Windows Credential Manager tier ──────────────────────────────────
+
+_CF_ID = "OLLAMA_CF_ACCESS_CLIENT_ID"
+_CF_SECRET = "OLLAMA_CF_ACCESS_CLIENT_SECRET"
+_CF_ID_TARGET = "ai-tools-mcp-cf-access/client-id"
+_CF_SECRET_TARGET = "ai-tools-mcp-cf-access/client-secret"
+
+# Fakes only — never a real credential shape, never a real value.
+_FAKE_ENV_ID = "fake-env-client-id"
+_FAKE_VAULT_ID = "fake-vault-client-id"
+_FAKE_VAULT_SECRET = "fake-vault-client-secret"
+
+
+@contextlib.contextmanager
+def _no_cf_env():
+    """Clear both CF env vars so the vault tier is what's under test."""
+    with mock.patch.dict(os.environ, {}, clear=False):
+        os.environ.pop(_CF_ID, None)
+        os.environ.pop(_CF_SECRET, None)
+        yield
+
+
+def _vault(mapping):
+    """Stub _read_windows_credential from a {target: value} dict."""
+    return lambda target: mapping.get(target)
+
+
+class TestWindowsCredentialVaultTier(unittest.TestCase):
+    """Windows Credential Manager as the middle credential tier.
+
+    The vault tier exists because Claude Desktop launches the packaged
+    .mcpb outside any shell — it inherits no profile, so a plaintext env
+    var was the only thing that reached it. Env stays FIRST so existing
+    installs are untouched and the cutover stays reversible.
+    """
+
+    def test_env_var_wins_over_vault(self):
+        vault = mock.Mock(side_effect=_vault({_CF_ID_TARGET: _FAKE_VAULT_ID}))
+        with mock.patch.dict(os.environ, {_CF_ID: _FAKE_ENV_ID}):
+            with mock.patch.object(mcp_server, "_read_windows_credential", vault):
+                with mock.patch.object(mcp_server.subprocess, "run") as run:
+                    value, source = mcp_server._resolve_credential(_CF_ID, "u")
+        self.assertEqual(value, _FAKE_ENV_ID)
+        self.assertEqual(source, "env")
+        # Precedence must SHORT-CIRCUIT, not just win a comparison: the
+        # vault is never consulted and the Keychain never shelled out to.
+        vault.assert_not_called()
+        run.assert_not_called()
+
+    def test_vault_used_when_env_absent(self):
+        vault = _vault({_CF_ID_TARGET: _FAKE_VAULT_ID})
+        with _no_cf_env():
+            with mock.patch.object(mcp_server, "_read_windows_credential", vault):
+                with mock.patch.object(mcp_server.subprocess, "run") as run:
+                    value, source = mcp_server._resolve_credential(_CF_ID, "u")
+        self.assertEqual(value, _FAKE_VAULT_ID)
+        self.assertEqual(source, "windows-credential-manager")
+        run.assert_not_called()  # answered before the Keychain tier
+
+    def test_both_cf_credentials_resolve_from_vault(self):
+        vault = _vault(
+            {_CF_ID_TARGET: _FAKE_VAULT_ID, _CF_SECRET_TARGET: _FAKE_VAULT_SECRET}
+        )
+        with _no_cf_env():
+            with mock.patch.object(mcp_server, "_read_windows_credential", vault):
+                headers = mcp_server._ollama_auth_headers("https://ollama.example.com")
+        self.assertEqual(
+            headers,
+            {
+                "CF-Access-Client-Id": _FAKE_VAULT_ID,
+                "CF-Access-Client-Secret": _FAKE_VAULT_SECRET,
+            },
+        )
+
+    def test_blank_env_falls_through_to_vault(self):
+        # Whitespace is not a credential — same fail-closed rule the env
+        # tier already applied before the Keychain.
+        vault = _vault({_CF_ID_TARGET: _FAKE_VAULT_ID})
+        with mock.patch.dict(os.environ, {_CF_ID: "   "}):
+            with mock.patch.object(mcp_server, "_read_windows_credential", vault):
+                value, source = mcp_server._resolve_credential(_CF_ID, "u")
+        self.assertEqual(value, _FAKE_VAULT_ID)
+        self.assertEqual(source, "windows-credential-manager")
+
+    def test_empty_vault_entry_is_treated_as_absent(self):
+        # CredReadW succeeds with CredentialBlobSize 0 for an entry stored
+        # with an empty secret — must not be mistaken for a credential.
+        ok = mock.Mock(returncode=0, stdout="from-keychain\n")
+        with _no_cf_env():
+            with mock.patch.object(
+                mcp_server, "_read_windows_credential", _vault({_CF_ID_TARGET: ""})
+            ):
+                with mock.patch.object(mcp_server.subprocess, "run", return_value=ok):
+                    value, source = mcp_server._resolve_credential(_CF_ID, "u")
+        self.assertEqual(value, "from-keychain")
+        self.assertEqual(source, "macos-keychain")
+
+    def test_missing_everywhere_names_both_remedies(self):
+        miss = mock.Mock(returncode=1, stdout="")
+        with _no_cf_env():
+            with mock.patch.object(mcp_server, "_read_windows_credential", _vault({})):
+                with mock.patch.object(mcp_server.subprocess, "run", return_value=miss):
+                    with self.assertRaises(ValueError) as ctx:
+                        mcp_server._resolve_credential(_CF_ID, "u")
+        message = str(ctx.exception)
+        self.assertIn(_CF_ID, message)  # the env var
+        self.assertIn(_CF_ID_TARGET, message)  # the vault target
+        self.assertIn("security add-generic-password", message)  # the Keychain
+
+    def test_missing_credentials_skip_endpoint_rather_than_raise(self):
+        # Fail closed: an Access-gated host is never called bare.
+        miss = mock.Mock(returncode=1, stdout="")
+        with _no_cf_env():
+            with mock.patch.object(mcp_server, "_read_windows_credential", _vault({})):
+                with mock.patch.object(mcp_server.subprocess, "run", return_value=miss):
+                    self.assertIsNone(
+                        mcp_server._ollama_auth_headers("https://ollama.example.com")
+                    )
+
+    def test_non_cf_service_never_consults_the_vault(self):
+        # Only services in _CRED_VAULT_TARGETS get a vault lookup; the
+        # Perplexity key keeps its exact two-tier behaviour.
+        vault = mock.Mock(return_value="should-not-be-read")
+        ok = mock.Mock(returncode=0, stdout="from-keychain\n")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PERPLEXITY_API_KEY", None)
+            with mock.patch.object(mcp_server, "_read_windows_credential", vault):
+                with mock.patch.object(mcp_server.subprocess, "run", return_value=ok):
+                    value, source = mcp_server._resolve_credential(
+                        "api_tokens", "perplexity"
+                    )
+        self.assertEqual(value, "from-keychain")
+        self.assertEqual(source, "macos-keychain")
+        vault.assert_not_called()
+
+    def test_localhost_endpoint_needs_no_credentials_at_all(self):
+        vault = mock.Mock(return_value=None)
+        with _no_cf_env():
+            with mock.patch.object(mcp_server, "_read_windows_credential", vault):
+                self.assertEqual(
+                    mcp_server._ollama_auth_headers("http://localhost:11434"), {}
+                )
+        vault.assert_not_called()
+
+
+class TestWindowsCredentialReaderIsPlatformGuarded(unittest.TestCase):
+    """The ctypes path must be inert everywhere except Windows.
+
+    CI runs this suite on Linux, where importing ctypes.wintypes raises —
+    so the guard is what keeps `import mcp_server` working at all.
+    """
+
+    def setUp(self):
+        mcp_server._windows_credential_api.cache_clear()
+        self.addCleanup(mcp_server._windows_credential_api.cache_clear)
+
+    def test_api_binding_is_none_off_windows(self):
+        for platform in ("linux", "darwin"):
+            with self.subTest(platform=platform):
+                mcp_server._windows_credential_api.cache_clear()
+                with mock.patch.object(mcp_server.sys, "platform", platform):
+                    self.assertIsNone(mcp_server._windows_credential_api())
+
+    def test_reader_returns_none_off_windows(self):
+        with mock.patch.object(mcp_server.sys, "platform", "linux"):
+            self.assertIsNone(mcp_server._read_windows_credential(_CF_ID_TARGET))
+
+    def test_resolution_off_windows_is_unchanged_two_tier(self):
+        # The whole non-Windows contract in one assertion: env, then
+        # Keychain, with the vault tier structurally absent.
+        ok = mock.Mock(returncode=0, stdout="from-keychain\n")
+        with mock.patch.object(mcp_server.sys, "platform", "darwin"):
+            with _no_cf_env():
+                with mock.patch.object(mcp_server.subprocess, "run", return_value=ok):
+                    value, source = mcp_server._resolve_credential(_CF_ID, "u")
+            self.assertEqual((value, source), ("from-keychain", "macos-keychain"))
+
+            with mock.patch.dict(os.environ, {_CF_ID: _FAKE_ENV_ID}):
+                with mock.patch.object(mcp_server.subprocess, "run") as run:
+                    self.assertEqual(
+                        mcp_server._resolve_credential(_CF_ID, "u"),
+                        (_FAKE_ENV_ID, "env"),
+                    )
+                    run.assert_not_called()
+
+
+class TestCredentialBlobDecoding(unittest.TestCase):
+    """CredentialBlob decoding — UTF-16LE in practice, UTF-8 tolerated."""
+
+    def test_utf16le_blob_is_the_common_case(self):
+        # What CredVault.psm1's [Text.Encoding]::Unicode, cmdkey, and
+        # keyring all write.
+        blob = _FAKE_VAULT_SECRET.encode("utf-16-le")
+        self.assertEqual(mcp_server._decode_credential_blob(blob), _FAKE_VAULT_SECRET)
+
+    def test_utf8_blob_is_tolerated(self):
+        blob = _FAKE_VAULT_SECRET.encode("utf-8")
+        self.assertEqual(mcp_server._decode_credential_blob(blob), _FAKE_VAULT_SECRET)
+
+    def test_ascii_utf8_is_not_misread_as_utf16(self):
+        # The discriminator is the NUL byte: an even-length ASCII UTF-8
+        # blob also decodes "successfully" as UTF-16LE, into garbage.
+        # Guards against a decoder that just tries UTF-16 first.
+        self.assertEqual(mcp_server._decode_credential_blob(b"abcd"), "abcd")
+
+    def test_trailing_nul_terminator_is_stripped(self):
+        blob = (_FAKE_VAULT_ID + "\x00").encode("utf-16-le")
+        self.assertEqual(mcp_server._decode_credential_blob(blob), _FAKE_VAULT_ID)
+
+    def test_empty_blob_is_empty_string(self):
+        self.assertEqual(mcp_server._decode_credential_blob(b""), "")
+
+    def test_undecodable_blob_fails_closed(self):
+        # Lone UTF-16 surrogate half: invalid as both UTF-16LE and UTF-8.
+        # "" reads as absent upstream rather than a garbage credential.
+        self.assertEqual(mcp_server._decode_credential_blob(b"\x00\xd8\xff"), "")
+
+    def test_decoder_never_raises_on_arbitrary_bytes(self):
+        for blob in (b"\xff", b"\xff\xfe", b"\x00", b"\x80\x81\x82", bytes(range(8))):
+            with self.subTest(blob=blob):
+                self.assertIsInstance(mcp_server._decode_credential_blob(blob), str)
+
+
+class TestCredentialSourceReporting(unittest.TestCase):
+    """--check reports the tier, never the value (the cutover check)."""
+
+    def _report(self, env, vault):
+        buf = io.StringIO()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for key in (_CF_ID, _CF_SECRET):
+                os.environ.pop(key, None)
+            os.environ.update(env)
+            with mock.patch.object(
+                mcp_server, "_read_windows_credential", _vault(vault)
+            ):
+                with mock.patch.object(
+                    mcp_server.subprocess, "run", return_value=mock.Mock(returncode=1)
+                ):
+                    with contextlib.redirect_stdout(buf):
+                        mcp_server._report_cf_access_credentials()
+        return buf.getvalue()
+
+    def test_reports_vault_as_the_source(self):
+        out = self._report(
+            {}, {_CF_ID_TARGET: _FAKE_VAULT_ID, _CF_SECRET_TARGET: _FAKE_VAULT_SECRET}
+        )
+        self.assertIn("ok: cloudflare access client id found", out)
+        self.assertIn("windows-credential-manager", out)
+        self.assertNotIn(_FAKE_VAULT_ID, out)  # never the value
+        self.assertNotIn(_FAKE_VAULT_SECRET, out)
+
+    def test_reports_env_as_the_source(self):
+        out = self._report({_CF_ID: _FAKE_ENV_ID, _CF_SECRET: "fake-env-secret"}, {})
+        self.assertIn("(env)", out)
+        self.assertNotIn(_FAKE_ENV_ID, out)
+
+    def test_warns_when_env_and_vault_disagree(self):
+        # The failure this catches: a rotated service token leaves the
+        # vault current and the env var stale. Env wins by precedence, so
+        # the only other symptom is a 403 indistinguishable from
+        # "no credentials configured".
+        out = self._report({_CF_ID: _FAKE_ENV_ID}, {_CF_ID_TARGET: _FAKE_VAULT_ID})
+        self.assertIn("differs", out)
+        self.assertIn(_CF_ID_TARGET, out)
+        self.assertNotIn(_FAKE_ENV_ID, out)
+        self.assertNotIn(_FAKE_VAULT_ID, out)
+
+    def test_no_divergence_warning_when_copies_agree(self):
+        out = self._report({_CF_ID: _FAKE_ENV_ID}, {_CF_ID_TARGET: _FAKE_ENV_ID})
+        self.assertNotIn("differs", out)
+
+    def test_warns_when_credential_is_absent_everywhere(self):
+        out = self._report({}, {})
+        self.assertIn("warn: cloudflare access client id not found", out)
+        self.assertIn("warn: cloudflare access client secret not found", out)
 
 
 class TestModelAllowlistOverride(unittest.TestCase):

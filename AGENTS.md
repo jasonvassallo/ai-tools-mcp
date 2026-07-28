@@ -76,8 +76,17 @@ policy change.
 
 `mcp_server.py` uses PEP 723 inline script metadata — no virtualenv or project config needed. `uv run mcp_server.py` handles everything.
 
-Credentials:
+Credentials resolve env var → Windows Credential Manager → macOS Keychain
+(first non-empty wins). The vault tier is Windows-only and applies only to
+the services listed in `_CRED_VAULT_TARGETS` (currently the Cloudflare
+Access service token); it is read in-process via ctypes/`advapi32.CredReadW`
+because Claude Desktop launches the packaged `.mcpb` outside any shell and
+inherits no profile. Keep env first — that is what makes an install
+upgrade-safe and a vault cutover reversible. Never log a credential value;
+`_resolve_credential` returns a source label for that purpose.
+
 - macOS Keychain: service `api_tokens`, account `perplexity` (required)
+- Windows Credential Manager: generic targets `ai-tools-mcp-cf-access/client-id` and `.../client-secret`
 - Google Cloud ADC at `~/.config/gcloud/application_default_credentials.json` (required for Gemini Deep Research). Configure with `gcloud auth application-default login`. Billing project is auto-detected.
 
 ## Running
