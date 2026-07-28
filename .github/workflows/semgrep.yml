@@ -24,7 +24,14 @@ jobs:
     container:
       image: semgrep/semgrep
     # Skip dependabot PRs (they can't access secrets / Actions context cleanly).
-    if: (github.actor != 'dependabot[bot]')
+    # Honour the `trivial` opt-out tier, matching claude-code-review.yml: a
+    # docs/comment-only PR should cost zero Actions minutes. Gemini and Codex
+    # still review such PRs -- they run server-side as GitHub Apps, not here.
+    # pull_request only: pushes to the default branch carry no labels and must
+    # always run the full scan.
+    if: >
+      (github.actor != 'dependabot[bot]') &&
+      (github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, 'trivial'))
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
