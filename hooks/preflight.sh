@@ -23,7 +23,11 @@ set -uo pipefail
 # before Python ever starts) — and an mcpb manifest cannot create it. This
 # hook runs at every CLI session start, so create it here: idempotent, and
 # inert on macOS (Unix tempdir logic reads TMPDIR, not TMP/TEMP).
-mkdir -p "${HOME}/.uvtmp" 2>/dev/null || true
+# ${HOME:-${USERPROFILE:-}}: this hook only runs under bash (which sets HOME),
+# but the safe expansion keeps the hook's exit-0/pure-JSON contract unbreakable
+# even in a pathological env — under `set -u` a bare ${HOME} would crash the
+# whole hook if HOME were ever unset. If both are empty, mkdir fails silently.
+mkdir -p "${HOME:-${USERPROFILE:-}}/.uvtmp" 2>/dev/null || true
 
 SERVER="${CLAUDE_PLUGIN_ROOT}/mcp_server.py"
 
