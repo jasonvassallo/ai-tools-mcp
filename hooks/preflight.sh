@@ -17,6 +17,14 @@
 
 set -uo pipefail
 
+# The Desktop manifest (mcpb/manifest.json) redirects TMP/TEMP to ~/.uvtmp so
+# uv's scratch writes escape EDR-blocked default temp paths on Windows. uv
+# HARD-FAILS on a cold resolve when that directory is missing (os error 3,
+# before Python ever starts) — and an mcpb manifest cannot create it. This
+# hook runs at every CLI session start, so create it here: idempotent, and
+# inert on macOS (Unix tempdir logic reads TMPDIR, not TMP/TEMP).
+mkdir -p "${HOME}/.uvtmp" 2>/dev/null || true
+
 SERVER="${CLAUDE_PLUGIN_ROOT}/mcp_server.py"
 
 # Emit a SessionStart additionalContext envelope built via python's json module
