@@ -53,6 +53,41 @@ surfaces and the `uv.toml` policy line, so partial edits fail CI
 instead of drifting silently — update its expectations alongside any
 policy change.
 
+## CI Gates on `main`
+
+`semgrep/ci` is a required status check. `claude-gate`
+(`.github/workflows/claude-gate.yml`, a cheap binary Claude Haiku 4.5
+merge gate) is not yet required in branch protection — that's a
+deliberate, separate follow-up step, pending here until it produces a
+real passing run. `claude-gate` carries no `trivial`-label guard: its
+`if:` condition only excludes forks, draft PRs, and PRs whose
+triggering actor is `dependabot[bot]` — it does not check PR
+authorship, so another bot's same-repo PR (e.g. Renovate) still runs
+it, and a human reopening a Dependabot PR also passes the actor check.
+It exists so a `trivial`-labeled PR still has at least one enforced
+check: `trivial` guards only `claude-review` and `semgrep/ci`.
+CodeRabbit's automatic reviews are disabled fleet-wide regardless of
+label (`.coderabbit.yaml`), and Greptile is gated by the separate
+`greptile` label, not `trivial` — a PR carrying both labels still gets
+a Greptile review.
+It runs on plain `pull_request`, which means a same-repo PR editing this
+workflow file could in principle neuter its own gate check — a
+`pull_request_target` trigger would close that hole, but is a confirmed
+no-go here: `claude-code-action`'s OIDC token exchange rejects
+`pull_request_target`-sourced tokens outright (401 on every retry,
+reproduced on PR #55). See the comment in `claude-gate.yml` before
+trying that again. `claude-code-action` does have its own partial
+anti-tamper check instead: it refuses to run when the invoking PR's
+copy of `claude-gate.yml` differs from `main`'s, so any PR editing this
+file self-skips and fails closed (confirmed live on #55) — once
+required, an admin will need to temporarily lift the required context
+to land changes to this file. That stops a PR from rewriting the
+prompt/model to self-approve, but not one that deletes the action step
+or the enforcement step outright. The accepted trade-off is narrow:
+exploiting either gap requires existing write access to this repo
+(forks are already excluded), and a write-access collaborator has
+simpler ways to bypass CI than editing this file.
+
 ## Provider Mapping
 
 - `quick_research`:

@@ -1,18 +1,31 @@
 name: Claude Gate
 
-# claude-gate — the ALWAYS-RUNS second required status check on `main`.
+# claude-gate — will become an ALWAYS-RUNS second required status check on
+# `main`, alongside semgrep/ci (not yet wired into branch protection --
+# pending until this file lands on main untouched and produces a real
+# passing run; a PR that edits this file will always fail, see below).
 #
 # WHY (2026-08-01, ported from mlx-omni-signal): every other reviewer is
 # tiered. claude-review and semgrep/ci skip `trivial`-labelled PRs (#30),
-# CodeRabbit is CLI-only on the Free plan, Greptile is opt-in via the
-# `greptile` label — and GitHub treats a SKIPPED required check as SATISFIED.
-# Before this job existed, `semgrep/ci` was the only required check, so a
-# `trivial`-labelled PR could merge with ZERO enforced CI (observed on
-# mlx-omni-signal #31, and identically on ai-tools-mcp #52/#53). This job
-# carries NO `trivial` guard: it runs on every human-authored, non-fork,
-# non-draft PR, so `main` always has at least one real gate. It is
-# deliberately CHEAP and BINARY — a merge gate, not a reviewer; the tiered
-# reviewers own depth.
+# CodeRabbit is unconditionally off regardless of label, Greptile is opt-in
+# via the separate `greptile` label — and GitHub treats a SKIPPED required
+# check as SATISFIED. Before this job existed, `semgrep/ci` was the only
+# required check, so a `trivial`-labelled PR could merge with ZERO enforced
+# CI (observed on mlx-omni-signal #31, and identically on ai-tools-mcp
+# #52/#53). This job's `if:` below excludes forks, draft PRs, and PRs whose
+# triggering actor is `dependabot[bot]` -- NOT "human-authored" broadly, so
+# another bot's same-repo PR still runs it. It is deliberately CHEAP and
+# BINARY -- a merge gate, not a reviewer; the tiered reviewers own depth.
+#
+# ANTI-TAMPER (partial, not absolute): claude-code-action refuses to run
+# when the invoking PR's copy of THIS file differs from main's -- so any PR
+# editing this file self-skips and fails closed (confirmed live on #55; an
+# admin must temporarily lift the required context to land such changes).
+# That stops a PR from rewriting the prompt/model to self-approve, but does
+# NOT stop a PR that deletes the action step or the "Enforce verdict" step
+# outright -- that would pass with nothing run. Accepted trade-off on a
+# single-owner repo: exploiting either gap already requires write access,
+# and a write-access collaborator has simpler ways to bypass CI.
 #
 # Fleet model convention — which Claude model reviews what (dictated 2026-07-29):
 #   claude-opus-5             — deep/final review: security-sensitive changes and
@@ -32,16 +45,23 @@ name: Claude Gate
 #                               wire it into a security gate.
 
 on:
-  # pull_request_target (not pull_request): this gate is meant to become a
-  # REQUIRED check, so it must run from the base branch's own workflow
-  # definition -- with plain `pull_request`, a same-repo PR editing this file
-  # would execute ITS OWN modified version, letting a contributor neuter the
-  # gate (e.g. hardcode APPROVE) within the very PR it's supposed to police.
-  # Safe here specifically because this workflow never checks out or executes
-  # PR code -- it only reads the diff via the read-only `gh pr diff`/`gh pr
-  # view` calls, which is the standard mitigation for pull_request_target's
-  # usual risk (leaking secrets to attacker-controlled code).
-  pull_request_target:
+  # plain pull_request, NOT pull_request_target (2026-08-01 correction): a
+  # pull_request_target trigger was tried here specifically to close a
+  # same-repo self-tamper hole (a PR editing this file could neuter the gate
+  # and have ITS OWN modified version execute for its own check). That trigger
+  # is a documented no-go for claude-code-action: the OIDC token exchange it
+  # depends on rejects pull_request_target-sourced tokens outright --
+  # confirmed live on PR #55, which failed at "Exchanging OIDC token for app
+  # token... 401 Unauthorized - Invalid OIDC token" on every retry, with no
+  # code change involved (a pure docs PR). Multiple independent
+  # anthropics/claude-code-action issues corroborate this as a known
+  # incompatibility, not a one-off. The self-tamper risk this reverts to is
+  # real but narrow: it requires existing write access to this repo (forks are
+  # already excluded below), and on a single-owner repo a write-access
+  # collaborator has simpler ways to bypass CI than editing this file. Do not
+  # "fix" this back to pull_request_target without first confirming
+  # claude-code-action has resolved the OIDC incompatibility upstream.
+  pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
