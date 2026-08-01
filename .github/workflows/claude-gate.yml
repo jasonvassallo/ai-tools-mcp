@@ -32,7 +32,16 @@ name: Claude Gate
 #                               wire it into a security gate.
 
 on:
-  pull_request:
+  # pull_request_target (not pull_request): this gate is meant to become a
+  # REQUIRED check, so it must run from the base branch's own workflow
+  # definition -- with plain `pull_request`, a same-repo PR editing this file
+  # would execute ITS OWN modified version, letting a contributor neuter the
+  # gate (e.g. hardcode APPROVE) within the very PR it's supposed to police.
+  # Safe here specifically because this workflow never checks out or executes
+  # PR code -- it only reads the diff via the read-only `gh pr diff`/`gh pr
+  # view` calls, which is the standard mitigation for pull_request_target's
+  # usual risk (leaking secrets to attacker-controlled code).
+  pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
