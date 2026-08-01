@@ -518,6 +518,7 @@ Output behavior:
 - Keep the public MCP surface stable.
 - Avoid adding unrelated automation or local-model functionality here.
 - If functionality drifts beyond hosted MCP tooling, it should likely live in a different repo.
+- See [AGENTS.md](AGENTS.md#ci-gates-on-main) for the CI gates enforced on `main`.
 
 ## Secret Hygiene
 
