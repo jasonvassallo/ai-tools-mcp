@@ -76,8 +76,17 @@ workflow file could in principle neuter its own gate check — a
 no-go here: `claude-code-action`'s OIDC token exchange rejects
 `pull_request_target`-sourced tokens outright (401 on every retry,
 reproduced on PR #55). See the comment in `claude-gate.yml` before
-trying that again. The accepted trade-off is narrow: it requires
-existing write access to this repo, and forks are already excluded.
+trying that again. `claude-code-action` does have its own partial
+anti-tamper check instead: it refuses to run when the invoking PR's
+copy of `claude-gate.yml` differs from `main`'s, so any PR editing this
+file self-skips and fails closed (confirmed live on #55) — once
+required, an admin will need to temporarily lift the required context
+to land changes to this file. That stops a PR from rewriting the
+prompt/model to self-approve, but not one that deletes the action step
+or the enforcement step outright. The accepted trade-off is narrow:
+exploiting either gap requires existing write access to this repo
+(forks are already excluded), and a write-access collaborator has
+simpler ways to bypass CI than editing this file.
 
 ## Provider Mapping
 
