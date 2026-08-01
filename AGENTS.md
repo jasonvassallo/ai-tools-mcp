@@ -101,11 +101,13 @@ Add to `~/.claude/.mcp.json`:
 
 ```json
 {
-  "ai-tools-mcp": {
-    "command": "uv",
-    "args": ["run", "/path/to/mcp_server.py"],
-    "env": {
-      "UV_PRERELEASE": "if-necessary-or-explicit"
+  "mcpServers": {
+    "ai-tools-mcp": {
+      "command": "uv",
+      "args": ["run", "/path/to/mcp_server.py"],
+      "env": {
+        "UV_PRERELEASE": "if-necessary-or-explicit"
+      }
     }
   }
 }
