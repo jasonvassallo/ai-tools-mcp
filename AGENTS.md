@@ -53,6 +53,18 @@ surfaces and the `uv.toml` policy line, so partial edits fail CI
 instead of drifting silently — update its expectations alongside any
 policy change.
 
+## CI Gates on `main`
+
+Two required status checks: `semgrep/ci` and `claude-gate`
+(`.github/workflows/claude-gate.yml`, a cheap binary Claude Haiku 4.5
+merge gate). `claude-gate` carries no `trivial`-label guard and runs on
+every human-authored, non-fork, non-draft PR — it exists specifically
+so a `trivial`-labeled PR (which skips `claude-review`, CodeRabbit,
+Greptile, and `semgrep/ci`) still has at least one enforced check.
+It's triggered on `pull_request_target`, not `pull_request`, so a PR
+can't neuter the gate by editing its own workflow file — the check
+always runs the base branch's copy of `claude-gate.yml`.
+
 ## Provider Mapping
 
 - `quick_research`:
