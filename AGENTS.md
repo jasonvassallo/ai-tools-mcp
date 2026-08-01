@@ -55,15 +55,29 @@ policy change.
 
 ## CI Gates on `main`
 
-Two required status checks: `semgrep/ci` and `claude-gate`
+`semgrep/ci` is a required status check. `claude-gate`
 (`.github/workflows/claude-gate.yml`, a cheap binary Claude Haiku 4.5
-merge gate). `claude-gate` carries no `trivial`-label guard and runs on
-every human-authored, non-fork, non-draft PR — it exists specifically
-so a `trivial`-labeled PR (which skips `claude-review`, CodeRabbit,
-Greptile, and `semgrep/ci`) still has at least one enforced check.
-It's triggered on `pull_request_target`, not `pull_request`, so a PR
-can't neuter the gate by editing its own workflow file — the check
-always runs the base branch's copy of `claude-gate.yml`.
+merge gate) is not yet required in branch protection — that's a
+deliberate, separate follow-up step, pending here until it produces a
+real passing run. `claude-gate` carries no `trivial`-label guard: its
+`if:` condition only excludes forks, draft PRs, and PRs whose
+triggering actor is `dependabot[bot]` — it does not check PR
+authorship, so another bot's same-repo PR (e.g. Renovate) still runs
+it, and a human reopening a Dependabot PR also passes the actor check.
+It exists so a `trivial`-labeled PR still has at least one enforced
+check: `trivial` guards only `claude-review` and `semgrep/ci`.
+CodeRabbit's automatic reviews are disabled fleet-wide regardless of
+label (`.coderabbit.yaml`), and Greptile is gated by the separate
+`greptile` label, not `trivial` — a PR carrying both labels still gets
+a Greptile review.
+It runs on plain `pull_request`, which means a same-repo PR editing this
+workflow file could in principle neuter its own gate check — a
+`pull_request_target` trigger would close that hole, but is a confirmed
+no-go here: `claude-code-action`'s OIDC token exchange rejects
+`pull_request_target`-sourced tokens outright (401 on every retry,
+reproduced on PR #55). See the comment in `claude-gate.yml` before
+trying that again. The accepted trade-off is narrow: it requires
+existing write access to this repo, and forks are already excluded.
 
 ## Provider Mapping
 

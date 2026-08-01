@@ -32,16 +32,23 @@ name: Claude Gate
 #                               wire it into a security gate.
 
 on:
-  # pull_request_target (not pull_request): this gate is meant to become a
-  # REQUIRED check, so it must run from the base branch's own workflow
-  # definition -- with plain `pull_request`, a same-repo PR editing this file
-  # would execute ITS OWN modified version, letting a contributor neuter the
-  # gate (e.g. hardcode APPROVE) within the very PR it's supposed to police.
-  # Safe here specifically because this workflow never checks out or executes
-  # PR code -- it only reads the diff via the read-only `gh pr diff`/`gh pr
-  # view` calls, which is the standard mitigation for pull_request_target's
-  # usual risk (leaking secrets to attacker-controlled code).
-  pull_request_target:
+  # plain pull_request, NOT pull_request_target (2026-08-01 correction): a
+  # pull_request_target trigger was tried here specifically to close a
+  # same-repo self-tamper hole (a PR editing this file could neuter the gate
+  # and have ITS OWN modified version execute for its own check). That trigger
+  # is a documented no-go for claude-code-action: the OIDC token exchange it
+  # depends on rejects pull_request_target-sourced tokens outright --
+  # confirmed live on PR #55, which failed at "Exchanging OIDC token for app
+  # token... 401 Unauthorized - Invalid OIDC token" on every retry, with no
+  # code change involved (a pure docs PR). Multiple independent
+  # anthropics/claude-code-action issues corroborate this as a known
+  # incompatibility, not a one-off. The self-tamper risk this reverts to is
+  # real but narrow: it requires existing write access to this repo (forks are
+  # already excluded below), and on a single-owner repo a write-access
+  # collaborator has simpler ways to bypass CI than editing this file. Do not
+  # "fix" this back to pull_request_target without first confirming
+  # claude-code-action has resolved the OIDC incompatibility upstream.
+  pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
