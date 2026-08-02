@@ -447,6 +447,7 @@ def _load_adc() -> tuple[Any, str]:
             "Google Cloud Application Default Credentials not found. "
             "Run: gcloud auth application-default login"
         ) from exc
+    project = project or getattr(creds, "quota_project_id", None)
     if not project:
         raise ValueError(
             "Could not determine billing project from ADC. Run: "
