@@ -1573,6 +1573,32 @@ class TestRunCheckOllamaLine(unittest.TestCase):
         self.assertEqual(kwargs.get("allow_redirects"), False)
 
 
+class TestLoadADC(unittest.TestCase):
+    def test_uses_credential_quota_project_when_default_project_is_missing(self):
+        credentials = types.SimpleNamespace(quota_project_id="quota-project")
+
+        with mock.patch.object(
+            mcp_server.google.auth,
+            "default",
+            return_value=(credentials, None),
+        ):
+            loaded_credentials, project = mcp_server._load_adc()
+
+        self.assertIs(loaded_credentials, credentials)
+        self.assertEqual(project, "quota-project")
+
+    def test_rejects_adc_without_default_or_quota_project(self):
+        credentials = types.SimpleNamespace(quota_project_id=None)
+
+        with mock.patch.object(
+            mcp_server.google.auth,
+            "default",
+            return_value=(credentials, None),
+        ):
+            with self.assertRaisesRegex(ValueError, "billing project"):
+                mcp_server._load_adc()
+
+
 class TestCredentialResolution(unittest.TestCase):
     """v1.2 (issue #20): env-first credential lookup, Keychain fallback."""
 
