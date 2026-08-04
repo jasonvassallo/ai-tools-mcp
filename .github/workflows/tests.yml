@@ -74,10 +74,13 @@ jobs:
         run: uv run --with pytest pytest test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py -q
 
       - name: Ruff format check
-        run: uv tool run ruff format --check mcp_server.py test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py
+        run: uv tool run --from ruff==0.16.1 ruff format --check mcp_server.py test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py
+
+      - name: Ruff lint check
+        run: uv tool run --from ruff==0.16.1 ruff check .
 
   prerelease-guard:
-    # The UV_PRERELEASE=if-necessary-or-explicit pin is duplicated across
+    # The UV_PRERELEASE=if-necessary pin is duplicated across
     # every launch/check surface by necessity (uv config discovery is
     # cwd-based and uv.toml has no include mechanism — see uv.toml's
     # comments), so there is no single source of truth. This job turns the
@@ -94,7 +97,7 @@ jobs:
       - name: Verify UV_PRERELEASE pins on all launch surfaces
         run: |
           set -euo pipefail
-          PIN='UV_PRERELEASE["=: ]+["]?if-necessary-or-explicit'
+          PIN='UV_PRERELEASE["=: ]+["]?if-necessary'
           fail=0
 
           # file:minimum-occurrences — install.sh has two call sites
@@ -125,7 +128,7 @@ jobs:
           done
 
           # Repo-cwd runs are covered by uv.toml rather than an env pin.
-          if grep -q '^prerelease = "if-necessary-or-explicit"$' uv.toml; then
+          if grep -q '^prerelease = "if-necessary"$' uv.toml; then
             echo "ok: uv.toml policy line present"
           else
             echo "FAIL: uv.toml is missing the prerelease policy line"

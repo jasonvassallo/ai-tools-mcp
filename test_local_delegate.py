@@ -308,50 +308,50 @@ class TestOllamaAuthHeaders(unittest.TestCase):
             self.assertIsNone(mcp_server._ollama_auth_headers("https://remote.example"))
 
     def test_probe_sends_cf_headers_to_remote(self):
-        with mock.patch.dict(
-            os.environ,
-            {
-                "AI_TOOLS_OLLAMA_URLS": "https://remote.example",
-                "AI_TOOLS_OLLAMA_URL": "",
-            },
-        ):
-            with self._keychain(
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "AI_TOOLS_OLLAMA_URLS": "https://remote.example",
+                    "AI_TOOLS_OLLAMA_URL": "",
+                },
+            ),
+            self._keychain(
                 {
                     "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
                     "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
                 }
+            ),
+        ):
+            mcp_server._ollama_endpoint_cache.clear()
+            client = _FakeTagsClient(tags_by_url={"https://remote.example": [_MODEL]})
+            with mock.patch.object(
+                mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
             ):
-                mcp_server._ollama_endpoint_cache.clear()
-                client = _FakeTagsClient(
-                    tags_by_url={"https://remote.example": [_MODEL]}
-                )
-                with mock.patch.object(
-                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
-                ):
-                    endpoint = asyncio.run(mcp_server._select_ollama_endpoint(_MODEL))
+                endpoint = asyncio.run(mcp_server._select_ollama_endpoint(_MODEL))
         self.assertEqual(endpoint, "https://remote.example")
         _, kwargs = client.get_calls[0]
         self.assertEqual(kwargs["headers"]["CF-Access-Client-Id"], "id-123")
 
     def test_post_sends_cf_headers_and_never_leaks_secret_in_errors(self):
-        with self._keychain(
-            {
-                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
-                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
-            }
-        ):
-            with mock.patch.object(
+        with (
+            self._keychain(
+                {
+                    "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                    "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+                }
+            ),
+            mock.patch.object(
                 mcp_server,
                 "_select_ollama_endpoint",
                 mock.AsyncMock(return_value="https://remote.example"),
+            ),
+        ):
+            client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
+            with mock.patch.object(
+                mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
             ):
-                client = _FakeClient(exc=mcp_server.httpx.ConnectError("refused"))
-                with mock.patch.object(
-                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
-                ):
-                    out = asyncio.run(
-                        mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
-                    )
+                out = asyncio.run(mcp_server._post_ollama_chat({"model": _MODEL}, 30.0))
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("sec-456", out["error"])
 
@@ -360,29 +360,29 @@ class TestOllamaAuthHeaders(unittest.TestCase):
         # redact_secrets has no CF-Access-token pattern, so the only backstop
         # is the value-aware scrub in _post_ollama_chat's HTTPStatusError
         # branch — assert it actually strips the live secret value.
-        with self._keychain(
-            {
-                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
-                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
-            }
-        ):
-            with mock.patch.object(
+        with (
+            self._keychain(
+                {
+                    "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                    "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+                }
+            ),
+            mock.patch.object(
                 mcp_server,
                 "_select_ollama_endpoint",
                 mock.AsyncMock(return_value="https://remote.example"),
-            ):
-                client = _FakeClient(
-                    response=_FakeResponse(
-                        status_code=403,
-                        text="denied for CF-Access-Client-Secret: sec-456",
-                    )
+            ),
+        ):
+            client = _FakeClient(
+                response=_FakeResponse(
+                    status_code=403,
+                    text="denied for CF-Access-Client-Secret: sec-456",
                 )
-                with mock.patch.object(
-                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
-                ):
-                    out = asyncio.run(
-                        mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
-                    )
+            )
+            with mock.patch.object(
+                mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+            ):
+                out = asyncio.run(mcp_server._post_ollama_chat({"model": _MODEL}, 30.0))
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("sec-456", out["error"])
         self.assertIn("[REDACTED_CF_ACCESS]", out["error"])
@@ -394,29 +394,29 @@ class TestOllamaAuthHeaders(unittest.TestCase):
         # AFTER truncation (substring match against the full secret), it never
         # finds the full value in the truncated snippet and the fragment
         # leaks. The scrub must run on the full body BEFORE truncation.
-        with self._keychain(
-            {
-                "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
-                "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
-            }
-        ):
-            with mock.patch.object(
+        with (
+            self._keychain(
+                {
+                    "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+                    "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+                }
+            ),
+            mock.patch.object(
                 mcp_server,
                 "_select_ollama_endpoint",
                 mock.AsyncMock(return_value="https://remote.example"),
+            ),
+        ):
+            secret = "sec-456"
+            filler_before = "a" * 495
+            filler_after = "b" * (600 - len(filler_before) - len(secret))
+            body = filler_before + secret + filler_after
+            self.assertEqual(len(body), 600)
+            client = _FakeClient(response=_FakeResponse(status_code=403, text=body))
+            with mock.patch.object(
+                mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
             ):
-                secret = "sec-456"
-                filler_before = "a" * 495
-                filler_after = "b" * (600 - len(filler_before) - len(secret))
-                body = filler_before + secret + filler_after
-                self.assertEqual(len(body), 600)
-                client = _FakeClient(response=_FakeResponse(status_code=403, text=body))
-                with mock.patch.object(
-                    mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
-                ):
-                    out = asyncio.run(
-                        mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
-                    )
+                out = asyncio.run(mcp_server._post_ollama_chat({"model": _MODEL}, 30.0))
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("sec-456", out["error"])
         self.assertNotIn("sec-4", out["error"])
@@ -559,11 +559,13 @@ def _no_security_binary(service, account):
 class TestResolveOllamaChain(unittest.TestCase):
     def _chain(self, env, keychain=_no_keychain):
         cleared = {k: "" for k in ("AI_TOOLS_OLLAMA_URLS", "AI_TOOLS_OLLAMA_URL")}
-        with mock.patch.dict(os.environ, {**cleared, **env}):
-            with mock.patch.object(
+        with (
+            mock.patch.dict(os.environ, {**cleared, **env}),
+            mock.patch.object(
                 mcp_server, "get_api_key_from_keychain", side_effect=keychain
-            ):
-                return mcp_server._resolve_ollama_chain()
+            ),
+        ):
+            return mcp_server._resolve_ollama_chain()
 
     def test_urls_env_is_ordered_chain(self):
         chain = self._chain(
@@ -1590,13 +1592,15 @@ class TestLoadADC(unittest.TestCase):
     def test_rejects_adc_without_default_or_quota_project(self):
         credentials = types.SimpleNamespace(quota_project_id=None)
 
-        with mock.patch.object(
-            mcp_server.google.auth,
-            "default",
-            return_value=(credentials, None),
+        with (
+            mock.patch.object(
+                mcp_server.google.auth,
+                "default",
+                return_value=(credentials, None),
+            ),
+            self.assertRaisesRegex(ValueError, "billing project"),
         ):
-            with self.assertRaisesRegex(ValueError, "billing project"):
-                mcp_server._load_adc()
+            mcp_server._load_adc()
 
 
 class TestCredentialResolution(unittest.TestCase):
@@ -1643,11 +1647,13 @@ class TestCredentialResolution(unittest.TestCase):
     def test_non_macos_no_security_binary_degrades_to_same_error(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OLLAMA_URL", None)
-            with mock.patch.object(
-                mcp_server.subprocess, "run", side_effect=FileNotFoundError
+            with (
+                mock.patch.object(
+                    mcp_server.subprocess, "run", side_effect=FileNotFoundError
+                ),
+                self.assertRaises(ValueError) as ctx,
             ):
-                with self.assertRaises(ValueError) as ctx:
-                    mcp_server.get_api_key_from_keychain("OLLAMA_URL", "u")
+                mcp_server.get_api_key_from_keychain("OLLAMA_URL", "u")
         self.assertIn("OLLAMA_URL", str(ctx.exception))
 
 
@@ -1739,12 +1745,14 @@ class TestWindowsCredentialVaultTier(unittest.TestCase):
         # CredReadW succeeds with CredentialBlobSize 0 for an entry stored
         # with an empty secret — must not be mistaken for a credential.
         ok = mock.Mock(returncode=0, stdout="from-keychain\n")
-        with _no_cf_env():
-            with mock.patch.object(
+        with (
+            _no_cf_env(),
+            mock.patch.object(
                 mcp_server, "_read_windows_credential", _vault({_CF_ID_TARGET: ""})
-            ):
-                with mock.patch.object(mcp_server.subprocess, "run", return_value=ok):
-                    value, source = mcp_server._resolve_credential(_CF_ID, "u")
+            ),
+            mock.patch.object(mcp_server.subprocess, "run", return_value=ok),
+        ):
+            value, source = mcp_server._resolve_credential(_CF_ID, "u")
         self.assertEqual(value, "from-keychain")
         self.assertEqual(source, "macos-keychain")
 
@@ -1896,14 +1904,16 @@ class TestCredentialSourceReporting(unittest.TestCase):
             for key in (_CF_ID, _CF_SECRET):
                 os.environ.pop(key, None)
             os.environ.update(env)
-            with mock.patch.object(
-                mcp_server, "_read_windows_credential", _vault(vault)
-            ):
-                with mock.patch.object(
+            with (
+                mock.patch.object(
+                    mcp_server, "_read_windows_credential", _vault(vault)
+                ),
+                mock.patch.object(
                     mcp_server.subprocess, "run", return_value=mock.Mock(returncode=1)
-                ):
-                    with contextlib.redirect_stdout(buf):
-                        mcp_server._report_cf_access_credentials()
+                ),
+                contextlib.redirect_stdout(buf),
+            ):
+                mcp_server._report_cf_access_credentials()
         return buf.getvalue()
 
     def test_reports_vault_as_the_source(self):

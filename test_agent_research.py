@@ -660,13 +660,15 @@ class TestGetAgentResponseHelper(unittest.TestCase):
         async def fake_get_client():
             return _FakeClient()
 
-        with mock.patch.object(
-            mcp_server, "get_api_key_from_keychain", return_value="test-key"
-        ):
-            with mock.patch.object(
+        with (
+            mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", return_value="test-key"
+            ),
+            mock.patch.object(
                 mcp_server, "_get_http_client", side_effect=fake_get_client
-            ):
-                data = asyncio.run(mcp_server._get_agent_response("resp_abc-123"))
+            ),
+        ):
+            data = asyncio.run(mcp_server._get_agent_response("resp_abc-123"))
         self.assertEqual(data, {"ok": 1})
         self.assertEqual(
             captured["url"], "https://api.perplexity.ai/v1/responses/resp_abc-123"
@@ -687,13 +689,15 @@ class TestGetAgentResponseHelper(unittest.TestCase):
         async def fake_get_client():
             return _FakeClient()
 
-        with mock.patch.object(
-            mcp_server, "get_api_key_from_keychain", return_value="test-key"
-        ):
-            with mock.patch.object(
+        with (
+            mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", return_value="test-key"
+            ),
+            mock.patch.object(
                 mcp_server, "_get_http_client", side_effect=fake_get_client
-            ):
-                data = asyncio.run(mcp_server._get_agent_response("resp_abc"))
+            ),
+        ):
+            data = asyncio.run(mcp_server._get_agent_response("resp_abc"))
         self.assertEqual(data["status"], "failed")
         self.assertIn("connection timed out", data["error"])
 
@@ -705,15 +709,17 @@ class TestPostAgentResearchHelper(unittest.TestCase):
         async def fake_get_client():
             return fake_client
 
-        with mock.patch.object(
-            mcp_server, "get_api_key_from_keychain", return_value="test-key"
-        ):
-            with mock.patch.object(
+        with (
+            mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", return_value="test-key"
+            ),
+            mock.patch.object(
                 mcp_server, "_get_http_client", side_effect=fake_get_client
-            ):
-                return asyncio.run(
-                    mcp_server._post_agent_research({"model": "perplexity/sonar"})
-                )
+            ),
+        ):
+            return asyncio.run(
+                mcp_server._post_agent_research({"model": "perplexity/sonar"})
+            )
 
     def test_posts_to_agent_endpoint_with_bearer_and_timeout(self):
         captured: dict = {}

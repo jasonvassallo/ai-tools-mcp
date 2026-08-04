@@ -40,7 +40,7 @@ The same `mcp_server.py` is wrapped three ways. When making changes, update all 
 - Claude Desktop extension: `mcpb/manifest.json` (built into `dist/ai-tools-mcp.mcpb` by `scripts/build_mcpb.sh`)
 
 Every surface that launches or preflight-checks the server via `uv run`
-pins `UV_PRERELEASE=if-necessary-or-explicit` in its env (the three
+pins `UV_PRERELEASE=if-necessary` in its env (the three
 launch entries above, `hooks/preflight.sh`, `install.sh`'s check, and
 the README's manual `claude mcp add` examples), and the repo-level
 `uv.toml` pins the same policy for repo-cwd runs. There is no single
@@ -141,7 +141,7 @@ Add to `~/.claude/.mcp.json`:
       "command": "uv",
       "args": ["run", "/path/to/mcp_server.py"],
       "env": {
-        "UV_PRERELEASE": "if-necessary-or-explicit"
+        "UV_PRERELEASE": "if-necessary"
       }
     }
   }

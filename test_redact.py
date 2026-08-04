@@ -707,11 +707,13 @@ class TestPostGeminiInteractionHelper(unittest.TestCase):
         async def failing_headers():
             raise RuntimeError("ADC credentials unavailable")
 
-        with mock.patch.object(
-            mcp_server, "_gemini_headers", side_effect=failing_headers
+        with (
+            mock.patch.object(
+                mcp_server, "_gemini_headers", side_effect=failing_headers
+            ),
+            self.assertRaises(RuntimeError),
         ):
-            with self.assertRaises(RuntimeError):
-                asyncio.run(mcp_server._post_gemini_interaction({"input": "query"}))
+            asyncio.run(mcp_server._post_gemini_interaction({"input": "query"}))
 
 
 class TestGetGeminiInteractionHelper(unittest.TestCase):
