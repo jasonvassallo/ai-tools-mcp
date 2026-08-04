@@ -16,4 +16,4 @@
 # - Key and value verified on uv 0.11.29 (minimum verified version).
 #   An older uv that doesn't recognize them may silently ignore this
 #   file rather than error — don't assume the guard holds below that.
-prerelease = "if-necessary-or-explicit"
+prerelease = "if-necessary"

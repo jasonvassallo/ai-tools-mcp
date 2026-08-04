@@ -4,7 +4,7 @@
       "command": "uv",
       "args": ["run", "${CLAUDE_PLUGIN_ROOT}/mcp_server.py"],
       "env": {
-        "UV_PRERELEASE": "if-necessary-or-explicit"
+        "UV_PRERELEASE": "if-necessary"
       }
     }
   }

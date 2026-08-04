@@ -1,0 +1,10 @@
+# Pin the substantive rules already used by this repository. The targeted
+# exclusions below are intentional: the test suite models exception paths and
+# closure races, while benchmark scripts prioritize resilient corpus processing
+# over production-style error reporting.
+[lint]
+select = ["B023", "BLE001", "C408", "FURB167", "I001", "PLW1510", "S110", "S112", "SIM117", "TRY004"]
+
+[lint.per-file-ignores]
+"test_*.py" = ["B023", "BLE001", "SIM117"]
+"benchmarks/local-model-bench/*.py" = ["BLE001", "C408", "PLW1510", "S110", "S112"]
