@@ -1385,6 +1385,27 @@ class TestLocalDelegateSync(unittest.TestCase):
         self.assertEqual(timeout_s, 300.0)
         self.assertIn("ok", out[0].text)
 
+    def test_keep_alive_zero_default_tag_matching(self):
+        # PR #60 review findings: the env-overridable allowlist accepts
+        # arbitrary tags, so the qwen match must survive namespacing and
+        # casing rather than a bare whole-tag prefix check.
+        applies = mcp_server._keep_alive_zero_default_applies
+        for tag in (
+            "qwen3.6:35b-a3b-coding-nvfp4",
+            "qwen3.6:27b-coding-nvfp4-64k",
+            "Qwen3:latest",
+            "QWEN2.5-coder:7b",
+            "acme/qwen3:latest",
+            "hf.co/acme/qwen-model",
+        ):
+            self.assertTrue(applies(tag), msg=tag)
+        for tag in (
+            "gemma4:12b-nvfp4",
+            "acme/gemma:2b",
+            "hf.co/qwenteam/gemma-x",  # qwen in namespace, not model name
+        ):
+            self.assertFalse(applies(tag), msg=tag)
+
     def test_qwen_defaults_keep_alive_zero(self):
         # Contamination mitigation: a resident qwen runner returns other
         # prompts' answers on repeat calls; omitted keep_alive → "0".

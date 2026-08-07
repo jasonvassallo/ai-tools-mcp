@@ -1627,6 +1627,19 @@ _DELEGATE_KEEP_ALIVE_RE = re.compile(r"^(0|[1-9][0-9]{0,3}(s|m|h))$")
 # caller keep_alive always wins (deliberate warm-pinning stays possible).
 _KEEP_ALIVE_ZERO_MODEL_PREFIXES: tuple[str, ...] = ("qwen",)
 
+
+def _keep_alive_zero_default_applies(model: str) -> bool:
+    """True when an omitted keep_alive should default to "0" for this tag.
+
+    Matches on the final path component, case-folded: the env-overridable
+    allowlist accepts arbitrary tags (e.g. "hf.co/acme/qwen-model",
+    "Qwen3:latest"), where a bare whole-tag prefix check would silently
+    skip the mitigation (PR #60 review findings).
+    """
+    name = model.rsplit("/", 1)[-1].lower()
+    return name.startswith(_KEEP_ALIVE_ZERO_MODEL_PREFIXES)
+
+
 # Shared-client default is 30s; delegate calls pass explicit per-request
 # timeouts (same mechanism as _AGENT_API_TIMEOUT_SECONDS).
 _DELEGATE_TIMEOUT_DEFAULT_S = 300
@@ -3089,7 +3102,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # After final model resolution (implicit calls may have re-resolved
         # `model` above): qwen tags default to keep_alive "0" — the proven
         # repeat-call contamination mitigation. Explicit caller values win.
-        if keep_alive is None and model.startswith(_KEEP_ALIVE_ZERO_MODEL_PREFIXES):
+        if keep_alive is None and _keep_alive_zero_default_applies(model):
             keep_alive = "0"
 
         messages: list[dict[str, str]] = []
