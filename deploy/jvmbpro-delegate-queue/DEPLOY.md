@@ -90,22 +90,24 @@ sudo launchctl kickstart -k system/homebrew.mxcl.cloudflared
 
 Route `queue-mbp.djvassallo.com` at JVMBPro's tunnel. Uses the
 `CLOUDFLARE_API_TOKEN` Keychain item (zone `djvassallo.com`, id
-`d8edb0a8…` — fill from the zone list if needed); the token is read
-into the process environment, never echoed:
+`d8edb0a8…` — fill from the zone list if needed); the token is piped
+straight from the Keychain into curl's header reader on stdin
+(`-H @-`, verified on the fleet's curl 8.7.1), so it never appears in
+any process argument list, shell variable, or environment:
 
 ```bash
-CF_TOKEN=$(security find-generic-password -s CLOUDFLARE_API_TOKEN -w)
-curl -s -X POST \
-  "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records" \
-  -H "Authorization: Bearer $CF_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data '{
-    "type": "CNAME",
-    "name": "queue-mbp",
-    "content": "47b3a9bb-7c29-421d-b7ad-c2739652f9d2.cfargotunnel.com",
-    "proxied": true
-  }'
-unset CF_TOKEN
+security find-generic-password -s CLOUDFLARE_API_TOKEN -w |
+  sed 's/^/Authorization: Bearer /' |
+  curl -s -X POST \
+    "https://api.cloudflare.com/client/v4/zones/<ZONE_ID>/dns_records" \
+    -H @- \
+    -H "Content-Type: application/json" \
+    --data '{
+      "type": "CNAME",
+      "name": "queue-mbp",
+      "content": "47b3a9bb-7c29-421d-b7ad-c2739652f9d2.cfargotunnel.com",
+      "proxied": true
+    }'
 ```
 
 ## 5. Cloudflare Access application (reuse the existing Ollama service token)
@@ -127,14 +129,16 @@ In Zero Trust → Access → Applications, add a self-hosted application:
 curl -s -o /dev/null -w '%{http_code}\n' https://queue-mbp.djvassallo.com/healthz
 # expect: 403
 
-# With the service-token headers it reaches the queue (values read from
-# the Keychain into variables, never typed inline):
-CF_ID=$(security find-generic-password -s OLLAMA_CF_ACCESS_CLIENT_ID -w)
-CF_SECRET=$(security find-generic-password -s OLLAMA_CF_ACCESS_CLIENT_SECRET -w)
-curl -s https://queue-mbp.djvassallo.com/healthz \
-  -H "CF-Access-Client-Id: $CF_ID" \
-  -H "CF-Access-Client-Secret: $CF_SECRET"
-unset CF_ID CF_SECRET
+# With the service-token headers it reaches the queue. Both header
+# values are piped from the Keychain to curl's stdin header reader
+# (-H @-), so neither ever appears in a process argument list, shell
+# variable, or environment:
+{
+  security find-generic-password -s OLLAMA_CF_ACCESS_CLIENT_ID -w |
+    sed 's/^/CF-Access-Client-Id: /'
+  security find-generic-password -s OLLAMA_CF_ACCESS_CLIENT_SECRET -w |
+    sed 's/^/CF-Access-Client-Secret: /'
+} | curl -s https://queue-mbp.djvassallo.com/healthz -H @-
 # expect: {"status": "ok", ...}
 ```
 

@@ -628,6 +628,15 @@ def _make_handler(store: QueueStore) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         server_version = "delegate-queue"
         protocol_version = "HTTP/1.1"
+        # Finite per-connection socket timeout. StreamRequestHandler
+        # applies this via settimeout() in setup(), and
+        # handle_one_request() treats the resulting socket.timeout as
+        # terminal — the connection closes instead of parking one of
+        # ThreadingHTTPServer's threads forever behind a client that
+        # stalls mid-request (reachable through the Access tunnel, so
+        # not a purely loopback concern). 60 s comfortably covers both
+        # loopback and tunnel-relayed callers.
+        timeout = 60
 
         # ── plumbing ─────────────────────────────────────────────────
 
@@ -705,7 +714,13 @@ def _make_handler(store: QueueStore) -> type[BaseHTTPRequestHandler]:
                 if self.path != "/v1/jobs":
                     self._send_json(404, {"error": "not found"})
                     return
-                length = int(self.headers.get("Content-Length") or 0)
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    # A non-numeric header is a client error, not the
+                    # 500 the boundary except below would turn it into.
+                    self._send_json(400, {"error": "invalid Content-Length"})
+                    return
                 if length <= 0:
                     self._send_json(400, {"error": "empty body"})
                     return

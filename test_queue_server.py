@@ -21,6 +21,7 @@ import contextlib
 import importlib.util
 import json
 import secrets
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -438,6 +439,31 @@ class TestEndToEnd(unittest.TestCase):
         code, body = _http("POST", f"{self.base}/v1/jobs", {**_PAYLOAD, "evil": True})
         self.assertEqual(code, 400)
         self.assertIn("unknown payload keys", body["error"])
+
+    def test_non_numeric_content_length_400(self):
+        # urllib always sends a correct Content-Length, so drive a raw
+        # socket to deliver the malformed header. Must be a 400 client
+        # error, not a 500 from the boundary handler.
+        with socket.create_connection(
+            ("127.0.0.1", self.server.server_address[1]), timeout=5
+        ) as sock:
+            sock.sendall(
+                b"POST /v1/jobs HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Length: abc\r\n"
+                b"Connection: close\r\n"
+                b"\r\n"
+            )
+            response = sock.recv(4096)
+        self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
+        self.assertIn(b"invalid Content-Length", response)
+
+    def test_handler_has_finite_socket_timeout(self):
+        # StreamRequestHandler applies Handler.timeout via settimeout();
+        # None would let a stalled client park a server thread forever.
+        timeout = self.server.RequestHandlerClass.timeout
+        self.assertIsNotNone(timeout)
+        self.assertGreater(timeout, 0)
 
     def test_oversize_body_413(self):
         big = {**_PAYLOAD}
