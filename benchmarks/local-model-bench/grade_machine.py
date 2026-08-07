@@ -24,7 +24,7 @@ OUT = HERE / "out"
 
 def strip_fence(text: str) -> str:
     """Pull the first fenced code block, or return the text unfenced."""
-    m = re.search(r"```(?:[a-zA-Z]*)\n(.*?)```", text, re.S)
+    m = re.search(r"```(?:[a-zA-Z]*)\n(.*?)```", text, re.DOTALL)
     return m.group(1) if m else text
 
 
@@ -304,9 +304,9 @@ GRADERS = {
 
 # ── review: mechanical properties only ────────────────────────────────
 
-VERDICT_RE = re.compile(r"VERDICT:\s*(APPROVE|REQUEST_CHANGES)", re.I)
+VERDICT_RE = re.compile(r"VERDICT:\s*(APPROVE|REQUEST_CHANGES)", re.IGNORECASE)
 FINDING_RE = re.compile(
-    r"^\s*[-*]\s*\[?(CRITICAL|MAJOR|MINOR|NONE)\]?\s*:?\s*(.*)$", re.I | re.M
+    r"^\s*[-*]\s*\[?(CRITICAL|MAJOR|MINOR|NONE)\]?\s*:?\s*(.*)$", re.IGNORECASE | re.MULTILINE
 )
 
 
@@ -321,7 +321,7 @@ def parse_review(text: str):
         desc = desc.strip()
         if desc:
             findings.append({"severity": sev, "text": desc})
-    declared_none = bool(re.search(r"^\s*[-*]\s*NONE\s*$", text, re.M))
+    declared_none = bool(re.search(r"^\s*[-*]\s*NONE\s*$", text, re.MULTILINE))
     # strict format: verdict line present, no prose outside the template
     stray = [
         ln

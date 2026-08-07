@@ -67,7 +67,7 @@ fi
 # UV_PRERELEASE is pinned so the check verifies the same resolution the
 # launch configs use — the hook runs from the user's project cwd, where
 # the repo uv.toml is not discovered and ambient env would apply.
-if check_output=$(UV_PRERELEASE="if-necessary-or-explicit" uv run "${SERVER}" --check 2>&1); then
+if check_output=$(UV_PRERELEASE="if-necessary" uv run "${SERVER}" --check 2>&1); then
   emit "ai-tools-mcp preflight: OK" "${check_output}"
 else
   emit "ai-tools-mcp preflight: WARNING — some credentials are not healthy" "${check_output}"

@@ -197,7 +197,7 @@ SCRIPT_PATH="${INSTALL_DIR}/${SCRIPT_NAME}"
 SERVER_ENTRY=$(jq -n \
     --arg cmd "$UV_PATH" \
     --arg script "$SCRIPT_PATH" \
-    '{command: $cmd, args: ["run", $script], env: {UV_PRERELEASE: "if-necessary-or-explicit"}}')
+    '{command: $cmd, args: ["run", $script], env: {UV_PRERELEASE: "if-necessary"}}')
 
 # --- Claude Code: ~/.claude/.mcp.json ---
 mkdir -p "$(dirname "$CLAUDE_CODE_CONFIG")"
@@ -268,7 +268,7 @@ done
 
 # Verify dependencies resolve and config is valid
 echo -e "  ${DIM}Running preflight check (uv run --check)...${NC}"
-CHECK_OUTPUT=$(UV_PRERELEASE="if-necessary-or-explicit" "$UV_PATH" run "$SCRIPT_PATH" --check 2>&1) && {
+CHECK_OUTPUT=$(UV_PRERELEASE="if-necessary" "$UV_PATH" run "$SCRIPT_PATH" --check 2>&1) && {
     print_ok "Dependencies resolve and config valid"
 } || {
     print_warn "Preflight check failed:"

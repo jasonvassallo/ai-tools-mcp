@@ -115,9 +115,8 @@ except ImportError:  # pragma: no cover - absent on POSIX; mocked in tests
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import TextContent, Tool
 from openai import OpenAI
-
 
 # Patterns for secret-shape strings that may appear in scraped web content
 # returned by upstream search providers. Applied at the response boundary so
@@ -392,6 +391,7 @@ def _resolve_credential(service: str, account: str) -> tuple[str, str]:
         result = subprocess.run(
             ["security", "find-generic-password", "-s", service, "-a", account, "-w"],
             capture_output=True,
+            check=False,
             text=True,
         )
     except FileNotFoundError:
@@ -447,6 +447,7 @@ def _load_adc() -> tuple[Any, str]:
             "Google Cloud Application Default Credentials not found. "
             "Run: gcloud auth application-default login"
         ) from exc
+    project = project or getattr(creds, "quota_project_id", None)
     if not project:
         raise ValueError(
             "Could not determine billing project from ADC. Run: "
@@ -895,11 +896,14 @@ def load_session(session_id: str) -> dict[str, Any]:
         raise ValueError(f"Session file invalid or unreadable: {session_id}") from e
 
     # Defensive: a syntactically-valid JSON file shaped like ``[]`` or
-    # ``"string"`` would crash the .get() calls below. Raise a clean
-    # ValueError so the MCP layer sees a consistent error contract
+    # ``"string"`` would crash the .get() calls below. Preserve the public
+    # ValueError contract for malformed persisted content, distinct from a
+    # missing or unreadable session.
     # (per PR #3 follow-up review, Gemini medium L275).
     if not isinstance(data, dict):
-        raise ValueError(f"Session file shape is not a JSON object: {session_id}")
+        raise ValueError(  # noqa: TRY004 - persisted-content validation is a value error
+            f"Session file shape is not a JSON object: {session_id}"
+        )
 
     # Use `or` fallback (not get-default) so JSON null round-trips to a
     # usable value rather than None — same reason as the list_sessions
@@ -952,7 +956,9 @@ def update_session(session_id: str, name: str | None = None) -> dict[str, Any]:
         # Defensive: same shape guard as load_session (per PR #3
         # follow-up review, Gemini medium L301).
         if not isinstance(data, dict):
-            raise ValueError(f"Session file shape is not a JSON object: {session_id}")
+            raise ValueError(  # noqa: TRY004 - persisted-content validation is a value error
+                f"Session file shape is not a JSON object: {session_id}"
+            )
 
         if name is not None:
             # `is not None` (not truthy check) so callers can pass
@@ -2765,7 +2771,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     <= _AGENT_MAX_OUTPUT_TOKENS_MAX
                 )
             ):
-                raise ValueError(
+                raise TypeError(
                     "max_output_tokens must be an integer in "
                     f"[{_AGENT_MAX_OUTPUT_TOKENS_MIN}, "
                     f"{_AGENT_MAX_OUTPUT_TOKENS_MAX}]; got {max_output_tokens!r}."
@@ -2776,11 +2782,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # contract as collaborative_planning on gemini_deep_research_start).
             background = arguments.get("background", False)
             if not isinstance(background, bool):
-                raise ValueError(
+                raise TypeError(
                     "background must be a JSON boolean (true/false), "
                     "not a string or number."
                 )
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             err = {"status": "failed", "error": str(exc)}
             return [TextContent(type="text", text=json.dumps(err, indent=2))]
 
@@ -2888,7 +2894,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # JSON-stringified flag would silently flip the meaning.
             collaborative_planning = arguments.get("collaborative_planning", False)
             if not isinstance(collaborative_planning, bool):
-                raise ValueError(
+                raise TypeError(
                     "collaborative_planning must be a JSON boolean "
                     "(true/false), not a string or number."
                 )
@@ -2948,7 +2954,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 ),
             }
             return [TextContent(type="text", text=json.dumps(result, indent=2))]
-        except ValueError as exc:
+        except (TypeError, ValueError) as exc:
             err = {"status": "failed", "error": str(exc)}
             return [TextContent(type="text", text=json.dumps(err, indent=2))]
 

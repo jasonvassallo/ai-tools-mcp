@@ -756,11 +756,13 @@ class TestAtomicWrites(_SessionMgmtBase):
         """If json.dump raises, the temp file must be cleaned up so
         SESSIONS_DIR doesn't accumulate .tmp litter on disk-full or
         permission errors."""
-        with mock.patch.object(
-            mcp_server.json, "dump", side_effect=OSError("disk full")
+        with (
+            mock.patch.object(
+                mcp_server.json, "dump", side_effect=OSError("disk full")
+            ),
+            self.assertRaises(OSError),
         ):
-            with self.assertRaises(OSError):
-                mcp_server.save_session(name="fail", messages=[])
+            mcp_server.save_session(name="fail", messages=[])
         leftover = list(self.tmp_path.glob("*.tmp"))
         self.assertEqual(leftover, [], f"Leftover temp files: {leftover}")
 
@@ -778,11 +780,13 @@ class TestAtomicWrites(_SessionMgmtBase):
         with open(sess_path, "r", encoding="utf-8") as f:
             before = json.load(f)
 
-        with mock.patch.object(
-            mcp_server.json, "dump", side_effect=OSError("disk full")
+        with (
+            mock.patch.object(
+                mcp_server.json, "dump", side_effect=OSError("disk full")
+            ),
+            self.assertRaises(OSError),
         ):
-            with self.assertRaises(OSError):
-                mcp_server.update_session(sid, name="should-not-stick")
+            mcp_server.update_session(sid, name="should-not-stick")
 
         with open(sess_path, "r", encoding="utf-8") as f:
             after = json.load(f)
@@ -1109,11 +1113,13 @@ class TestAtomicWrites(_SessionMgmtBase):
         sess_path = self.tmp_path / f"{sid}.json"
 
         # Force update_session to raise during write.
-        with mock.patch.object(
-            mcp_server.json, "dump", side_effect=OSError("simulated")
+        with (
+            mock.patch.object(
+                mcp_server.json, "dump", side_effect=OSError("simulated")
+            ),
+            self.assertRaises(OSError),
         ):
-            with self.assertRaises(OSError):
-                mcp_server.update_session(sid, name="will-fail")
+            mcp_server.update_session(sid, name="will-fail")
 
         # The lock file may exist (we don't unlink on release —
         # that's documented behavior to avoid a re-acquire race),
@@ -1132,24 +1138,42 @@ class TestAtomicWrites(_SessionMgmtBase):
         save = mcp_server.save_session(name="vanishing", messages=[])
         sid = save["session_id"]
         sess_path = self.tmp_path / f"{sid}.json"
+        original_contents = sess_path.read_text(encoding="utf-8")
 
-        # Wrap json.load so it deletes the file as a side effect after
-        # successfully reading it. This simulates a concurrent
-        # delete_session() landing between our read and our write.
+        # Model a non-cooperating delete after the read.  On Windows an
+        # open text handle cannot reliably be unlinked, so deleting the
+        # physical fixture from inside json.load makes this POSIX-oriented
+        # test fail before update_session reaches its existence re-check.
+        # Returning False for this exact path simulates the observable
+        # post-delete state consistently on every supported platform.
         original_load = mcp_server.json.load
+        original_exists = mcp_server.Path.exists
+        deleted = False
 
         def evil_load(fp):
+            nonlocal deleted
             data = original_load(fp)
-            sess_path.unlink()
+            deleted = True
             return data
 
-        with mock.patch.object(mcp_server.json, "load", side_effect=evil_load):
+        def deleted_exists(path):
+            if deleted and path == sess_path:
+                return False
+            return original_exists(path)
+
+        with (
+            mock.patch.object(mcp_server.json, "load", side_effect=evil_load),
+            mock.patch.object(mcp_server.Path, "exists", deleted_exists),
+        ):
             with self.assertRaises(ValueError) as ctx:
                 mcp_server.update_session(sid, name="resurrected?")
 
         self.assertIn("deleted concurrently", str(ctx.exception))
-        # And critically: the file stayed deleted (no silent recreation).
-        self.assertFalse(sess_path.exists())
+        # update_session never wrote a replacement after the simulated
+        # disappearance. The fixture remains for inspection because this
+        # platform-neutral simulation does not perform a physical unlink.
+        self.assertTrue(sess_path.exists())
+        self.assertEqual(sess_path.read_text(encoding="utf-8"), original_contents)
         # No temp leak either.
         leftover = list(self.tmp_path.glob("*.tmp"))
         self.assertEqual(leftover, [])
@@ -1265,20 +1289,22 @@ class TestLazyKeychainImport(unittest.TestCase):
         env_guard.start()
         self.addCleanup(env_guard.stop)
         module.os.environ.pop("PERPLEXITY_API_KEY", None)
-        with mock.patch.object(
-            module,
-            "subprocess",
-            mock.Mock(
-                run=mock.Mock(
-                    side_effect=FileNotFoundError(
-                        "[Errno 2] No such file or directory: 'security'"
-                    )
+        with (
+            mock.patch.object(
+                module,
+                "subprocess",
+                mock.Mock(
+                    run=mock.Mock(
+                        side_effect=FileNotFoundError(
+                            "[Errno 2] No such file or directory: 'security'"
+                        )
+                    ),
+                    CalledProcessError=Exception,
                 ),
-                CalledProcessError=Exception,
             ),
+            self.assertRaises(ValueError) as ctx,
         ):
-            with self.assertRaises(ValueError) as ctx:
-                module._get_perplexity_client()
+            module._get_perplexity_client()
         self.assertIn("PERPLEXITY_API_KEY", str(ctx.exception))
 
     def test_get_perplexity_client_caches_first_call(self):
