@@ -1383,9 +1383,76 @@ class TestLocalDelegateSync(unittest.TestCase):
         self.assertIs(payload["stream"], False)
         self.assertNotIn(
             "keep_alive", payload
-        )  # v1.1: omitted → inherit server OLLAMA_KEEP_ALIVE
+        )  # gemma default: omitted → inherit server OLLAMA_KEEP_ALIVE
         self.assertEqual(timeout_s, 300.0)
         self.assertIn("ok", out[0].text)
+
+    def test_keep_alive_zero_default_tag_matching(self):
+        # PR #60 review findings: the env-overridable allowlist accepts
+        # arbitrary tags, so the qwen match must survive namespacing and
+        # casing rather than a bare whole-tag prefix check.
+        applies = mcp_server._keep_alive_zero_default_applies
+        for tag in (
+            "qwen3.6:35b-a3b-coding-nvfp4",
+            "qwen3.6:27b-coding-nvfp4-64k",
+            "Qwen3:latest",
+            "QWEN2.5-coder:7b",
+            "acme/qwen3:latest",
+            "hf.co/acme/qwen-model",
+        ):
+            self.assertTrue(applies(tag), msg=tag)
+        for tag in (
+            "gemma4:12b-nvfp4",
+            "acme/gemma:2b",
+            "hf.co/qwenteam/gemma-x",  # qwen in namespace, not model name
+        ):
+            self.assertFalse(applies(tag), msg=tag)
+
+    def test_qwen_defaults_keep_alive_zero(self):
+        # Contamination mitigation: a resident qwen runner returns other
+        # prompts' answers on repeat calls; omitted keep_alive → "0".
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            _call(
+                "local_delegate",
+                {"prompt": "p", "model": "qwen3.6:35b-a3b-coding-nvfp4"},
+            )
+        payload, _ = fake.call_args.args
+        self.assertEqual(payload["keep_alive"], "0")
+
+    def test_qwen_explicit_keep_alive_wins_over_default(self):
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            _call(
+                "local_delegate",
+                {
+                    "prompt": "p",
+                    "model": "qwen3.6:35b-a3b-coding-nvfp4-64k",
+                    "keep_alive": "5m",
+                },
+            )
+        payload, _ = fake.call_args.args
+        self.assertEqual(payload["keep_alive"], "5m")
+
+    def test_implicitly_resolved_qwen_gets_keep_alive_zero(self):
+        # The qwen default must key off the FINAL model: an omitted-model call
+        # resolves via _resolve_implicit_model, which may pick a qwen tag.
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        resolver = mock.AsyncMock(
+            return_value=(
+                "qwen3.6:35b-a3b-coding-nvfp4",
+                "http://127.0.0.1:11434",
+                "",
+            )
+        )
+        with (
+            mock.patch.object(mcp_server, "_resolve_implicit_model", resolver),
+            mock.patch.object(mcp_server, "_post_ollama_chat", fake),
+        ):
+            _call("local_delegate", {"prompt": "p"})
+        payload, _ = fake.call_args.args
+        self.assertEqual(payload["model"], "qwen3.6:35b-a3b-coding-nvfp4")
+        self.assertEqual(payload["keep_alive"], "0")
 
     def test_payload_with_system_think_keepalive_timeout(self):
         fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
@@ -1452,6 +1519,22 @@ class TestLocalDelegateBackground(unittest.TestCase):
                 self.assertIn("bg answer", done[0].text)
 
         asyncio.run(scenario())
+
+    def test_background_qwen_payload_gets_keep_alive_zero(self):
+        # The qwen keep_alive default is applied before the payload forks into
+        # the background job path, so background calls are protected too.
+        starter = mock.Mock(return_value="job-1")
+        with mock.patch.object(mcp_server, "_start_delegate_job", starter):
+            _call(
+                "local_delegate",
+                {
+                    "prompt": "p",
+                    "model": "qwen3.6:35b-a3b-coding-nvfp4",
+                    "background": True,
+                },
+            )
+        (payload,) = starter.call_args.args
+        self.assertEqual(payload["keep_alive"], "0")
 
     def test_cap_error_is_clean_text(self):
         async def scenario():
