@@ -55,11 +55,12 @@ policy change.
 
 ## CI Gates on `main`
 
-`semgrep/ci` is a required status check. `claude-gate`
+`semgrep/ci` and `claude-gate`
 (`.github/workflows/claude-gate.yml`, a cheap binary Claude Haiku 4.5
-merge gate) is not yet required in branch protection — that's a
-deliberate, separate follow-up step, pending here until it produces a
-real passing run. `claude-gate` carries no `trivial`-label guard: its
+merge gate) are both required status checks. `claude-gate` was promoted
+to required once it produced real passing runs (42s on #63, and a pass
+on #60); branch protection returned both contexts when it was last read
+live on 2026-08-08. `claude-gate` carries no `trivial`-label guard: its
 `if:` condition only excludes forks, draft PRs, and PRs whose
 triggering actor is `dependabot[bot]` — it does not check PR
 authorship, so another bot's same-repo PR (e.g. Renovate) still runs
@@ -79,11 +80,13 @@ reproduced on PR #55). See the comment in `claude-gate.yml` before
 trying that again. `claude-code-action` does have its own partial
 anti-tamper check instead: it refuses to run when the invoking PR's
 copy of `claude-gate.yml` differs from `main`'s, so any PR editing this
-file self-skips and fails closed (confirmed live on #55) — once
-required, an admin will need to temporarily lift the required context
-to land changes to this file. That stops a PR from rewriting the
-prompt/model to self-approve, but not one that deletes the action step
-or the enforcement step outright. The accepted trade-off is narrow:
+file self-skips and fails closed (confirmed live on #55). Now that the
+context is required, that consequence is live: landing any change to
+this file takes an admin temporarily lifting `claude-gate` from the
+required contexts and restoring it immediately after the merge. That
+stops a PR from rewriting the prompt/model to self-approve, but not one
+that deletes the action step or the enforcement step outright. The
+accepted trade-off is narrow:
 exploiting either gap requires existing write access to this repo
 (forks are already excluded), and a write-access collaborator has
 simpler ways to bypass CI than editing this file.
