@@ -68,19 +68,28 @@ slow there) and expect ~4–8 tok/s from a dense 12–14B q4.
   repeat calls, and unloading between calls measured 0/96 contaminated. Other
   models — including the `gemma4:12b-nvfp4` default — still inherit the
   server's `OLLAMA_KEEP_ALIVE`. The cost is latency: every qwen call now pays
-  a cold ~20 GB load.
+  a cold load — ~20 GB for the qwen3.6 35B tags, less for a smaller override
+  tag such as the ~9 GB `qwen2.5-coder:14b` above, which the `qwen` prefix
+  also matches.
 - **Pass `keep_alive` explicitly to keep one warm — an explicit value always
-  wins.** `keep_alive: "5m"` is the deliberate opt-out when you are about to
-  make several calls against the same tag and want to pay that load once. Do
-  not warm-pin for a *repeat-call* workload over the same model: that is the
-  exact shape that reproduces the contamination bug. Warm-pinning a tag for a
-  human-paced sequence of distinct tasks is fine.
+  wins.** `keep_alive: "5m"` is the deliberate opt-out when repeated cold
+  loads would dominate the work. Know what you are re-enabling: the measured
+  trigger is **many short, structurally similar prompts through one resident
+  runner**, and *distinctness is not the protective factor* — 16 genuinely
+  distinct delegation tasks came back 0/30 contaminated on first exposure but
+  8/30 and 7/30 on re-runs, while review prompts each embedding a unique diff
+  measured 0/120. Size and dissimilarity are what protect you. So warm-pinning
+  is defensible for a handful of large, unlike calls and unsafe for a batch of
+  small similar ones, however distinct their subjects.
 - **Don't leave two qwen tags warm on JVMBPro.** Each tag is its own runner
   instance, so a second warm-pinned tag loads a *second* ~20 GB copy of the
   same weights (weights on disk are shared, loaded GPU memory is not). Under
-  the default unload-per-call behaviour there is no resident copy to collide
-  with, so tag choice is free — pick purely by the window the task needs. If
-  you do warm-pin, pin exactly one tag per host and reuse it.
+  the default, *sequential* calls leave no resident copy to collide with, so
+  tag choice is free — pick purely by the window the task needs. Two caveats:
+  `keep_alive: "0"` unloads only when a call *finishes*, so overlapping calls
+  against two tags (`background=true` allows up to four in flight) can still
+  hold two runners at once; and if you do warm-pin, pin exactly one tag per
+  host and reuse it.
 - **The mini endpoint (`ollama.djvassallo.com`) is the always-on fallback.**
   It serves only the base tag at 32k. "Always-on" means the host and its
   Ollama server are always up — not that the model stays resident: a
