@@ -47,6 +47,7 @@ jobs:
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
+            REVIEWED HEAD SHA: ${{ github.event.pull_request.head.sha }}
 
             Please review this pull request and provide feedback on:
             - Code quality and best practices
@@ -60,4 +61,41 @@ jobs:
 
             Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
 
-          claude_args: '--allowedTools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"'
+            Your structured output is the machine-read verdict for this exact
+            head: set no_major_issues to true ONLY if your review raised no
+            blocking or major findings; when false, also set highest_severity
+            and a one-line verdict_summary.
+
+          claude_args: |
+            --allowedTools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"
+            --json-schema '{"type":"object","properties":{"no_major_issues":{"type":"boolean"},"highest_severity":{"type":"string","enum":["critical","major","minor"]},"verdict_summary":{"type":"string"}},"required":["no_major_issues"]}'
+
+      - name: Post exact-head verdict marker
+        # The review-pipeline Stage 2 watcher fail-closes the Claude reviewer
+        # slot unless an issue comment carries the literal marker
+        # <!-- review-pipeline: reviewer=claude head=<sha> --> plus a
+        # clean-phrase or severity-prefixed verdict body. Build that comment
+        # deterministically from the schema-validated structured output —
+        # never from model-copied free text. If the model produced no
+        # structured output, or this step fails, no marker is posted and the
+        # watcher stays fail-closed (unverified), which is the safe direction.
+        if: steps.claude-review.outputs.structured_output != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STRUCTURED_OUTPUT: ${{ steps.claude-review.outputs.structured_output }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          clean="$(printf '%s' "$STRUCTURED_OUTPUT" | jq -r '.no_major_issues')"
+          if [ "$clean" = "true" ]; then
+            line1="No major issues found."
+          else
+            sev="$(printf '%s' "$STRUCTURED_OUTPUT" | jq -r '.highest_severity // "major"')"
+            case "$sev" in critical|major|minor) ;; *) sev="major" ;; esac
+            summary="$(printf '%s' "$STRUCTURED_OUTPUT" | jq -r '.verdict_summary // "see review comment"' | tr '\n' ' ' | cut -c1-300)"
+            line1="${sev^}: ${summary}"
+          fi
+          body="$(printf '%s\n%s' "$line1" "<!-- review-pipeline: reviewer=claude head=${HEAD_SHA} -->")"
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="$body"
