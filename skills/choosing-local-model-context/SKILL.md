@@ -31,7 +31,7 @@ and **worst-case bounding on small machines**.
 |---|---|---|---|
 | `qwen3.6:35b-a3b-coding-nvfp4` (base) | host's default: **64k** on JVMBPro / **32k** on jvmacmini | localhost (JVMBPro), `ollama-mbp.djvassallo.com` (64k), `ollama.djvassallo.com` (jvmacmini, 32k, always-on) | Default **qwen** tag (gemma4:12b-nvfp4 is the tool-wide default). Window depends on which host answers. |
 | `-32k` | 32,768 | JVMBPro only (tag exists there) | Rarely needed — prefer base. |
-| `-256k` | 262,144 | JVMBPro only (localhost or `ollama-mbp`) | **Kept warm/pinned on JVMBPro.** Not on the mini (32 GB — a full window would exceed the machine). |
+| `-256k` | 262,144 | JVMBPro only (localhost or `ollama-mbp`) | Not on the mini (32 GB — a full window would exceed the machine). By default, no qwen tag stays resident between `local_delegate` calls; see the explicit `keep_alive` opt-in below. |
 
 ## Sizing rule of thumb
 
@@ -61,13 +61,41 @@ slow there) and expect ~4–8 tok/s from a dense 12–14B q4.
 
 ## Host-specific etiquette
 
-- **On JVMBPro, prefer `-256k` for local calls.** It is the instance already
-  pinned warm; calling the base tag there loads a *second* ~20 GB copy of
-  the same weights (different tag = different runner instance — weights on
-  disk are shared, loaded GPU memory is not).
+- **Qwen tags unload after every call by default.** When the caller omits
+  `keep_alive`, `local_delegate` sends `keep_alive: "0"` for any qwen tag, so
+  no qwen instance is left resident. That is the contamination mitigation: a
+  long-lived qwen runner returns *other prompts'* answers on ~15–25% of
+  repeat calls, and unloading between calls measured 0/96 contaminated. Other
+  models — including the `gemma4:12b-nvfp4` default — still inherit the
+  server's `OLLAMA_KEEP_ALIVE`. The cost is latency: every qwen call now pays
+  a cold load — ~20 GB for the qwen3.6 35B tags, less for a smaller override
+  tag such as the ~9 GB `qwen2.5-coder:14b` above, which the `qwen` prefix
+  also matches.
+- **Pass `keep_alive` explicitly to keep one warm — an explicit value always
+  wins.** `keep_alive: "5m"` is the deliberate opt-out when repeated cold
+  loads would dominate the work. Know what you are re-enabling: the measured
+  trigger is **many short, structurally similar prompts through one resident
+  runner**, and *distinctness is not the protective factor* — 16 genuinely
+  distinct delegation tasks came back 0/30 contaminated on first exposure but
+  8/30 and 7/30 on re-runs, while review prompts each embedding a unique diff
+  measured 0/120. Size and dissimilarity are what protect you. So warm-pinning
+  is defensible for a handful of large, unlike calls and unsafe for a batch of
+  small similar ones, however distinct their subjects.
+- **Don't leave two qwen tags warm on JVMBPro.** Each tag is its own runner
+  instance, so a second warm-pinned tag loads a *second* ~20 GB copy of the
+  same weights (weights on disk are shared, loaded GPU memory is not). Under
+  the default, *sequential* calls leave no resident copy to collide with, so
+  tag choice is free — pick purely by the window the task needs. Two caveats:
+  `keep_alive: "0"` unloads only when a call *finishes*, so overlapping calls
+  against two tags (`background=true` allows up to four in flight) can still
+  hold two runners at once; and if you do warm-pin, pin exactly one tag per
+  host and reuse it.
 - **The mini endpoint (`ollama.djvassallo.com`) is the always-on fallback.**
-  It serves only the base tag at 32k, pinned warm. If the task fits 32k, it
-  works even when the laptop is closed.
+  It serves only the base tag at 32k. "Always-on" means the host and its
+  Ollama server are always up — not that the model stays resident: a
+  `local_delegate` call unloads it afterwards like any other qwen tag, unless
+  you passed `keep_alive` yourself. If the task fits 32k, it works even when
+  the laptop is closed.
 - If Ollama returns a context-length error or output is silently truncated,
   step up one tier and retry — never trim the user's input to force a fit
   without saying so.
