@@ -2028,17 +2028,32 @@ async def _evict_ollama_runner(
     interaction was NOT measured here, and overlapping background qwen jobs
     may cost each other a reload.
 
-    Never raises. A failed eviction leaves exactly today's behaviour; it
-    must not turn into a failure of the caller's actual request.
+    Bounded by `timeout_s` in WALL CLOCK, via asyncio.wait_for. httpx's
+    float timeout is per-phase — connect, write, read and pool each get that
+    value — so passing it alone would let a pathological eviction overshoot
+    and erode the caller's total budget that the pre_unload path reserves
+    against (CodeRabbit MINOR on 4a46cc2). The httpx timeout is kept as the
+    inner per-phase bound; wait_for is the outer total.
+
+    Never raises. A failed OR timed-out eviction leaves exactly today's
+    behaviour; it must not turn into a failure of the caller's real request.
     """
     try:
-        await client.post(
-            f"{endpoint}/api/generate",
-            json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
-            headers=headers,
+        await asyncio.wait_for(
+            client.post(
+                f"{endpoint}/api/generate",
+                json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
+                headers=headers,
+                timeout=timeout_s,
+            ),
             timeout=timeout_s,
         )
-    except (httpx.RequestError, httpx.HTTPStatusError, ValueError):
+    except (
+        httpx.RequestError,
+        httpx.HTTPStatusError,
+        ValueError,
+        asyncio.TimeoutError,
+    ):
         return
 
 
@@ -2581,9 +2596,10 @@ async def list_tools() -> list[Tool]:
                         "default": 300,
                         "description": (
                             "Sync timeout in seconds (1-600), covering the whole "
-                            "call. Below ~5s the qwen contamination pre-unload is "
-                            "skipped rather than allowed to overrun this ceiling, "
-                            "so such a call runs unprotected."
+                            "call (pre-unload plus chat). At 5s or less the qwen "
+                            "contamination pre-unload is skipped rather than "
+                            "allowed to overrun this ceiling, so such a call runs "
+                            "unprotected."
                         ),
                     },
                 },

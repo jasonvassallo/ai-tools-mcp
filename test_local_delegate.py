@@ -1772,6 +1772,43 @@ class TestEvictOllamaRunner(unittest.TestCase):
                 msg=f"timeout_s={caller_timeout}",
             )
 
+    def test_hung_eviction_is_cut_off_at_its_budget(self):
+        # httpx's float timeout is per-phase, so it cannot bound total wall
+        # clock on its own; asyncio.wait_for is what enforces evict_budget.
+        # A fake client that ignores the httpx timeout entirely (as a wedged
+        # connection effectively would) must still be cut off, and the chat
+        # must still run.
+        class _HungEvict:
+            def __init__(self):
+                self.calls: list = []
+
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if url.endswith("/api/generate"):
+                    await asyncio.sleep(60)  # never completes within budget
+                return _FakeResponse(json_data={"ok": True})
+
+        client = _HungEvict()
+        started = time.monotonic()
+        with (
+            mock.patch.object(mcp_server, "_OLLAMA_EVICT_TIMEOUT_S", 0.3),
+            mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value=self._EP),
+            ),
+            _with_client(client),
+        ):
+            out = asyncio.run(
+                mcp_server._post_ollama_chat({"model": _MODEL}, 30.0, pre_unload=True)
+            )
+        elapsed = time.monotonic() - started
+        # Cut off near the 0.3s budget, nowhere near the 60s hang...
+        self.assertLess(elapsed, 5.0)
+        # ...and the caller's real request still went out and succeeded.
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(client.calls[-1][0], f"{self._EP}/api/chat")
+
     def test_eviction_carries_the_same_auth_headers_as_the_chat(self):
         # A remote Access-gated endpoint would 403 the eviction — and a
         # silently-403ing eviction is an unprotected call that looks fine.
