@@ -1150,7 +1150,7 @@ class TestDelegateJobs(unittest.TestCase):
         async def scenario():
             gate = asyncio.Event()
 
-            async def fake_post(payload, timeout_s):
+            async def fake_post(payload, timeout_s, pre_unload=False):
                 await gate.wait()
                 return {"message": {"content": "done!"}}
 
@@ -1173,7 +1173,7 @@ class TestDelegateJobs(unittest.TestCase):
         async def scenario():
             gate = asyncio.Event()
 
-            async def fake_post(payload, timeout_s):
+            async def fake_post(payload, timeout_s, pre_unload=False):
                 await gate.wait()
                 return {}
 
@@ -1203,7 +1203,7 @@ class TestDelegateJobs(unittest.TestCase):
 
     def test_timeout_result_is_failure_envelope(self):
         async def scenario():
-            async def hang(payload, timeout_s):
+            async def hang(payload, timeout_s, pre_unload=False):
                 await asyncio.sleep(3600)
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", hang):
@@ -1223,7 +1223,7 @@ class TestDelegateJobs(unittest.TestCase):
         # them, and confirm the registry stays bounded — retaining only
         # the newest window — instead of growing unboundedly.
         async def scenario():
-            async def fake_post(payload, timeout_s):
+            async def fake_post(payload, timeout_s, pre_unload=False):
                 return {"message": {"content": "done"}}
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
@@ -1266,7 +1266,7 @@ class TestDelegateJobs(unittest.TestCase):
                 "started": time.monotonic() - 100,
             }
 
-            async def fake_post(payload, timeout_s):
+            async def fake_post(payload, timeout_s, pre_unload=False):
                 return {"message": {"content": "done"}}
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
@@ -1454,6 +1454,44 @@ class TestLocalDelegateSync(unittest.TestCase):
         self.assertEqual(payload["model"], "qwen3.6:35b-a3b-coding-nvfp4")
         self.assertEqual(payload["keep_alive"], "0")
 
+    def test_qwen_default_also_requests_a_pre_unload(self):
+        # keep_alive is a POST-response TTL, so the "0" default does not
+        # protect the call carrying it: measured 2026-08-08 on JVMBPro, a
+        # keep_alive:0 call landing on an already-resident dirty qwen runner
+        # is contaminated at the same rate as an unprotected one. The
+        # eviction is what puts the call on a fresh runner.
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            _call(
+                "local_delegate",
+                {"prompt": "p", "model": "qwen3.6:35b-a3b-coding-nvfp4"},
+            )
+        self.assertTrue(fake.call_args.kwargs["pre_unload"])
+
+    def test_explicit_keep_alive_suppresses_pre_unload(self):
+        # An explicit caller value means exactly what it says — including an
+        # explicit "0". The eviction rides with the auto-applied default only.
+        for ka in ("5m", "0"):
+            fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+            with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+                _call(
+                    "local_delegate",
+                    {
+                        "prompt": "p",
+                        "model": "qwen3.6:35b-a3b-coding-nvfp4",
+                        "keep_alive": ka,
+                    },
+                )
+            self.assertFalse(fake.call_args.kwargs["pre_unload"], msg=ka)
+
+    def test_non_qwen_model_gets_no_pre_unload(self):
+        # gemma is immune to the contamination (0/141 lifetime) — it must not
+        # pay a reload it does not need.
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            _call("local_delegate", {"prompt": "p", "model": "gemma4:12b-nvfp4"})
+        self.assertFalse(fake.call_args.kwargs["pre_unload"])
+
     def test_payload_with_system_think_keepalive_timeout(self):
         fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
@@ -1494,7 +1532,7 @@ class TestLocalDelegateBackground(unittest.TestCase):
         async def scenario():
             gate = asyncio.Event()
 
-            async def fake_post(payload, timeout_s):
+            async def fake_post(payload, timeout_s, pre_unload=False):
                 await gate.wait()
                 return {"model": "m", "message": {"content": "bg answer"}}
 
@@ -1535,12 +1573,15 @@ class TestLocalDelegateBackground(unittest.TestCase):
             )
         (payload,) = starter.call_args.args
         self.assertEqual(payload["keep_alive"], "0")
+        # ...and so is the eviction: a background job runs on the same shared
+        # runner and is exposed to the same first-call gap.
+        self.assertTrue(starter.call_args.kwargs["pre_unload"])
 
     def test_cap_error_is_clean_text(self):
         async def scenario():
             gate = asyncio.Event()
 
-            async def fake_post(payload, timeout_s):
+            async def fake_post(payload, timeout_s, pre_unload=False):
                 await gate.wait()
                 return {}
 
@@ -1571,6 +1612,139 @@ class TestLocalDelegateBackground(unittest.TestCase):
     def test_result_missing_id_is_clean_error(self):
         out = _call("local_delegate_result", {})
         self.assertIn("Error", out[0].text)
+
+
+class TestEvictOllamaRunner(unittest.TestCase):
+    """The pre-unload that makes keep_alive:"0" protect its OWN call.
+
+    Measured 2026-08-08 on JVMBPro: a keep_alive:0 request landing on an
+    already-resident, already-dirty qwen runner is contaminated at the same
+    rate as an unprotected one, because keep_alive only sets the
+    post-response TTL. Evicting first is the part that actually works.
+    """
+
+    _EP = "http://127.0.0.1:11434"
+
+    def _run_chat(self, client, pre_unload):
+        with (
+            mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value=self._EP),
+            ),
+            _with_client(client),
+        ):
+            return asyncio.run(
+                mcp_server._post_ollama_chat(
+                    {"model": _MODEL}, 30.0, pre_unload=pre_unload
+                )
+            )
+
+    def test_evicts_before_the_chat_on_the_same_endpoint(self):
+        client = _FakeClient(response=_FakeResponse(json_data={"ok": True}))
+        out = self._run_chat(client, pre_unload=True)
+        self.assertEqual(out, {"ok": True})
+        urls = [url for url, _ in client.calls]
+        # Order is the whole point: evicting AFTER the chat would be the
+        # no-op this change exists to fix.
+        self.assertEqual(urls, [f"{self._EP}/api/generate", f"{self._EP}/api/chat"])
+        body = client.calls[0][1]["json"]
+        self.assertEqual(body["model"], _MODEL)
+        self.assertEqual(body["keep_alive"], 0)
+        # Empty prompt is Ollama's unload idiom — a non-empty one would
+        # bill a whole generation just to evict.
+        self.assertEqual(body["prompt"], "")
+
+    def test_no_eviction_when_not_requested(self):
+        client = _FakeClient(response=_FakeResponse(json_data={"ok": True}))
+        self._run_chat(client, pre_unload=False)
+        self.assertEqual([url for url, _ in client.calls], [f"{self._EP}/api/chat"])
+
+    def test_eviction_failure_never_fails_the_callers_request(self):
+        # A wedged/absent eviction must degrade to today's behaviour, not
+        # turn a working delegate call into an error.
+        class _FailFirst:
+            def __init__(self):
+                self.calls: list = []
+
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if url.endswith("/api/generate"):
+                    raise mcp_server.httpx.ConnectError("refused")
+                return _FakeResponse(json_data={"ok": True})
+
+        client = _FailFirst()
+        out = self._run_chat(client, pre_unload=True)
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(len(client.calls), 2)
+
+    def test_eviction_is_bounded_by_the_callers_timeout(self):
+        # timeout_s is the documented ceiling for the whole delegate call, so
+        # the eviction must be spent out of that budget, never added on top.
+        # A slow eviction makes the deduction observable: if its cost were
+        # added on top, the chat would still be handed the full 30s.
+        class _SlowEvict:
+            def __init__(self):
+                self.calls: list = []
+
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if url.endswith("/api/generate"):
+                    await asyncio.sleep(0.2)
+                return _FakeResponse(json_data={"ok": True})
+
+        client = _SlowEvict()
+        self._run_chat(client, pre_unload=True)
+        evict_timeout = client.calls[0][1]["timeout"]
+        chat_timeout = client.calls[1][1]["timeout"]
+        self.assertLessEqual(evict_timeout, 30.0)
+        self.assertLess(chat_timeout, 30.0 - 0.15)
+
+    def test_short_caller_timeout_neither_starves_nor_overruns(self):
+        # timeout_s may be as low as 1. The chat must still get a usable
+        # slice, but never MORE than the caller asked for — the floor is
+        # clamped to the ceiling.
+        client = _FakeClient(response=_FakeResponse(json_data={"ok": True}))
+        with (
+            mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value=self._EP),
+            ),
+            _with_client(client),
+        ):
+            asyncio.run(
+                mcp_server._post_ollama_chat({"model": _MODEL}, 1.0, pre_unload=True)
+            )
+        self.assertLessEqual(client.calls[0][1]["timeout"], 1.0)
+        chat_timeout = client.calls[1][1]["timeout"]
+        self.assertGreater(chat_timeout, 0.0)
+        self.assertLessEqual(chat_timeout, 1.0)
+
+    def test_eviction_carries_the_same_auth_headers_as_the_chat(self):
+        # A remote Access-gated endpoint would 403 the eviction — and a
+        # silently-403ing eviction is an unprotected call that looks fine.
+        client = _FakeClient(response=_FakeResponse(json_data={"ok": True}))
+        with (
+            mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value="https://remote.example"),
+            ),
+            mock.patch.object(
+                mcp_server,
+                "_ollama_auth_headers",
+                mock.Mock(return_value={"CF-Access-Client-Id": "id-123"}),
+            ),
+            _with_client(client),
+        ):
+            asyncio.run(
+                mcp_server._post_ollama_chat({"model": _MODEL}, 30.0, pre_unload=True)
+            )
+        evict_headers = client.calls[0][1]["headers"]
+        chat_headers = client.calls[1][1]["headers"]
+        self.assertEqual(evict_headers, chat_headers)
+        self.assertEqual(evict_headers["CF-Access-Client-Id"], "id-123")
 
 
 class TestRunCheckOllamaLine(unittest.TestCase):
