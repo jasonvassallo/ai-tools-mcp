@@ -2071,18 +2071,21 @@ async def _post_ollama_chat(
     # (no second resolution that could drift), and both the sync and the
     # background delegate paths route through it.
     if pre_unload:
-        started = time.monotonic()
-        await _evict_ollama_runner(
-            client, endpoint, model, headers, min(_OLLAMA_EVICT_TIMEOUT_S, timeout_s)
-        )
-        # Spend the eviction out of the caller's budget rather than on top of
-        # it: timeout_s is the documented ceiling for the whole delegate call,
-        # and a pre-unload must not be able to overrun it.
-        # The floor itself is clamped to the caller's ceiling: callers may pass
-        # timeout_s as low as 1, and handing the chat MORE time than it asked
-        # for would just trade one overrun for another.
-        floor = min(_OLLAMA_MIN_CHAT_TIMEOUT_S, timeout_s)
-        timeout_s = max(floor, timeout_s - (time.monotonic() - started))
+        # timeout_s is the documented ceiling for the WHOLE delegate call, so
+        # the chat's minimum slice is reserved up front rather than restored
+        # afterwards. Restoring a floor after the fact hands back budget the
+        # eviction already spent, which lets the total reach ~2x the caller's
+        # ceiling on small timeouts (CodeRabbit MAJOR, reproduced at
+        # timeout_s=1). Reserving first makes the sum bounded by construction.
+        chat_reserve = min(_OLLAMA_MIN_CHAT_TIMEOUT_S, timeout_s)
+        evict_budget = min(_OLLAMA_EVICT_TIMEOUT_S, timeout_s - chat_reserve)
+        # A budget too small to afford an eviction skips it and runs
+        # unprotected rather than overrunning. Moot in practice: no qwen tag
+        # completes a generation in the seconds that implies.
+        if evict_budget > 0:
+            started = time.monotonic()
+            await _evict_ollama_runner(client, endpoint, model, headers, evict_budget)
+            timeout_s = max(chat_reserve, timeout_s - (time.monotonic() - started))
     try:
         response = await client.post(
             f"{endpoint}/api/chat", json=payload, headers=headers, timeout=timeout_s
@@ -2576,7 +2579,12 @@ async def list_tools() -> list[Tool]:
                     "timeout_s": {
                         "type": "integer",
                         "default": 300,
-                        "description": "Sync timeout in seconds (1-600).",
+                        "description": (
+                            "Sync timeout in seconds (1-600), covering the whole "
+                            "call. Below ~5s the qwen contamination pre-unload is "
+                            "skipped rather than allowed to overrun this ceiling, "
+                            "so such a call runs unprotected."
+                        ),
                     },
                 },
                 "required": ["prompt"],

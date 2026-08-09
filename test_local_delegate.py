@@ -1716,10 +1716,61 @@ class TestEvictOllamaRunner(unittest.TestCase):
             asyncio.run(
                 mcp_server._post_ollama_chat({"model": _MODEL}, 1.0, pre_unload=True)
             )
-        self.assertLessEqual(client.calls[0][1]["timeout"], 1.0)
-        chat_timeout = client.calls[1][1]["timeout"]
+        # timeout_s=1 cannot afford an eviction on top of the chat's slice, so
+        # the eviction is skipped entirely and the chat keeps the full budget.
+        self.assertEqual([url for url, _ in client.calls], [f"{self._EP}/api/chat"])
+        chat_timeout = client.calls[0][1]["timeout"]
         self.assertGreater(chat_timeout, 0.0)
         self.assertLessEqual(chat_timeout, 1.0)
+
+    def test_total_budget_is_bounded_by_the_callers_timeout(self):
+        # The regression CodeRabbit asked for: a SLOW eviction must not let
+        # the two legs together exceed timeout_s.
+        #
+        # The bound is (time the eviction actually consumed) + (budget handed
+        # to the chat) — NOT the sum of the two budgets, which double-counts
+        # eviction budget that goes unused when the eviction returns early.
+        # The pre-remediation code failed this at timeout_s=1: it spent up to
+        # 1s evicting and then restored the chat to a full 1s floor.
+        for caller_timeout in (1.0, 6.0, 30.0):
+
+            class _SlowEvict:
+                def __init__(self):
+                    self.calls: list = []
+                    self.evict_elapsed = 0.0
+
+                async def post(self, url, **kwargs):
+                    self.calls.append((url, kwargs))
+                    if url.endswith("/api/generate"):
+                        started = time.monotonic()
+                        await asyncio.sleep(0.2)
+                        self.evict_elapsed = time.monotonic() - started
+                    return _FakeResponse(json_data={"ok": True})
+
+            client = _SlowEvict()
+            with (
+                mock.patch.object(
+                    mcp_server,
+                    "_select_ollama_endpoint",
+                    mock.AsyncMock(return_value=self._EP),
+                ),
+                _with_client(client),
+            ):
+                asyncio.run(
+                    mcp_server._post_ollama_chat(
+                        {"model": _MODEL}, caller_timeout, pre_unload=True
+                    )
+                )
+            chat_budget = next(
+                kwargs["timeout"]
+                for url, kwargs in client.calls
+                if url.endswith("/api/chat")
+            )
+            self.assertLessEqual(
+                client.evict_elapsed + chat_budget,
+                caller_timeout + 1e-9,
+                msg=f"timeout_s={caller_timeout}",
+            )
 
     def test_eviction_carries_the_same_auth_headers_as_the_chat(self):
         # A remote Access-gated endpoint would 403 the eviction — and a
