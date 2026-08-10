@@ -61,7 +61,8 @@ merge gate) are both required status checks. `claude-gate` was promoted
 to required after it landed on `main` untouched and produced real
 passing runs (#60 in 53s and #63 in 39s; #64 then passed in 47s, after
 the promotion); branch protection returned both contexts when it was
-last read live on 2026-08-09. `claude-gate` carries no `trivial`-label guard: its
+last read live on 2026-08-09. `claude-gate` carries no `trivial`-label
+guard: its
 `if:` condition only excludes forks, draft PRs, and PRs whose
 triggering actor is `dependabot[bot]` — it does not check PR
 authorship, so another bot's same-repo PR (e.g. Renovate) still runs
@@ -107,6 +108,14 @@ gh api -X DELETE repos/OWNER/REPO/branches/main/protection/enforce_admins
 gh pr merge N --squash --match-head-commit SHA --admin
 gh api -X POST   repos/OWNER/REPO/branches/main/protection/enforce_admins
 ```
+
+Be clear about the trade: disabling `enforce_admins` is narrower in
+**who** (admins only, for the window) but broader in **what** — for
+that window admins are exempt from *every* main protection, including
+`allow_force_pushes: false` and `allow_deletions: false`, not just the
+status checks. It is preferred because the alternative provably leaves
+zero enforced CI on a `trivial` PR, not because it is unconditionally
+safer. Keep the window to a single pinned merge.
 
 Do **not** reach first for dropping `claude-gate` from the required
 contexts. That relaxes `main` repo-wide for the whole window, and if

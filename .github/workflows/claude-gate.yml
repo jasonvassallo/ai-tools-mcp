@@ -10,8 +10,11 @@ name: Claude Gate
 # file, and a self-skip is not a failure (the step still reports
 # success). What fails the check is "Enforce verdict" finding no
 # verdict file. So an edit that KEEPS that step fails its own required
-# check and needs an admin to lift the context to land; an edit that
-# REMOVES it passes with nothing run. See ANTI-TAMPER.
+# check and needs an admin exception to land; an edit that REMOVES it
+# passes with nothing run. See ANTI-TAMPER below, and AGENTS.md
+# "Landing a change to `claude-gate.yml`" for the exception procedure
+# -- prefer toggling enforce_admins; do NOT reach first for dropping
+# claude-gate from the required contexts.
 #
 # WHY (2026-08-01, ported from mlx-omni-signal): every other reviewer is
 # tiered. claude-review and semgrep/ci skip `trivial`-labelled PRs (#30),
@@ -27,8 +30,10 @@ name: Claude Gate
 #
 # ANTI-TAMPER (partial, not absolute): claude-code-action refuses to run
 # when the invoking PR's copy of THIS file differs from main's -- so any PR
-# editing this file self-skips and fails closed (confirmed live on #55; an
-# admin must temporarily lift the required context to land such changes).
+# editing this file makes the ACTION self-skip (confirmed live on #55).
+# As spelled out above, that self-skip is not itself a failure; the check
+# goes red only because "Enforce verdict" then finds no verdict file, and
+# landing such a change takes the admin exception in AGENTS.md.
 # That stops a PR from rewriting the prompt/model to self-approve, but does
 # NOT stop a PR that deletes the action step or the "Enforce verdict" step
 # outright -- that would pass with nothing run. Accepted trade-off on a
