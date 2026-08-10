@@ -58,9 +58,10 @@ policy change.
 `semgrep/ci` and `claude-gate`
 (`.github/workflows/claude-gate.yml`, a cheap binary Claude Haiku 4.5
 merge gate) are both required status checks. `claude-gate` was promoted
-to required once it produced real passing runs (42s on #63, and a pass
-on #60); branch protection returned both contexts when it was last read
-live on 2026-08-08. `claude-gate` carries no `trivial`-label guard: its
+to required after it landed on `main` untouched and produced real
+passing runs (#60 in 53s and #63 in 39s; #64 then passed in 47s, after
+the promotion); branch protection returned both contexts when it was
+last read live on 2026-08-09. `claude-gate` carries no `trivial`-label guard: its
 `if:` condition only excludes forks, draft PRs, and PRs whose
 triggering actor is `dependabot[bot]` — it does not check PR
 authorship, so another bot's same-repo PR (e.g. Renovate) still runs
@@ -79,17 +80,52 @@ no-go here: `claude-code-action`'s OIDC token exchange rejects
 reproduced on PR #55). See the comment in `claude-gate.yml` before
 trying that again. `claude-code-action` does have its own partial
 anti-tamper check instead: it refuses to run when the invoking PR's
-copy of `claude-gate.yml` differs from `main`'s, so any PR editing this
-file self-skips and fails closed (confirmed live on #55). Now that the
-context is required, that consequence is live: landing any change to
-this file takes an admin temporarily lifting `claude-gate` from the
-required contexts and restoring it immediately after the merge. That
-stops a PR from rewriting the prompt/model to self-approve, but not one
-that deletes the action step or the enforcement step outright. The
-accepted trade-off is narrow:
+copy of `claude-gate.yml` differs from `main`'s (confirmed live on
+#55). Be precise about what that does and does not cause. The action
+**self-skips**, and a self-skip is not a step failure — the action's
+own step still reports `success`. What turns the check red is the
+separate "Enforce verdict (fail closed)" step finding no verdict file.
+Verified on #66, job 93321756563: gate step `success`, enforce step
+`failure`. So an edit that KEEPS the enforcement step fails its own
+required check, while an edit that DELETES that step — or the action
+step — passes with nothing run. That stops a PR from rewriting the
+prompt/model to self-approve, but not one that removes the machinery
+outright. The accepted trade-off is narrow:
 exploiting either gap requires existing write access to this repo
 (forks are already excluded), and a write-access collaborator has
 simpler ways to bypass CI than editing this file.
+
+### Landing a change to `claude-gate.yml`
+
+An edit that keeps the enforcement step fails its own required check,
+so such a PR needs an administrator exception. **Prefer the narrowest
+lever** — temporarily disable `enforce_admins`, merge that one PR
+pinned to its exact head, then re-enable it:
+
+```
+gh api -X DELETE repos/OWNER/REPO/branches/main/protection/enforce_admins
+gh pr merge N --squash --match-head-commit SHA --admin
+gh api -X POST   repos/OWNER/REPO/branches/main/protection/enforce_admins
+```
+
+Do **not** reach first for dropping `claude-gate` from the required
+contexts. That relaxes `main` repo-wide for the whole window, and if
+the PR is labelled `trivial` it is worse than useless: `semgrep/ci`
+skips on that label and a skipped required check counts as satisfied,
+so the PR would merge with ZERO enforced CI — precisely the #52/#53
+hole this job exists to close. If the contexts must be rewritten
+anyway, use the `checks` form with an explicit `app_id`; a bare
+`contexts` array lets any app satisfy the context, which is a silent
+and permanent weakening.
+
+Whichever lever is used: get explicit administrator approval first,
+record the exception in the PR body, restore protection
+unconditionally — even if the merge fails — verify the restore by
+re-reading the endpoint and diffing it against the captured prior
+state rather than trusting a PATCH exit code, and prove the gate is
+operational again on a later PR. A protection read only shows the
+context is required; it does not show the job still runs and can fail
+closed.
 
 ## Provider Mapping
 
