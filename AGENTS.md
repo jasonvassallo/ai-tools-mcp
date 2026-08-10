@@ -101,13 +101,44 @@ simpler ways to bypass CI than editing this file.
 An edit that keeps the enforcement step fails its own required check,
 so such a PR needs an administrator exception. **Prefer the narrowest
 lever** — temporarily disable `enforce_admins`, merge that one PR
-pinned to its exact head, then re-enable it:
+pinned to its exact head, then re-enable it.
 
-```
+**Arm the restore BEFORE touching protection.** Do not run these as
+three sequential commands: if the shell is interrupted, disconnected,
+or exits after the `DELETE`, the `POST` never runs and every
+admin-facing `main` protection stays disabled indefinitely. Use an
+`EXIT` trap, and verify rather than trusting the exit code:
+
+```bash
+gh api repos/OWNER/REPO/branches/main/protection > protection-baseline.json
+
+restore() {
+  for i in 1 2 3 4 5; do
+    gh api -X POST repos/OWNER/REPO/branches/main/protection/enforce_admins >/dev/null 2>&1
+    if gh api repos/OWNER/REPO/branches/main/protection > protection-after.json 2>/dev/null \
+       && jq -e '.enforce_admins.enabled == true' protection-after.json >/dev/null; then
+      echo "RESTORE OK"; return 0
+    fi
+    sleep 3
+  done
+  echo "!!! RESTORE FAILED - enforce_admins MAY STILL BE DISABLED !!!"; return 1
+}
+trap restore EXIT
+
 gh api -X DELETE repos/OWNER/REPO/branches/main/protection/enforce_admins
 gh pr merge N --squash --match-head-commit SHA --admin
-gh api -X POST   repos/OWNER/REPO/branches/main/protection/enforce_admins
+# trap fires on EVERY exit path, including a failed or interrupted merge
 ```
+
+Then diff `protection-after.json` against `protection-baseline.json`.
+
+Two limits of that trap, worth knowing before you rely on it: an `EXIT`
+trap does not run on `SIGKILL`, a lost SSH session, or a machine crash,
+so confirm protection by hand if the shell dies that way; and if `jq`
+is missing the verification always evaluates false, so the loop prints
+`RESTORE FAILED` even when the `POST` succeeded. That errs safe, but
+check the API before re-running blindly. Ensure `gh` and `jq` are
+installed and authenticated first.
 
 Be clear about the trade: disabling `enforce_admins` is narrower in
 **who** (admins only, for the window) but broader in **what** — for
