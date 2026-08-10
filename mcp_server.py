@@ -1368,29 +1368,52 @@ def _render_grounded_answer(data: dict[str, Any], heading: str) -> str:
     (web.title / web.uri per chunk); the issued queries are in
     ``webSearchQueries``. Sources are appended explicitly because the
     synthesized text usually references them only by name.
+
+    Every nested field is type-narrowed before use. Falsy-coalescing alone
+    is not enough: a field present with the WRONG type (a string where a
+    list or mapping is expected) survives ``or {}`` and then raises
+    AttributeError on the next ``.get``. Reproduced on five shapes during
+    PR #67 review — the MCP SDK would convert that into a generic error
+    string, losing the specific fail-closed message this function exists
+    to produce.
     """
-    candidates = data.get("candidates") or []
-    if not candidates:
+    candidates = data.get("candidates") if isinstance(data, dict) else None
+    if not isinstance(candidates, list) or not candidates:
         return f"Error: Vertex returned no candidates for {heading}"
-    candidate = candidates[0] or {}
-    parts = (candidate.get("content") or {}).get("parts") or []
-    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+    candidate = candidates[0]
+    if not isinstance(candidate, dict):
+        return f"Error: Vertex returned a malformed candidate for {heading}"
+    content = candidate.get("content")
+    parts = content.get("parts") if isinstance(content, dict) else None
+    if not isinstance(parts, list):
+        parts = []
+    text = "".join(
+        p.get("text", "")
+        for p in parts
+        if isinstance(p, dict) and isinstance(p.get("text"), str)
+    ).strip()
     if not text:
         return f"Error: Vertex returned an empty answer for {heading}"
 
     sections = [f"## {heading}", "", text]
-    grounding = candidate.get("groundingMetadata") or {}
+    grounding = candidate.get("groundingMetadata")
+    if not isinstance(grounding, dict):
+        grounding = {}
+    chunks = grounding.get("groundingChunks")
     sources = []
-    for chunk in grounding.get("groundingChunks") or []:
-        web = chunk.get("web") or {} if isinstance(chunk, dict) else {}
+    for chunk in chunks if isinstance(chunks, list) else []:
+        web = chunk.get("web") if isinstance(chunk, dict) else None
+        if not isinstance(web, dict):
+            continue
+        uri = web.get("uri")
+        if not isinstance(uri, str) or not uri:
+            continue
         title = web.get("title") or web.get("domain") or "source"
-        uri = web.get("uri") or ""
-        if uri:
-            sources.append(f"- {title}: {uri}")
+        sources.append(f"- {title}: {uri}")
     if sources:
         sections += ["", "### Sources", *sources]
-    queries = grounding.get("webSearchQueries") or []
-    if queries:
+    queries = grounding.get("webSearchQueries")
+    if isinstance(queries, list) and queries:
         joined = ", ".join(str(q) for q in queries)
         sections += ["", f"*Search queries: {joined}*"]
     return "\n".join(sections)

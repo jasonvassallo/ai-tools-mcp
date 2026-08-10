@@ -924,6 +924,84 @@ class TestRenderGroundedAnswer(unittest.TestCase):
         self.assertNotIn("no-title.example", out)
         self.assertIn("*Search queries: q1, q2*", out)
 
+    def test_malformed_shapes_fail_closed_without_raising(self):
+        # PR #67: Gemini and CodeRabbit independently flagged this, and
+        # direct reproduction confirmed five of these shapes raised
+        # AttributeError. Falsy-coalescing (`or {}`) does not help when a
+        # field is PRESENT with the wrong type, so each nested access is
+        # type-narrowed. The renderer must return its own fail-closed
+        # message rather than let the MCP SDK flatten an AttributeError
+        # into a generic error string.
+        cases = {
+            "candidates not a list": {"candidates": "nope"},
+            "candidate not a dict": {"candidates": ["nope"]},
+            "content not a dict": {"candidates": [{"content": "nope"}]},
+            "parts not a list": {"candidates": [{"content": {"parts": "nope"}}]},
+            "groundingMetadata not a dict": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hi"}]},
+                        "groundingMetadata": "nope",
+                    }
+                ]
+            },
+            "groundingChunks not a list": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hi"}]},
+                        "groundingMetadata": {"groundingChunks": "nope"},
+                    }
+                ]
+            },
+            "chunk web not a dict": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hi"}]},
+                        "groundingMetadata": {"groundingChunks": [{"web": "nope"}]},
+                    }
+                ]
+            },
+            "webSearchQueries not a list": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hi"}]},
+                        "groundingMetadata": {"webSearchQueries": "nope"},
+                    }
+                ]
+            },
+            "part text not a string": {
+                "candidates": [{"content": {"parts": [{"text": 42}]}}]
+            },
+            "top level not a dict": "nope",
+        }
+        for label, data in cases.items():
+            with self.subTest(shape=label):
+                out = mcp_server._render_grounded_answer(data, "Quick Research")
+                self.assertIsInstance(out, str)
+                self.assertTrue(out.startswith(("## Quick Research", "Error:")), out)
+
+    def test_source_needs_a_usable_uri(self):
+        # A chunk whose uri is missing or the wrong type is skipped, not
+        # rendered as a bare dash or crashed on.
+        data = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "body"}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"title": "No URI"}},
+                            {"web": {"title": "Bad URI", "uri": 42}},
+                            {"web": {"title": "Good", "uri": "https://e.x/1"}},
+                        ]
+                    },
+                }
+            ]
+        }
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("- Good: https://e.x/1", out)
+        self.assertNotIn("No URI", out)
+        self.assertNotIn("Bad URI", out)
+
     def test_empty_candidates_fail_closed(self):
         out = mcp_server._render_grounded_answer({}, "Quick Research")
         self.assertIn("Error", out)
