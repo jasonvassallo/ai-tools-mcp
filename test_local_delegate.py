@@ -1468,10 +1468,14 @@ class TestLocalDelegateSync(unittest.TestCase):
             )
         self.assertTrue(fake.call_args.kwargs["pre_unload"])
 
-    def test_explicit_keep_alive_suppresses_pre_unload(self):
-        # An explicit caller value means exactly what it says — including an
-        # explicit "0". The eviction rides with the auto-applied default only.
-        for ka in ("5m", "0"):
+    def test_pre_unload_follows_the_effective_zero_ttl(self):
+        # Protection keys off the EFFECTIVE keep_alive, not how it was chosen.
+        # An explicit "0" MUST still be protected: commands/local-delegate.md
+        # tells callers to pass keep_alive="0" for the long-context qwen
+        # route, so gating on "we defaulted it" left that documented path
+        # unprotected (Codex P1 + Gemini, PR #65). Explicit non-zero values
+        # still opt out so deliberate warm-pinning works.
+        for ka, expect_pre_unload in (("5m", False), ("0", True), ("1h", False)):
             fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
                 _call(
@@ -1482,7 +1486,21 @@ class TestLocalDelegateSync(unittest.TestCase):
                         "keep_alive": ka,
                     },
                 )
-            self.assertFalse(fake.call_args.kwargs["pre_unload"], msg=ka)
+            self.assertEqual(
+                fake.call_args.kwargs["pre_unload"], expect_pre_unload, msg=ka
+            )
+            # The caller's explicit value is still what reaches Ollama.
+            self.assertEqual(fake.call_args.args[0]["keep_alive"], ka, msg=ka)
+
+    def test_explicit_zero_on_non_qwen_stays_unprotected(self):
+        # The zero TTL alone must not trigger an eviction on an immune model.
+        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+            _call(
+                "local_delegate",
+                {"prompt": "p", "model": "gemma4:12b-nvfp4", "keep_alive": "0"},
+            )
+        self.assertFalse(fake.call_args.kwargs["pre_unload"])
 
     def test_non_qwen_model_gets_no_pre_unload(self):
         # gemma is immune to the contamination (0/141 lifetime) — it must not

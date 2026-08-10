@@ -2595,11 +2595,13 @@ async def list_tools() -> list[Tool]:
                         "type": "integer",
                         "default": 300,
                         "description": (
-                            "Sync timeout in seconds (1-600), covering the whole "
-                            "call (pre-unload plus chat). At 5s or less the qwen "
-                            "contamination pre-unload is skipped rather than "
-                            "allowed to overrun this ceiling, so such a call runs "
-                            "unprotected."
+                            "Sync timeout in seconds (1-600). The qwen "
+                            "contamination pre-unload is wall-clock bounded and "
+                            "deducted from this budget; at 5s or less it is "
+                            "skipped rather than allowed to eat it, so such a "
+                            "call runs unprotected. Note httpx applies the "
+                            "remainder per network phase, so this is a phase "
+                            "bound rather than a hard total."
                         ),
                     },
                 },
@@ -3206,15 +3208,17 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # `model` above): qwen tags default to keep_alive "0" — the proven
         # repeat-call contamination mitigation. Explicit caller values win.
         #
-        # The pre-unload rides with the auto-applied default only, because
-        # keep_alive:"0" alone does not protect the call carrying it (it is
-        # a post-response TTL). An explicit caller keep_alive — including an
-        # explicit "0" — still means exactly what the caller asked for and
-        # nothing more, so passing keep_alive yourself opts out of both.
-        pre_unload = False
+        # The pre-unload follows the EFFECTIVE zero TTL, not how it was
+        # chosen. Gating it on "we applied the default" left the repo's own
+        # documented route unprotected: commands/local-delegate.md tells
+        # callers to pass keep_alive="0" for long-context qwen work, so the
+        # most likely qwen caller opted itself out of the very protection
+        # this exists to provide (Codex P1 + Gemini, PR #65, both confirmed
+        # against that file). An explicit NON-zero value still opts out —
+        # deliberate warm-pinning stays possible.
         if keep_alive is None and _keep_alive_zero_default_applies(model):
             keep_alive = "0"
-            pre_unload = True
+        pre_unload = keep_alive == "0" and _keep_alive_zero_default_applies(model)
 
         messages: list[dict[str, str]] = []
         if system:
