@@ -71,7 +71,7 @@ Perplexity Agent research stays available on the user's key.
   own key fetch, not the OpenAI client).
 - Docs: module docstring, README, AGENTS.md tool descriptions.
 - Lockstep version bump: `.claude-plugin/plugin.json` and
-  `mcpb/manifest.json` 1.5.2 → 1.6.0.
+  `mcpb/manifest.json` 1.5.4 → 1.6.0.
 - Tests: new coverage for `_vertex_generate_content` (mocked transport,
   grounding-chunk rendering, empty-candidates fail-closed) and updated
   quick/deep tests; Perplexity-client tests removed with the client.

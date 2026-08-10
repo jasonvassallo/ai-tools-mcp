@@ -1,5 +1,5 @@
 ---
-description: Run a fast Gemini grounded-search query (concise, single-source citations, smaller than deep_research)
+description: Run a fast Gemini grounded-search query (concise, citation-backed, smaller answer budget than deep_research)
 argument-hint: <research-query>
 ---
 

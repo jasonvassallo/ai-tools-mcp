@@ -1279,6 +1279,39 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
 # --- Vertex grounded search (quick_research / deep_research) -------------
 
 
+# Ceiling for the research tools' max_tokens argument. Matches the Gemini
+# flash generation limit (65,536 output tokens); a value above it would be
+# rejected by Vertex anyway, so validate at the tool boundary instead of
+# spending an authenticated request to find out.
+_VERTEX_MAX_OUTPUT_TOKENS = 65536
+
+
+def _validate_research_arguments(
+    tool_name: str, arguments: dict
+) -> tuple[str, int] | str:
+    """Validate quick/deep_research arguments before any authenticated call.
+
+    Returns ``(query, max_tokens)`` on success, or an error string. Booleans
+    are rejected explicitly because ``bool`` is a subclass of ``int``.
+    """
+    query = arguments.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return f"Error: {tool_name} requires a non-empty string 'query'"
+    max_tokens = arguments.get(
+        "max_tokens", 1024 if tool_name == "quick_research" else 2048
+    )
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or not 1 <= max_tokens <= _VERTEX_MAX_OUTPUT_TOKENS
+    ):
+        return (
+            f"Error: {tool_name} 'max_tokens' must be an integer between 1 "
+            f"and {_VERTEX_MAX_OUTPUT_TOKENS}"
+        )
+    return query, max_tokens
+
+
 async def _vertex_generate_content(
     system_prompt: str,
     query: str,
@@ -2712,8 +2745,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Handle tool calls."""
 
     if name == "quick_research":
-        query = arguments.get("query")
-        max_tokens = arguments.get("max_tokens", 1024)
+        validated = _validate_research_arguments(name, arguments)
+        if isinstance(validated, str):
+            return [TextContent(type="text", text=validated)]
+        query, max_tokens = validated
 
         # Same Vertex grounded-search path as deep_research; only the
         # system prompt and token budget differ. The prompt asks for
@@ -2742,8 +2777,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return [TextContent(type="text", text=result)]
 
     if name == "deep_research":
-        query = arguments.get("query")
-        max_tokens = arguments.get("max_tokens", 2048)
+        validated = _validate_research_arguments(name, arguments)
+        if isinstance(validated, str):
+            return [TextContent(type="text", text=validated)]
+        query, max_tokens = validated
 
         data = await _vertex_generate_content(
             system_prompt=(

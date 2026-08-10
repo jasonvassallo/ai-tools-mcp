@@ -954,6 +954,34 @@ class TestRenderGroundedAnswer(unittest.TestCase):
         self.assertIn("[REDACTED_GOOGLE_API_KEY]", result[0].text)
         self.assertNotIn(FAKE_GOOG_API_KEY, result[0].text)
 
+    def test_handler_rejects_invalid_arguments_before_any_call(self):
+        # Validation must run before authentication or any Vertex call —
+        # a network/credential mock that raises proves nothing was invoked.
+        async def must_not_be_called(**kwargs):
+            raise AssertionError("_vertex_generate_content must not be called")
+
+        cases = [
+            ("quick_research", {}, "non-empty string 'query'"),
+            ("quick_research", {"query": "   "}, "non-empty string 'query'"),
+            ("deep_research", {"query": 7}, "non-empty string 'query'"),
+            ("quick_research", {"query": "q", "max_tokens": 0}, "max_tokens"),
+            ("deep_research", {"query": "q", "max_tokens": True}, "max_tokens"),
+            ("deep_research", {"query": "q", "max_tokens": "2048"}, "max_tokens"),
+            (
+                "quick_research",
+                {"query": "q", "max_tokens": 10**6},
+                "max_tokens",
+            ),
+        ]
+        with mock.patch.object(
+            mcp_server, "_vertex_generate_content", side_effect=must_not_be_called
+        ):
+            for tool, args, expect in cases:
+                with self.subTest(tool=tool, args=args):
+                    result = asyncio.run(mcp_server.call_tool(tool, args))
+                    self.assertIn("Error", result[0].text)
+                    self.assertIn(expect, result[0].text)
+
     def test_handler_surfaces_failure_envelope(self):
         async def fake_vertex(**kwargs):
             return {"status": "failed", "error": "503: upstream"}
