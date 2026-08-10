@@ -1,9 +1,13 @@
 name: Claude Gate
 
-# claude-gate — will become an ALWAYS-RUNS second required status check on
-# `main`, alongside semgrep/ci (not yet wired into branch protection --
-# pending until this file lands on main untouched and produces a real
-# passing run; a PR that edits this file will always fail, see below).
+# claude-gate — an ALWAYS-RUNS second required status check on `main`,
+# alongside semgrep/ci. It was wired into branch protection after landing
+# on main untouched and producing real passing runs (#60, #63, #64, all
+# under a minute); required_status_checks.contexts read
+# ["semgrep/ci","claude-gate"] when last verified live on 2026-08-09.
+# That makes the consequence below live, not hypothetical: a PR editing
+# this file always fails its own required check, so landing one takes an
+# admin temporarily lifting the context (see ANTI-TAMPER).
 #
 # WHY (2026-08-01, ported from mlx-omni-signal): every other reviewer is
 # tiered. claude-review and semgrep/ci skip `trivial`-labelled PRs (#30),
