@@ -76,7 +76,9 @@ list **BEFORE the catch-all** `- service: http_status:404` rule
 
 ```yaml
   - hostname: queue-mbp.djvassallo.com
-    service: http://localhost:11438
+    # 127.0.0.1 literally: make_server() binds the IPv4 loopback only,
+    # and a "localhost" that resolves to ::1 first would miss it.
+    service: http://127.0.0.1:11438
 ```
 
 Then restart the tunnel (system daemon, per the one-tunnel-per-machine

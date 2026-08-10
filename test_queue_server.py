@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import http.client
 import importlib.util
 import json
 import secrets
@@ -319,10 +320,161 @@ class TestQueueStore(unittest.TestCase):
         with self.assertRaises(queue_server.QueueError):
             self.store.submit({"model": "m"})  # no messages
 
+    def test_submit_429_when_queue_full(self):
+        with mock.patch.object(queue_server, "MAX_QUEUED", 2):
+            self.store.submit(_PAYLOAD)
+            self.store.submit(_PAYLOAD)
+            with self.assertRaises(queue_server.QueueError) as ctx:
+                self.store.submit(_PAYLOAD)
+        self.assertEqual(ctx.exception.http_status, 429)
+        self.assertIn("queue is full", str(ctx.exception))
+        # Only QUEUED jobs count against the cap: work one off and the
+        # next submit is accepted again.
+        with mock.patch.object(queue_server, "MAX_QUEUED", 2):
+            job_id, _ = self.store.claim_next()
+            self.store.finish(job_id, {"message": {"content": "x"}})
+            self.store.submit(_PAYLOAD)
+
+    def test_attempts_exhausted_result_names_the_cause(self):
+        job_id = self.store.submit(_PAYLOAD)
+        for _ in (1, 2):
+            self.store.claim_next()
+            self.store.recover_running()
+        self.assertIsNone(self.store.claim_next())  # fails the job
+        result = self.store.result(job_id)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("attempts", result["error"])
+        self.assertNotEqual(result["error"], "job finished without a result")
+
+    def test_cancel_finish_race_never_overwrites_a_terminal_row(self):
+        # cancel() and a late finish() racing from two threads must
+        # serialize: whichever commits first wins, and the loser must
+        # never overwrite the winner (a cancel that lands after finish
+        # used to overwrite a real 'done' result). BEGIN IMMEDIATE in
+        # both methods makes the interleaving atomic; run a handful of
+        # iterations to exercise both orderings.
+        for _ in range(10):
+            job_id = self.store.submit(_PAYLOAD)
+            self.store.claim_next()
+            outcomes: dict[str, object] = {}
+            barrier = threading.Barrier(2)
+
+            def do_finish(job_id=job_id, outcomes=outcomes, barrier=barrier):
+                barrier.wait()
+                outcomes["finish_recorded"] = self.store.finish(
+                    job_id, {"message": {"content": "late"}}
+                )
+
+            def do_cancel(job_id=job_id, outcomes=outcomes, barrier=barrier):
+                barrier.wait()
+                try:
+                    self.store.cancel(job_id)
+                    outcomes["cancelled"] = True
+                except queue_server.QueueError as exc:
+                    outcomes["cancelled"] = False
+                    outcomes["cancel_status"] = exc.http_status
+
+            threads = [
+                threading.Thread(target=do_finish),
+                threading.Thread(target=do_cancel),
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+            status = self.store.status(job_id)["status"]
+            self.assertIn(status, ("done", "cancelled"))
+            if status == "done":
+                # finish won — cancel must have 409ed, and the stored
+                # result must be intact.
+                self.assertTrue(outcomes["finish_recorded"])
+                self.assertFalse(outcomes["cancelled"])
+                self.assertEqual(outcomes["cancel_status"], 409)
+                self.assertEqual(
+                    self.store.result(job_id)["message"]["content"], "late"
+                )
+            else:
+                # cancel won — the late outcome must have been discarded.
+                self.assertTrue(outcomes["cancelled"])
+                self.assertFalse(outcomes["finish_recorded"])
+
     def test_db_files_are_owner_only(self):
         self.store.submit(_PAYLOAD)
         self.assertEqual(self.store.db_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.store.db_path.parent.stat().st_mode & 0o777, 0o700)
+
+
+class TestWorkerResilience(unittest.TestCase):
+    """No exception class may kill a worker thread (PR #61 P1): a dead
+    worker silently strands every future queued job."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.store = _store(Path(self._tmp.name))
+        self.worker = queue_server.QueueWorker(
+            self.store, "http://127.0.0.1:9", poll_interval_s=0.01
+        )
+
+    def test_incomplete_read_fails_job_instead_of_raising(self):
+        # http.client.IncompleteRead is an HTTPException, NOT an OSError,
+        # so it escaped the original except chain and killed the thread.
+        job_id = self.store.submit(_PAYLOAD)
+        self.store.claim_next()
+        with mock.patch.object(
+            queue_server.urllib.request,
+            "urlopen",
+            side_effect=http.client.IncompleteRead(b""),
+        ):
+            self.worker._work_one(job_id, _PAYLOAD)  # must not raise
+        status = self.store.status(job_id)
+        self.assertEqual(status["status"], "failed")
+        self.assertEqual(status["error_class"], "worker_error")
+        result = self.store.result(job_id)
+        self.assertEqual(result["status"], "failed")
+        # The error names the exception class, never response content.
+        self.assertIn("IncompleteRead", result["error"])
+
+    def test_arbitrary_exception_fails_job_instead_of_raising(self):
+        job_id = self.store.submit(_PAYLOAD)
+        self.store.claim_next()
+        with mock.patch.object(
+            queue_server.urllib.request,
+            "urlopen",
+            side_effect=RuntimeError("secret detail"),
+        ):
+            self.worker._work_one(job_id, _PAYLOAD)  # must not raise
+        result = self.store.result(job_id)
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("RuntimeError", result["error"])
+        # Exception MESSAGES are never echoed into the stored result.
+        self.assertNotIn("secret detail", result["error"])
+
+    def test_worker_loop_survives_a_claim_next_crash(self):
+        # Even a failure OUTSIDE the per-job path (e.g. SQLite raising in
+        # claim_next) must not end the loop: the thread logs, backs off,
+        # and keeps polling.
+        calls: list[int] = []
+        proceed = threading.Event()
+
+        def flaky_claim():
+            calls.append(1)
+            if len(calls) == 1:
+                raise sqlite3.OperationalError("transient store failure")
+            proceed.set()
+            return None
+
+        with mock.patch.object(self.store, "claim_next", side_effect=flaky_claim):
+            self.worker.concurrency = 1
+            self.worker.start()
+            try:
+                self.assertTrue(
+                    proceed.wait(timeout=5),
+                    "worker thread died after the first claim_next crash",
+                )
+            finally:
+                self.worker.stop()
+        self.assertGreaterEqual(len(calls), 2)
 
 
 class _FakeUpstream:
@@ -454,7 +606,17 @@ class TestEndToEnd(unittest.TestCase):
                 b"Connection: close\r\n"
                 b"\r\n"
             )
-            response = sock.recv(4096)
+            # Read to EOF rather than taking a single recv(): the handler
+            # writes status/headers and body separately, so one recv can
+            # return the headers alone and lose the body assertion below.
+            # `Connection: close` above guarantees the server closes.
+            chunks = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            response = b"".join(chunks)
         self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
         self.assertIn(b"invalid Content-Length", response)
 

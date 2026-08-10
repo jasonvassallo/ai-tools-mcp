@@ -2234,10 +2234,18 @@ async def _select_queue_endpoint() -> tuple[str, dict[str, str]] | None:
 async def _queue_submit(payload: dict[str, Any]) -> str | None:
     """Submit a chat payload to the durable queue → job id, or None.
 
-    None means "no durable queue available" (unreachable, unhealthy,
-    submit rejected, or malformed response) and the caller falls back to
-    the in-memory store — the tool call still succeeds either way, and
-    the payload only ever goes to the user's own endpoints.
+    None means "the durable queue definitely did NOT take this job" —
+    no healthy endpoint, connect failure (request never reached the
+    service), or the service answered with an error status — and the
+    caller may safely fall back to the in-memory store.
+
+    Raises ValueError on an AMBIGUOUS outcome: the request may have
+    reached the service (read timeout / dropped connection mid-exchange)
+    or provably did (HTTP 200 whose body we could not extract a job id
+    from). Falling back would risk executing the same payload twice —
+    once by the queue's worker, once in-memory — so the caller must NOT
+    fall back; it surfaces the error and the user decides whether to
+    resubmit.
     """
     selected = await _select_queue_endpoint()
     if selected is None:
@@ -2255,11 +2263,31 @@ async def _queue_submit(payload: dict[str, Any]) -> str | None:
         )
         response.raise_for_status()
         data = response.json()
-    except (httpx.HTTPStatusError, httpx.RequestError, ValueError):
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # The request never reached the service; safe to fall back.
         return None
+    except httpx.HTTPStatusError:
+        # The service answered and refused (400/413/429/5xx): the job
+        # was not enqueued; safe to fall back.
+        return None
+    except (httpx.RequestError, ValueError) as exc:
+        raise ValueError(
+            "Durable queue submit outcome is unknown "
+            f"({type(exc).__name__} after the request was sent): the job "
+            "may already be enqueued server-side. Not falling back to the "
+            "in-memory store — that could execute the prompt twice. "
+            "Re-run the call to retry."
+        ) from exc
     job_id = data.get("job_id") if isinstance(data, dict) else None
     if not isinstance(job_id, str) or not _QUEUE_JOB_ID_RE.fullmatch(job_id):
-        return None
+        # HTTP 200 means the queue accepted the job even though the
+        # body is unusable — falling back would duplicate execution.
+        raise ValueError(
+            "Durable queue accepted the job (HTTP 200) but returned no "
+            "usable job_id. Not falling back to the in-memory store — "
+            "that could execute the prompt twice. The job will run and "
+            "expire server-side; re-run the call to retry."
+        )
     return job_id
 
 
@@ -2272,32 +2300,57 @@ async def _queue_poll(job_id: str) -> dict[str, Any]:
     Raises ValueError — a clean, retryable tool error — when no queue
     endpoint is reachable: the job is durable server-side, so "try again
     later" is the honest answer, not a terminal failure.
+
+    Each queue endpoint has its own independent store, so a 404 from one
+    endpoint only proves the job is unknown THERE — the walk continues
+    down the chain rather than declaring the job purged. Only when every
+    reachable endpoint says 404 does the error report the honest set of
+    possibilities (wrong/unreachable endpoint, or the 72 h purge).
     """
-    selected = await _select_queue_endpoint()
-    if selected is None:
+    client = await _get_http_client()
+    response: Any = None
+    headers: dict[str, str] = {}
+    tried_404: list[str] = []
+    last_request_error: httpx.RequestError | None = None
+    for endpoint in await asyncio.to_thread(_resolve_queue_chain):
+        endpoint_headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+        if endpoint_headers is None:
+            continue
+        try:
+            # Same server-sourced-auth / operator-configured-endpoint
+            # rationale as _probe_endpoint_tags.
+            candidate = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+                f"{endpoint}/v1/jobs/{job_id}/result",
+                headers=endpoint_headers,
+                timeout=_QUEUE_REQUEST_TIMEOUT_S,
+            )
+        except httpx.RequestError as exc:
+            last_request_error = exc
+            continue
+        if candidate.status_code == 404:
+            tried_404.append(endpoint)
+            continue
+        response = candidate
+        headers = endpoint_headers
+        break
+    if response is None:
+        if tried_404:
+            where = ", ".join(redact_secrets(e) for e in tried_404)
+            raise ValueError(
+                f"Queue job_id {job_id!r} is unknown to the reachable queue "
+                f"endpoint(s) ({where}). Either the endpoint that accepted "
+                "it is currently unreachable, or the job finished and was "
+                "purged (72 hours after completion)."
+            )
+        if last_request_error is not None:
+            raise ValueError(
+                f"Queue request error: "
+                f"{redact_secrets(str(last_request_error))}. The job is "
+                "durable server-side — retry local_delegate_result later."
+            ) from last_request_error
         raise ValueError(
             "No queue endpoint reachable to poll this durable job. The job "
             "is persisted server-side — retry local_delegate_result later."
-        )
-    endpoint, headers = selected
-    client = await _get_http_client()
-    try:
-        # Same server-sourced-auth / operator-configured-endpoint
-        # rationale as _probe_endpoint_tags.
-        response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
-            f"{endpoint}/v1/jobs/{job_id}/result",
-            headers=headers,
-            timeout=_QUEUE_REQUEST_TIMEOUT_S,
-        )
-    except httpx.RequestError as exc:
-        raise ValueError(
-            f"Queue request error: {redact_secrets(str(exc))}. The job is "
-            "durable server-side — retry local_delegate_result later."
-        ) from exc
-    if response.status_code == 404:
-        raise ValueError(
-            f"Unknown queue job_id {job_id!r} — finished queue jobs are "
-            "purged 72 hours after completion."
         )
     try:
         response.raise_for_status()
@@ -3275,9 +3328,31 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         if background:
             # Queue-first (v1.6): a reachable durable queue wins — the job
             # survives MCP server restarts and its result persists until
-            # the queue's TTL instead of being single-collect.
-            queue_job_id = await _queue_submit(payload)
+            # the queue's TTL instead of being single-collect. An
+            # AMBIGUOUS submit (ValueError) is surfaced as an error
+            # instead of falling back: the queue may already hold the
+            # job, and running it in-memory too would execute the prompt
+            # twice.
+            try:
+                queue_job_id = await _queue_submit(payload)
+            except ValueError as exc:
+                return [
+                    TextContent(type="text", text=f"Error: {redact_secrets(str(exc))}")
+                ]
             if queue_job_id is not None:
+                if model_arg is None:
+                    # The implicit model was resolved against the OLLAMA
+                    # chain (locality-first), but the queue's worker
+                    # executes against ITS OWN configured upstream, which
+                    # may not serve the resolved tag. Say so rather than
+                    # letting a later "upstream HTTP 404" surprise.
+                    advisory += (
+                        f"Note: model {model} was resolved against this "
+                        "machine's Ollama chain, but the durable queue "
+                        "executes jobs against its own upstream — if that "
+                        "upstream does not serve this tag the job will "
+                        "fail; pass model= explicitly to be sure.\n\n"
+                    )
                 envelope = {
                     "job_id": queue_job_id,
                     "status": "started",

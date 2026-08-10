@@ -77,7 +77,7 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Models: server-side allowlist, default = `gemma4:12b-nvfp4` followed by four qwen3.6 tags (the qwen base tag inherits each host's window — 64k JVMBPro / 32k jvmacmini — while `-32k`/`-64k`/`-256k` pin the window explicitly regardless of host; all four tags share one weight blob on disk); override the allowlist per machine via `AI_TOOLS_OLLAMA_MODELS` comma-separated env or the extension's `ollama_models` setting (first entry becomes the default model; blank/garbage fails closed to the built-ins). Omitted-model calls resolve local-first across the allowlist — the first chain endpoint serving any allowlisted tag picks the model, so a missing default falls back with an advisory instead of failing or silently going remote when a local option exists; `AI_TOOLS_OLLAMA_DEFAULT_MODEL` may pick a different allowlisted tag
 - Purpose: privacy / quota offload / second opinion / background jobs
 - Latency: seconds-to-minutes, synchronous by default, or pass `background=true` to get a `job_id` and poll `local_delegate_result`
-- Privacy: **input stays on your machines** — on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API; nothing written to disk; jobs are in-memory and single-collect
+- Privacy: **input stays on your machines** — on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API. Synchronous calls write nothing to disk. `background=true` jobs prefer the durable queue service (`queue_server.py`) when one is reachable: payloads and results are then persisted **AES-256-GCM-encrypted at rest** in SQLite on the queue host (key in the macOS System keychain; 72 h TTL), still only on your own machines. The queue is opt-in by deployment — with no queue deployed (the default for everyone but the repo owner's JVMBPro), background jobs fall back to the legacy in-memory, single-collect store
 - `think`: off by default (faster); set `true` only for reasoning-heavy asks
 - `keep_alive`: omit to inherit the server's `OLLAMA_KEEP_ALIVE`
 
@@ -100,7 +100,7 @@ It:
 - calls the local Ollama server (native /api/chat) for the local_delegate family
 - returns plain text MCP responses
 
-There are no local model weights, no persistent background service, and no embedded secrets in the repo. (The local_delegate family only calls an already-running Ollama server; background jobs are in-process asyncio tasks.)
+There are no local model weights and no embedded secrets in the repo. The local_delegate family only calls an already-running Ollama server. Since v1.6 the repo also ships an **optional** standalone durable queue service (`queue_server.py` + `deploy/jvmbpro-delegate-queue/`) that `background=true` delegate jobs prefer when deployed: a LaunchAgent that persists jobs encrypted at rest (AES-256-GCM, key in the macOS System keychain, 72 h result TTL). Deploying it is a deliberate per-machine choice — the MCP server itself still runs no persistent background service, and without a deployed queue, background jobs are in-process asyncio tasks (in-memory, single-collect).
 
 ## Repository Layout
 

@@ -66,6 +66,15 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     class _FakeConnectError(_FakeRequestError):
         pass
 
+    class _FakeTimeoutException(_FakeRequestError):
+        pass
+
+    class _FakeConnectTimeout(_FakeTimeoutException):
+        pass
+
+    class _FakeReadTimeout(_FakeTimeoutException):
+        pass
+
     class _FakeRequestsException(Exception):
         pass
 
@@ -153,6 +162,9 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             HTTPStatusError=_FakeHTTPStatusError,
             RequestError=_FakeRequestError,
             ConnectError=_FakeConnectError,
+            TimeoutException=_FakeTimeoutException,
+            ConnectTimeout=_FakeConnectTimeout,
+            ReadTimeout=_FakeReadTimeout,
         ),
         "requests": _make(
             "requests",
@@ -1103,9 +1115,16 @@ class TestThinkingModelAdvisory(unittest.TestCase):
 
     def test_background_envelope_has_no_warning_key_when_not_needed(self):
         # A durable-queue submit with no advisory carries no warning at
-        # all — the fallback note is only for the in-memory path.
+        # all — the fallback note is only for the in-memory path. Model
+        # passed explicitly: an implicit model on the queue path now
+        # carries its own resolved-against-this-machine advisory.
         out, _ = self._delegate(
-            {"prompt": "hi", "think": True, "background": True},
+            {
+                "prompt": "hi",
+                "think": True,
+                "background": True,
+                "model": mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL,
+            },
             self.THINKING,
             queue_job_id="q" + "c" * 32,
         )
@@ -2262,7 +2281,10 @@ class TestQueueSubmit(_QueueClientCase):
         )
         self.assertIsNone(self._submit(client))
 
-    def test_malformed_job_id_returns_none(self):
+    def test_malformed_job_id_is_ambiguous_not_a_fallback(self):
+        # HTTP 200 proves the queue ACCEPTED the job; a missing/garbage
+        # job_id must not quietly fall back to the in-memory store, or
+        # the same prompt executes twice (queue worker + in-memory).
         for bad in ("no-prefix", "q" + "z" * 32, "", None, 42):
             client = _FakeQueueClient(
                 get_map={
@@ -2274,7 +2296,34 @@ class TestQueueSubmit(_QueueClientCase):
                     )
                 },
             )
-            self.assertIsNone(self._submit(client), msg=repr(bad))
+            with self.assertRaises(ValueError, msg=repr(bad)) as ctx:
+                self._submit(client)
+            self.assertIn("twice", str(ctx.exception))
+
+    def test_connect_error_on_submit_falls_back(self):
+        # The POST never reached the service — safe to fall back (None).
+        client = _FakeQueueClient(
+            get_map={f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)},
+            post_map={
+                f"{_LOCAL_QUEUE}/v1/jobs": mcp_server.httpx.ConnectError("refused")
+            },
+        )
+        self.assertIsNone(self._submit(client))
+
+    def test_read_timeout_on_submit_is_ambiguous(self):
+        # The request was sent and the response never came back: the job
+        # may be enqueued server-side, so falling back would risk double
+        # execution. Must raise, not return None.
+        client = _FakeQueueClient(
+            get_map={f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)},
+            post_map={
+                f"{_LOCAL_QUEUE}/v1/jobs": mcp_server.httpx.ReadTimeout("mid-flight")
+            },
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self._submit(client)
+        self.assertIn("unknown", str(ctx.exception))
+        self.assertIn("twice", str(ctx.exception))
 
 
 class TestQueuePoll(_QueueClientCase):
@@ -2321,7 +2370,49 @@ class TestQueuePoll(_QueueClientCase):
             self._poll(
                 self._client(_FakeResponse(status_code=404, json_data={"error": "x"}))
             )
+        # The message must not flatly assert the job was purged: each
+        # endpoint has its own store, so "unknown here" also covers a job
+        # whose accepting endpoint is currently unreachable.
         self.assertIn("purged", str(ctx.exception))
+        self.assertIn("unreachable", str(ctx.exception))
+        self.assertIn(_LOCAL_QUEUE, str(ctx.exception))
+
+    def test_404_walks_chain_to_endpoint_that_knows_the_job(self):
+        # Two endpoints, each with its own store: a 404 from the first
+        # must not end the poll — the second endpoint has the job.
+        creds = {
+            "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+            "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+        }
+
+        def keychain(service, account):
+            if service in creds:
+                return creds[service]
+            raise ValueError("not found")
+
+        stored = {"model": "m", "message": {"content": "found remotely"}}
+        client = _FakeQueueClient(
+            get_map={
+                self.RESULT_URL: _FakeResponse(
+                    status_code=404, json_data={"error": "x"}
+                ),
+                f"{_REMOTE_QUEUE}/v1/jobs/{_QID}/result": _FakeResponse(
+                    json_data={"job_id": _QID, "result": stored}
+                ),
+            }
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"AI_TOOLS_QUEUE_URLS": f"{_LOCAL_QUEUE},{_REMOTE_QUEUE}"},
+            ),
+            mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", side_effect=keychain
+            ),
+            self._with(client),
+        ):
+            out = asyncio.run(mcp_server._queue_poll(_QID))
+        self.assertEqual(out, stored)
 
     def test_no_endpoint_raises_retryable_error(self):
         client = _FakeQueueClient(
@@ -2389,10 +2480,45 @@ class TestLocalDelegateQueue(unittest.TestCase):
         self.assertEqual(env["job_id"], _QID)
         self.assertEqual(env["status"], "started")
         self.assertEqual(env["queue"], "durable")
-        self.assertNotIn("warning", env)
+        # The model was implicit: the queue executes against ITS upstream,
+        # not the endpoint the model was resolved on, and the envelope
+        # says so.
+        self.assertIn("resolved against", env["warning"])
         start.assert_not_called()
         (payload,), _ = submit.call_args
         self.assertEqual(payload["messages"], [{"role": "user", "content": "p"}])
+
+    def test_queue_submit_explicit_model_has_no_warning(self):
+        submit = mock.AsyncMock(return_value=_QID)
+        with mock.patch.object(mcp_server, "_queue_submit", submit):
+            out = _call(
+                "local_delegate",
+                {
+                    "prompt": "p",
+                    "background": True,
+                    "model": mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL,
+                },
+            )
+        env = json.loads(out[0].text)
+        self.assertEqual(env["queue"], "durable")
+        self.assertNotIn("warning", env)
+
+    def test_ambiguous_queue_submit_errors_without_memory_fallback(self):
+        # An ambiguous submit outcome (job may already be enqueued) must
+        # surface as an error — starting an in-memory copy could execute
+        # the prompt twice.
+        submit = mock.AsyncMock(
+            side_effect=ValueError("submit outcome is unknown — twice")
+        )
+        start = mock.Mock()
+        with (
+            mock.patch.object(mcp_server, "_queue_submit", submit),
+            mock.patch.object(mcp_server, "_start_delegate_job", start),
+        ):
+            out = _call("local_delegate", {"prompt": "p", "background": True})
+        self.assertTrue(out[0].text.startswith("Error:"))
+        self.assertIn("unknown", out[0].text)
+        start.assert_not_called()
 
     def test_fallback_to_memory_carries_warning(self):
         async def scenario():

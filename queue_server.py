@@ -102,6 +102,10 @@ KEY_SERVICE = "DELEGATE_QUEUE_KEY"
 KEY_ACCOUNT = "jasonvassallo"
 
 MAX_BODY_BYTES = 2 * 1024 * 1024  # ~2 MB submit cap
+# Backpressure: submits beyond this many already-queued jobs draw a 429
+# instead of growing the backlog without bound. Queued jobs are exempt
+# from the TTL sweep, so the cap is what bounds on-disk backlog growth.
+MAX_QUEUED = 64
 MAX_ATTEMPTS = 2
 JOB_TIMEOUT_S = 1800.0
 TTL_S = 72 * 3600.0
@@ -307,19 +311,37 @@ class QueueStore:
         sanitized = validate_payload(payload)
         job_id = "q" + uuid.uuid4().hex
         nonce, ciphertext = encrypt_blob(self._key, sanitized)
-        with contextlib.closing(self._connect()) as conn, conn:
-            conn.execute(
-                "INSERT INTO jobs (job_id, status, model, created_at,"
-                " payload_nonce, payload_ct) VALUES (?,?,?,?,?,?)",
-                (
-                    job_id,
-                    "queued",
-                    str(sanitized["model"]),
-                    time.time(),
-                    nonce,
-                    ciphertext,
-                ),
-            )
+        with contextlib.closing(self._connect()) as conn:
+            # BEGIN IMMEDIATE so the depth check and the insert are one
+            # write transaction — two racing submits cannot both observe
+            # MAX_QUEUED - 1 and overshoot the cap.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                (queued,) = conn.execute(
+                    "SELECT COUNT(*) FROM jobs WHERE status='queued'"
+                ).fetchone()
+                if queued >= MAX_QUEUED:
+                    raise QueueError(
+                        429,
+                        f"queue is full ({queued} jobs queued, cap "
+                        f"{MAX_QUEUED}); retry later",
+                    )
+                conn.execute(
+                    "INSERT INTO jobs (job_id, status, model, created_at,"
+                    " payload_nonce, payload_ct) VALUES (?,?,?,?,?,?)",
+                    (
+                        job_id,
+                        "queued",
+                        str(sanitized["model"]),
+                        time.time(),
+                        nonce,
+                        ciphertext,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
         self._tighten_file_modes()
         log.info("job %s queued (model %s)", job_id, sanitized["model"])
         return job_id
@@ -362,18 +384,32 @@ class QueueStore:
         """
         with contextlib.closing(self._connect()) as conn:
             row = conn.execute(
-                "SELECT status, result_nonce, result_ct FROM jobs WHERE job_id = ?",
+                "SELECT status, result_nonce, result_ct, error_class, attempts"
+                " FROM jobs WHERE job_id = ?",
                 (job_id,),
             ).fetchone()
         if row is None:
             raise QueueError(404, f"unknown job_id {job_id!r}")
-        status, nonce, ciphertext = row
+        status, nonce, ciphertext, error_class, attempts = row
         if status == "cancelled":
             return {"status": "failed", "error": "job was cancelled"}
         if status not in _TERMINAL_STATUSES:
             return None
         if nonce is None or ciphertext is None:
-            return {"status": "failed", "error": "job finished without a result"}
+            # Jobs failed administratively (attempts cap at claim time or
+            # crash recovery) never got a result envelope written; say
+            # what actually happened instead of a generic shrug.
+            if error_class == "attempts_exhausted":
+                error = (
+                    f"job failed after exhausting {attempts} of "
+                    f"{MAX_ATTEMPTS} attempts (crashed or was interrupted "
+                    "each time before finishing)"
+                )
+            elif error_class:
+                error = f"job finished without a result ({error_class})"
+            else:
+                error = "job finished without a result"
+            return {"status": "failed", "error": error}
         return decrypt_blob(self._key, nonce, ciphertext)
 
     # ── cancel ───────────────────────────────────────────────────────
@@ -385,20 +421,35 @@ class QueueStore:
         in-flight upstream call cannot be aborted mid-request, but its
         eventual outcome is discarded (``finish`` refuses to overwrite a
         cancelled row). Cancelling an already-terminal job is a 409.
+
+        BEGIN IMMEDIATE makes the status check and the update one write
+        transaction; without it, ``finish`` could commit ``done`` between
+        this method's SELECT and its UPDATE and the cancel would then
+        overwrite a real result. The status guard on the UPDATE is
+        belt-and-suspenders for the same race.
         """
-        with contextlib.closing(self._connect()) as conn, conn:
-            row = conn.execute(
-                "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
-            ).fetchone()
-            if row is None:
-                raise QueueError(404, f"unknown job_id {job_id!r}")
-            status = row[0]
-            if status in _TERMINAL_STATUSES:
-                raise QueueError(409, f"job is already {status}")
-            conn.execute(
-                "UPDATE jobs SET status='cancelled', finished_at=? WHERE job_id = ?",
-                (time.time(), job_id),
-            )
+        with contextlib.closing(self._connect()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if row is None:
+                    raise QueueError(404, f"unknown job_id {job_id!r}")
+                status = row[0]
+                if status in _TERMINAL_STATUSES:
+                    raise QueueError(409, f"job is already {status}")
+                cur = conn.execute(
+                    "UPDATE jobs SET status='cancelled', finished_at=?"
+                    " WHERE job_id = ? AND status IN ('queued','running')",
+                    (time.time(), job_id),
+                )
+                if cur.rowcount != 1:
+                    raise QueueError(409, "job reached a terminal state first")
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
         log.info("job %s cancelled (was %s)", job_id, status)
         return "cancelled"
 
@@ -565,13 +616,23 @@ class QueueWorker:
             thread.join(timeout=5)
 
     def _run(self) -> None:
+        # The loop guard is the last line of defense: NO exception class
+        # may terminate a worker thread (a dead worker silently strands
+        # every future queued job). _work_one already converts job-level
+        # failures into failed rows; anything that still escapes — a
+        # store/SQLite error in claim_next, a finish() failure — is
+        # logged and the loop backs off and continues.
         while not self._stop.is_set():
-            claimed = self.store.claim_next()
-            if claimed is None:
+            try:
+                claimed = self.store.claim_next()
+                if claimed is None:
+                    self._stop.wait(self.poll_interval_s)
+                    continue
+                job_id, payload = claimed
+                self._work_one(job_id, payload)
+            except Exception:  # noqa: BLE001 - worker must outlive any single job
+                log.exception("worker iteration failed")
                 self._stop.wait(self.poll_interval_s)
-                continue
-            job_id, payload = claimed
-            self._work_one(job_id, payload)
 
     def _work_one(self, job_id: str, payload: dict[str, Any]) -> None:
         # Error text deliberately never includes payload or response
@@ -618,6 +679,24 @@ class QueueWorker:
                 job_id,
                 {"status": "failed", "error": "invalid JSON from upstream"},
                 error_class="bad_response",
+                failed=True,
+            )
+            return
+        except Exception as exc:  # noqa: BLE001 - see below
+            # Terminal backstop: the chain above names the EXPECTED
+            # failures, but urllib can raise outside it — e.g.
+            # http.client.IncompleteRead (a truncated upstream response)
+            # is an HTTPException, not an OSError — and any such escape
+            # previously killed the worker thread for good. Mark the job
+            # failed with the exception class (never its message, which
+            # could echo response content) and keep the worker alive.
+            self.store.finish(
+                job_id,
+                {
+                    "status": "failed",
+                    "error": f"unexpected worker error: {type(exc).__name__}",
+                },
+                error_class="worker_error",
                 failed=True,
             )
             return

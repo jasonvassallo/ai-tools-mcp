@@ -132,6 +132,21 @@ jobs:
             fi
           done
 
+          # The delegate-queue LaunchAgent plist is a launch surface too,
+          # but plist XML splits key and value across lines
+          # (<key>UV_PRERELEASE</key> / <string>if-necessary</string>),
+          # so the single-line pattern above cannot see it.
+          plist='deploy/jvmbpro-delegate-queue/com.jasonvassallo.delegate-queue.plist'
+          if [ ! -f "$plist" ]; then
+            echo "FAIL: $plist is missing — renamed or deleted? Update this check alongside the move."
+            fail=1
+          elif grep -A1 '<key>UV_PRERELEASE</key>' "$plist" | grep -q '<string>if-necessary</string>'; then
+            echo "ok: $plist (1 pin)"
+          else
+            echo "FAIL: $plist is missing the UV_PRERELEASE=if-necessary pin"
+            fail=1
+          fi
+
           # Repo-cwd runs are covered by uv.toml rather than an env pin.
           if grep -q '^prerelease = "if-necessary"$' uv.toml; then
             echo "ok: uv.toml policy line present"
