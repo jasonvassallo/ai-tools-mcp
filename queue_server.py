@@ -272,7 +272,10 @@ class QueueStore:
         return conn
 
     def _init_db(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # mode= closes the umask-sized window where a freshly created
+        # directory is briefly group/world-readable; the chmod still
+        # corrects pre-existing directories.
+        self.db_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.db_path.parent, 0o700)
         with contextlib.closing(self._connect()) as conn, conn:
             conn.execute(
@@ -791,6 +794,12 @@ def _make_handler(store: QueueStore) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
             try:
                 if self.path != "/v1/jobs":
+                    # The request body (if any) is never read on this
+                    # path. Under HTTP/1.1 keep-alive those unread bytes
+                    # would be parsed as the START of the next request
+                    # (reproduced: a follow-up GET drew a 501), so the
+                    # connection must close after the error response.
+                    self.close_connection = True
                     self._send_json(404, {"error": "not found"})
                     return
                 try:
@@ -798,9 +807,22 @@ def _make_handler(store: QueueStore) -> type[BaseHTTPRequestHandler]:
                 except ValueError:
                     # A non-numeric header is a client error, not the
                     # 500 the boundary except below would turn it into.
+                    # The body length is unknowable, so the unread bytes
+                    # would desynchronize a keep-alive connection —
+                    # close it (same reproduction as above).
+                    self.close_connection = True
                     self._send_json(400, {"error": "invalid Content-Length"})
                     return
-                if length <= 0:
+                if length < 0:
+                    # Negative is as malformed as non-numeric, with the
+                    # same unread-body desync — close.
+                    self.close_connection = True
+                    self._send_json(400, {"error": "invalid Content-Length"})
+                    return
+                if length == 0:
+                    # A declared-zero body has nothing unread: any bytes
+                    # that follow are, per protocol, the next request —
+                    # keep-alive stays safe here.
                     self._send_json(400, {"error": "empty body"})
                     return
                 if length > MAX_BODY_BYTES:

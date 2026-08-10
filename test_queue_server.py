@@ -350,9 +350,10 @@ class TestQueueStore(unittest.TestCase):
         # cancel() and a late finish() racing from two threads must
         # serialize: whichever commits first wins, and the loser must
         # never overwrite the winner (a cancel that lands after finish
-        # used to overwrite a real 'done' result). BEGIN IMMEDIATE in
-        # both methods makes the interleaving atomic; run a handful of
-        # iterations to exercise both orderings.
+        # used to overwrite a real 'done' result). cancel() wraps its
+        # check-then-update in BEGIN IMMEDIATE, while finish() is a
+        # single status-guarded UPDATE that is atomic on its own; run a
+        # handful of iterations to exercise both orderings.
         for _ in range(10):
             job_id = self.store.submit(_PAYLOAD)
             self.store.claim_next()
@@ -619,6 +620,69 @@ class TestEndToEnd(unittest.TestCase):
             response = b"".join(chunks)
         self.assertIn(b" 400 ", response.split(b"\r\n", 1)[0])
         self.assertIn(b"invalid Content-Length", response)
+
+    def test_unread_body_4xx_closes_keepalive_connection(self):
+        # Regression (PR #61 CodeRabbit major, reproduced): early-4xx
+        # paths that never read the request body — non-numeric or
+        # negative Content-Length, and POST to an unknown path — used to
+        # leave the connection open under HTTP/1.1 keep-alive, so the
+        # unread body bytes were parsed as the START of the next request
+        # (a follow-up valid GET drew a 501 "Unsupported method"). The
+        # server must close the connection after these responses; the
+        # drained 413 path stays keep-alive and is covered elsewhere.
+        # The requests declare a body but deliberately do not send its
+        # bytes: the server must close WITHOUT reading them either way,
+        # and omitting them avoids a TCP RST (close-with-unread-data)
+        # racing the buffered error response off the client socket. The
+        # actual desync (501 on the follow-up request) was demonstrated
+        # against the unfixed handler during finding verification.
+        cases = [
+            (
+                "non-numeric length",
+                b"POST /v1/jobs HTTP/1.1\r\nHost: l\r\nContent-Length: abc\r\n\r\n",
+                b" 400 ",
+            ),
+            (
+                "negative length",
+                b"POST /v1/jobs HTTP/1.1\r\nHost: l\r\nContent-Length: -7\r\n\r\n",
+                b" 400 ",
+            ),
+            (
+                "unknown path with declared body",
+                b"POST /nope HTTP/1.1\r\nHost: l\r\nContent-Length: 7\r\n\r\n",
+                b" 404 ",
+            ),
+        ]
+        for name, request, expected_status in cases:
+            with self.subTest(case=name):
+                # No `Connection: close` in the request: the CLOSE must
+                # come from the server. If it wrongly kept the
+                # connection alive, recv() would block until the client
+                # timeout below instead of returning EOF.
+                with socket.create_connection(
+                    ("127.0.0.1", self.server.server_address[1]), timeout=5
+                ) as sock:
+                    sock.sendall(request)
+                    chunks = []
+                    try:
+                        while True:
+                            chunk = sock.recv(4096)
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                    except TimeoutError:
+                        self.fail(
+                            f"{name}: server kept the keep-alive "
+                            "connection open after an unread-body error "
+                            "response (desync regression)"
+                        )
+                    data = b"".join(chunks)
+                # Exactly one response — the error — then EOF: the server
+                # closed instead of misparsing the unread body as a
+                # follow-up request.
+                self.assertIn(expected_status, data.split(b"\r\n", 1)[0])
+                self.assertEqual(data.count(b"HTTP/1.1 "), 1, data)
+                self.assertNotIn(b"Unsupported method", data)
 
     def test_handler_has_finite_socket_timeout(self):
         # StreamRequestHandler applies Handler.timeout via settimeout();
