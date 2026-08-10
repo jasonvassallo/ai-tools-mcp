@@ -2,7 +2,6 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "openai>=1.0.0",
 #     "mcp>=1.0.0,<2",
 #     "httpx>=0.27",
 #     "google-auth>=2.30",
@@ -20,11 +19,12 @@
 """
 MCP server providing five families of tools:
 
-- ``quick_research`` / ``deep_research``: Perplexity Sonar / Sonar Pro
-  — inline research with citations. ``quick_research`` uses the smaller
-  Sonar model for fast, concise, well-scoped answers; ``deep_research``
-  uses Sonar Pro for multi-source synthesis when the question spans
-  sources or needs cross-referencing.
+- ``quick_research`` / ``deep_research``: Gemini Flash on Vertex AI with
+  Google Search grounding — inline research with citations, authenticated
+  by ADC (no API key). The two tools share one backend and differ by
+  system prompt and answer budget: ``quick_research`` for fast, concise,
+  well-scoped answers; ``deep_research`` for multi-source synthesis when
+  the question spans sources or needs cross-referencing.
 - ``agent_research`` / ``agent_research_result``: Perplexity Agent API
   with the ``sandbox`` tool ("Search as Code") — the upstream agent
   writes and runs code in a Perplexity-hosted container, searching
@@ -63,12 +63,13 @@ preferred store there, since a persisted env var is plaintext and
 Claude Desktop launches the packaged extension outside any shell and
 so cannot be handed one by a profile script.
 
-For the Gemini tools, Application Default Credentials (ADC) are
-likewise loaded lazily on first ``gemini_*`` call rather than at
-module import. This means the MCP server can start and the
-Perplexity-backed ``deep_research`` and session tools can be used
-even on a machine without ``gcloud auth application-default login``
-having been run; only the ``gemini_*`` tools will fail when invoked.
+For the Google-backed tools (``quick_research``, ``deep_research``,
+``gemini_*``), Application Default Credentials (ADC) are loaded lazily
+on first call rather than at module import. This means the MCP server
+can start and the Perplexity-backed ``agent_research``, session, and
+local-delegate tools can be used even on a machine without
+``gcloud auth application-default login`` having been run; only the
+Google-backed tools will fail when invoked.
 """
 
 import asyncio
@@ -116,7 +117,6 @@ except ImportError:  # pragma: no cover - absent on POSIX; mocked in tests
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
-from openai import OpenAI
 
 # Patterns for secret-shape strings that may appear in scraped web content
 # returned by upstream search providers. Applied at the response boundary so
@@ -509,7 +509,7 @@ def run_check() -> None:
     errors = 0
     try:
         _, source = _resolve_credential("api_tokens", "perplexity")
-        print(f"ok: perplexity key found ({source})")
+        print(f"ok: perplexity key found ({source}) [agent_research only]")
     except ValueError as e:
         print(f"fail: {e}")
         errors += 1
@@ -1023,37 +1023,6 @@ def delete_session(session_id: str) -> dict[str, Any]:
     return {"success": True, "session_id": session_id}
 
 
-# Perplexity client is constructed lazily so the module imports
-# cleanly even when the keychain CLI is unavailable (e.g. on Windows
-# or in a container without the macOS ``security`` binary). The round-9
-# fcntl fix made the lock helpers Windows-tolerant, but the eager call
-# to ``get_api_key_from_keychain`` here still shelled out at import
-# time and raised on non-macOS, defeating the "module loads cleanly on
-# non-POSIX" goal. Per PR #4 round-10 review, Codex P2 L38: defer the
-# lookup so tool discovery and non-deep-research code paths (including
-# the session helpers) can load without a keychain dependency. The
-# error surfaces only when ``deep_research`` is actually invoked.
-_perplexity_client_cache: OpenAI | None = None
-
-
-def _get_perplexity_client() -> OpenAI:
-    """Lazy accessor for the Perplexity client.
-
-    Builds and caches a single ``OpenAI`` client on first call. Raises
-    whatever ``get_api_key_from_keychain`` raises — since v1.2 that is
-    always ``ValueError`` (a missing key, or a missing ``security(1)``
-    binary on non-macOS, both folded into the same actionable error).
-    Per PR #4 round-10 review, Codex P2 L38.
-    """
-    global _perplexity_client_cache
-    if _perplexity_client_cache is None:
-        _perplexity_client_cache = OpenAI(
-            api_key=get_api_key_from_keychain("api_tokens", "perplexity"),
-            base_url="https://api.perplexity.ai",
-        )
-    return _perplexity_client_cache
-
-
 # Gemini Deep Research configuration. The /interactions endpoint is a separate
 # surface from the standard Generative Language API and is not yet covered by
 # the google-genai SDK at time of writing — call it directly via httpx.
@@ -1071,11 +1040,26 @@ GEMINI_MODELS = {
 # the API host, since the ADC bearer token is attached to every request.
 _INTERACTION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
-# ADC is loaded LAZILY on first Gemini tool call rather than at module import.
-# This means the MCP server can start (and the Perplexity-backed deep_research
-# tool can be used) even on a machine without gcloud ADC configured — only the
-# gemini_* tools will fail when invoked. Module-level eager-load was crashing
-# the entire server at startup if ADC was missing or slow to fetch.
+# Vertex AI generateContent with Google Search grounding — the backend for
+# quick_research / deep_research since v1.6 (Perplexity Sonar retirement).
+# Location `global` is deliberate: verified cheapest for this project's
+# Vertex usage — do not "fix" it to a regional endpoint. Auth is the same
+# lazy ADC bearer path the Deep Research tools use; no API key exists or is
+# needed for this surface.
+_VERTEX_API_HOST = "https://aiplatform.googleapis.com"
+_VERTEX_LOCATION = "global"
+# gemini-flash-latest is REQUIRED, not a preference: pinned older flash tags
+# (e.g. gemini-2.5-flash) have started returning 404 "no longer available to
+# new users" on fresh credentials, and the -latest alias tracks the current
+# flash generation (gemini-3.6-flash at time of writing).
+_VERTEX_RESEARCH_MODEL = "gemini-flash-latest"
+
+# ADC is loaded LAZILY on first Gemini/Vertex tool call rather than at module
+# import. This means the MCP server can start (and the session/local tools can
+# be used) even on a machine without gcloud ADC configured — only the
+# research tools that need Google auth will fail when invoked. Module-level
+# eager-load was crashing the entire server at startup if ADC was missing or
+# slow to fetch.
 _gemini_credentials: Any = None
 _gemini_billing_project: str | None = None
 _gemini_token_lock = asyncio.Lock()
@@ -1292,6 +1276,93 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
         }
 
 
+# --- Vertex grounded search (quick_research / deep_research) -------------
+
+
+async def _vertex_generate_content(
+    system_prompt: str,
+    query: str,
+    max_tokens: int,
+    timeout_s: float = 120.0,
+) -> dict[str, Any]:
+    """POST a Google-Search-grounded generateContent request to Vertex AI.
+
+    Returns the parsed response body on success, or the same structured
+    ``{"status": "failed", "error": ...}`` envelope the Deep Research
+    helpers use, so callers render one error shape.
+
+    The URL is built entirely from module constants plus the ADC billing
+    project — no tool parameter reaches the URL, so the bearer token
+    cannot be redirected off the Vertex host.
+    """
+    headers = await _gemini_headers()
+    url = (
+        f"{_VERTEX_API_HOST}/v1/projects/{_gemini_billing_project}"
+        f"/locations/{_VERTEX_LOCATION}/publishers/google/models"
+        f"/{_VERTEX_RESEARCH_MODEL}:generateContent"
+    )
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": query}]}],
+        "tools": [{"googleSearch": {}}],
+        "generationConfig": {"maxOutputTokens": max_tokens},
+    }
+    client = await _get_http_client()
+    try:
+        response = await client.post(
+            url, json=payload, headers=headers, timeout=timeout_s
+        )
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc)
+    except httpx.RequestError as exc:
+        return {
+            "status": "failed",
+            "error": f"request error: {redact_secrets(str(exc))}",
+        }
+    except ValueError as exc:
+        return {
+            "status": "failed",
+            "error": f"invalid JSON from Vertex API: {redact_secrets(str(exc))}",
+        }
+
+
+def _render_grounded_answer(data: dict[str, Any], heading: str) -> str:
+    """Render a Vertex grounded response: answer text + Sources section.
+
+    Grounding citations live in ``groundingMetadata.groundingChunks``
+    (web.title / web.uri per chunk); the issued queries are in
+    ``webSearchQueries``. Sources are appended explicitly because the
+    synthesized text usually references them only by name.
+    """
+    candidates = data.get("candidates") or []
+    if not candidates:
+        return f"Error: Vertex returned no candidates for {heading}"
+    candidate = candidates[0] or {}
+    parts = (candidate.get("content") or {}).get("parts") or []
+    text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
+    if not text:
+        return f"Error: Vertex returned an empty answer for {heading}"
+
+    sections = [f"## {heading}", "", text]
+    grounding = candidate.get("groundingMetadata") or {}
+    sources = []
+    for chunk in grounding.get("groundingChunks") or []:
+        web = chunk.get("web") or {} if isinstance(chunk, dict) else {}
+        title = web.get("title") or web.get("domain") or "source"
+        uri = web.get("uri") or ""
+        if uri:
+            sources.append(f"- {title}: {uri}")
+    if sources:
+        sections += ["", "### Sources", *sources]
+    queries = grounding.get("webSearchQueries") or []
+    if queries:
+        joined = ", ".join(str(q) for q in queries)
+        sections += ["", f"*Search queries: {joined}*"]
+    return "\n".join(sections)
+
+
 # --- Perplexity Agent API (Search-as-Code) -------------------------------
 #
 # agent_research drives Perplexity's Agent API with the `sandbox` tool
@@ -1374,8 +1445,8 @@ async def _post_agent_research(payload: dict[str, Any]) -> dict[str, Any]:
         # contract instead of crashing the tool call (per PR #16 review,
         # Qodo bug #2 / CodeRabbit major). The keychain ValueError
         # deliberately propagates: credential-setup errors raise across all
-        # tool families (_get_perplexity_client and _gemini_headers behave
-        # the same) and the lookup sits outside this try block. Exception
+        # tool families (_gemini_headers behaves the same) and the lookup
+        # sits outside this try block. Exception
         # text is redacted like _http_error_payload's body snippet — the
         # same "never emit secret-shapes" contract on every error path.
         return {
@@ -2194,15 +2265,15 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="quick_research",
             description=(
-                "Quick research using Perplexity Sonar (the smaller, faster, "
-                "cheaper sibling of Sonar Pro). Returns a concise answer with "
+                "Quick research using Gemini Flash with Google Search "
+                "grounding. Returns a concise AI-synthesized answer with "
                 "citations in a few seconds. Use when: the query is well-scoped "
-                "and a single-source answer with citations is enough, you've "
-                "already tried built-in WebSearch and need LLM synthesis on top, "
-                "or you want a citation-backed answer without paying for Sonar "
-                "Pro's deeper multi-source reasoning. For ambiguous queries, "
-                "cross-source comparisons, or architectural tradeoff "
-                "investigations, use `deep_research` (Sonar Pro) instead."
+                "and a single-source answer with citations is enough, or you've "
+                "already tried built-in WebSearch and need LLM synthesis on "
+                "top. For ambiguous queries, cross-source comparisons, or "
+                "architectural tradeoff investigations, use `deep_research` "
+                "instead — same backend, deeper synthesis prompt and a larger "
+                "answer budget."
             ),
             inputSchema={
                 "type": "object",
@@ -2223,16 +2294,17 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="deep_research",
             description=(
-                "Deep research using Perplexity Sonar Pro with multi-source "
-                "synthesis and citations. Use instead of built-in WebSearch when: "
-                "the answer spans multiple sources, requires cross-referencing, "
-                "involves comparing tradeoffs/architectures/approaches, "
-                "the query is ambiguous and benefits from AI-powered search reasoning, "
-                "or you need comprehensive coverage with source citations. "
-                "Do NOT use for simple factual lookups (use built-in WebSearch for those). "
-                "For well-scoped single-source questions where a quick citation-backed "
-                "answer suffices, use `quick_research` (Sonar) instead — it is faster "
-                "and cheaper."
+                "Deep research using Gemini Flash with Google Search grounding "
+                "and a multi-source synthesis prompt. Use instead of built-in "
+                "WebSearch when: the answer spans multiple sources, requires "
+                "cross-referencing, involves comparing tradeoffs/architectures/"
+                "approaches, the query is ambiguous and benefits from AI-powered "
+                "search reasoning, or you need comprehensive coverage with "
+                "source citations. Do NOT use for simple factual lookups (use "
+                "built-in WebSearch for those). For well-scoped single-source "
+                "questions where a quick citation-backed answer suffices, use "
+                "`quick_research` instead — it is faster and uses a smaller "
+                "answer budget."
             ),
             inputSchema={
                 "type": "object",
@@ -2344,7 +2416,7 @@ async def list_tools() -> list[Tool]:
                 "Tasks run for several minutes and up to 60 minutes. Use when "
                 "you need a citation-dense, multi-page report drawing on many "
                 "sources. For quick inline research that completes in seconds, "
-                "use `deep_research` (Perplexity) instead."
+                "use `deep_research` (Gemini Flash, grounded) instead."
             ),
             inputSchema={
                 "type": "object",
@@ -2643,101 +2715,57 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         query = arguments.get("query")
         max_tokens = arguments.get("max_tokens", 1024)
 
-        # Same lazy-client + redaction path as deep_research; only the
-        # model and system prompt differ. Sonar is smaller/faster than
-        # Sonar Pro — the system prompt asks for brevity to match the
-        # use case rather than coaxing the smaller model into mimicking
-        # Sonar Pro's depth.
-        #
-        # asyncio.to_thread wrapper: the openai client's chat.completions
-        # .create is a synchronous blocking call. Running it bare inside
-        # an async def would block the asyncio event loop for the duration
-        # of the request (seconds-to-tens-of-seconds for Sonar). Per
-        # PR #11 review, Gemini high: wrap in asyncio.to_thread so other
-        # coroutines can progress. Same fix applied to deep_research below.
-        response = await asyncio.to_thread(
-            _get_perplexity_client().chat.completions.create,
-            model="sonar",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a concise research assistant. Answer the user's "
-                        "question directly, with citations. Prefer a single "
-                        "well-sourced answer over a survey of perspectives. "
-                        "Skip caveats unless they materially change the answer."
-                    ),
-                },
-                {"role": "user", "content": query},
-            ],
+        # Same Vertex grounded-search path as deep_research; only the
+        # system prompt and token budget differ. The prompt asks for
+        # brevity to match the use case rather than coaxing the model
+        # into deep_research's multi-source depth.
+        data = await _vertex_generate_content(
+            system_prompt=(
+                "You are a concise research assistant. Answer the user's "
+                "question directly, with citations. Prefer a single "
+                "well-sourced answer over a survey of perspectives. "
+                "Skip caveats unless they materially change the answer."
+            ),
+            query=query,
             max_tokens=max_tokens,
         )
-
-        # Defensive: per PR #11 review, Gemini medium — response.choices
-        # *should* always be non-empty per the API contract but a malformed
-        # or truncated response would raise IndexError on choices[0].
-        choices = response.choices or []
-        if not choices:
+        if data.get("status") == "failed":
             return [
                 TextContent(
                     type="text",
-                    text="Error: Perplexity returned no choices for quick_research",
+                    text=f"Error: quick_research failed — {data.get('error')}",
                 )
             ]
-        message = choices[0].message
-        content = redact_secrets(message.content or "")
-        result = f"## Quick Research\n\n{content}"
-
+        # Redact secret-shape patterns from grounded web content before the
+        # response leaves this server (same boundary rule as deep_research).
+        result = redact_secrets(_render_grounded_answer(data, "Quick Research"))
         return [TextContent(type="text", text=result)]
 
     if name == "deep_research":
         query = arguments.get("query")
         max_tokens = arguments.get("max_tokens", 2048)
 
-        # Lazy client construction: per PR #4 round-10 review, Codex
-        # P2 L38, the keychain lookup is deferred to here so the module
-        # imports cleanly on non-macOS even though the ``security`` CLI
-        # is unavailable.
-        #
-        # asyncio.to_thread wrapper: same rationale as quick_research above
-        # (per PR #11 review, Gemini high). Extending the fix to this
-        # pre-existing call site rather than leave the codebase in a
-        # half-fixed state where only the newer function is event-loop-safe.
-        response = await asyncio.to_thread(
-            _get_perplexity_client().chat.completions.create,
-            model="sonar-pro",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a thorough research assistant. Provide comprehensive, "
-                        "well-sourced answers that synthesize information across multiple "
-                        "sources. Include relevant details, comparisons, and caveats. "
-                        "Always cite your sources."
-                    ),
-                },
-                {"role": "user", "content": query},
-            ],
+        data = await _vertex_generate_content(
+            system_prompt=(
+                "You are a thorough research assistant. Provide comprehensive, "
+                "well-sourced answers that synthesize information across multiple "
+                "sources. Include relevant details, comparisons, and caveats. "
+                "Always cite your sources."
+            ),
+            query=query,
             max_tokens=max_tokens,
         )
-
-        # Defensive: same empty-choices guard as quick_research (per PR #11
-        # review, Gemini medium).
-        choices = response.choices or []
-        if not choices:
+        if data.get("status") == "failed":
             return [
                 TextContent(
                     type="text",
-                    text="Error: Perplexity returned no choices for deep_research",
+                    text=f"Error: deep_research failed — {data.get('error')}",
                 )
             ]
-        message = choices[0].message
-        # Redact secret-shape patterns from scraped web content before the
-        # response leaves this server. Perplexity's synthesis can include raw
+        # Redact secret-shape patterns from grounded web content before the
+        # response leaves this server. Search synthesis can include raw
         # API keys / JWTs / private-key blocks lifted from indexed pages.
-        content = redact_secrets(message.content or "")
-        result = f"## Research Results\n\n{content}"
-
+        result = redact_secrets(_render_grounded_answer(data, "Research Results"))
         return [TextContent(type="text", text=result)]
 
     if name == "agent_research":

@@ -1,5 +1,5 @@
 ---
-description: Run a Perplexity Sonar Pro deep-research query (fast, inline, multi-source with citations)
+description: Run a Gemini grounded deep-research query (fast, inline, multi-source with citations)
 argument-hint: <research-query>
 ---
 

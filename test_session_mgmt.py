@@ -55,10 +55,6 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     accident. With the leak fixed, this file needs its own fakes.
     """
 
-    class _FakeOpenAI:
-        def __init__(self, *a, **kw):
-            pass
-
     # httpx is imported at module level by mcp_server.py for the Gemini
     # Deep Research HTTP client. Tests don't exercise that code path
     # (Gemini helpers are mock.patch.object'd in test_redact.py), but
@@ -151,7 +147,6 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     transport_mod.requests = transport_requests_mod
 
     return {
-        "openai": _make("openai", OpenAI=_FakeOpenAI),
         "mcp": _make("mcp"),
         "mcp.server": _make("mcp.server", Server=_FakeServer),
         "mcp.server.stdio": _make("mcp.server.stdio", stdio_server=_fake_stdio_server),
@@ -1180,12 +1175,15 @@ class TestAtomicWrites(_SessionMgmtBase):
 
 
 class TestLazyKeychainImport(unittest.TestCase):
-    """PR #4 round-10 review (Codex P2 L38): the perplexity client must
-    be constructed lazily so importing ``mcp_server`` succeeds even when
-    the macOS ``security`` CLI is unavailable. This complements round-9's
-    fcntl portability fix — the goal of "module loads cleanly on
-    non-POSIX" requires *both* fcntl and the keychain lookup to be
-    deferred. These tests do a fresh ``importlib`` load with
+    """PR #4 round-10 review (Codex P2 L38): credential lookups must be
+    deferred so importing ``mcp_server`` succeeds even when the macOS
+    ``security`` CLI is unavailable. This complements round-9's fcntl
+    portability fix — the goal of "module loads cleanly on non-POSIX"
+    requires *both* fcntl and the keychain lookup to be deferred. Since
+    v1.6 the deferred credentials are the Perplexity Agent key (keychain)
+    and Google ADC; the original lazy Perplexity chat client is gone with
+    the Sonar retirement, but the import-time property it enforced is
+    unchanged. These tests do a fresh ``importlib`` load with
     ``subprocess.run`` mocked to fail, so we exercise the import-time
     path rather than poking the already-imported ``mcp_server`` global."""
 
@@ -1258,12 +1256,12 @@ class TestLazyKeychainImport(unittest.TestCase):
         ``import mcp_server`` still succeeds. Without the lazy
         accessor this would raise FileNotFoundError at import time."""
         module = self._import_with_failing_keychain(drop_fcntl=False)
-        # The cache must start uninitialised — proves we did not eagerly
-        # call ``get_api_key_from_keychain`` at module load.
-        self.assertIsNone(module._perplexity_client_cache)
+        # Credentials must start uninitialised — proves we did not eagerly
+        # resolve ADC or shell out to ``security`` at module load.
+        self.assertIsNone(module._gemini_credentials)
         # And the helper functions we care about are still reachable
         # for tool discovery.
-        self.assertTrue(callable(module._get_perplexity_client))
+        self.assertTrue(callable(module._vertex_generate_content))
         self.assertTrue(callable(module.list_sessions))
 
     def test_module_imports_when_fcntl_and_keychain_missing(self):
@@ -1274,12 +1272,12 @@ class TestLazyKeychainImport(unittest.TestCase):
         module = self._import_with_failing_keychain(drop_fcntl=True)
         # fcntl flag was set to None by the stubbed import.
         self.assertIsNone(module.fcntl)
-        # Keychain client still uninitialised.
-        self.assertIsNone(module._perplexity_client_cache)
+        # Credentials still uninitialised.
+        self.assertIsNone(module._gemini_credentials)
 
-    def test_get_perplexity_client_propagates_keychain_error(self):
-        """When ``deep_research`` is invoked on a system without the
-        keychain CLI, the failure must surface — we are deferring the
+    def test_perplexity_keychain_error_propagates(self):
+        """When ``agent_research`` resolves its key on a system without
+        the keychain CLI, the failure must surface — we are deferring the
         lookup, not silently swallowing it. v1.2 (issue #20): a missing
         security(1) no longer leaks a raw FileNotFoundError; it raises
         the actionable ValueError naming the env-var remedy, so the
@@ -1304,42 +1302,8 @@ class TestLazyKeychainImport(unittest.TestCase):
             ),
             self.assertRaises(ValueError) as ctx,
         ):
-            module._get_perplexity_client()
+            module.get_api_key_from_keychain("api_tokens", "perplexity")
         self.assertIn("PERPLEXITY_API_KEY", str(ctx.exception))
-
-    def test_get_perplexity_client_caches_first_call(self):
-        """The accessor must memoise — repeated invocations should
-        not re-shell out to ``security`` once the first call has
-        succeeded."""
-        # Reuse the already-imported test module (it was loaded with a
-        # stubbed succeeding ``subprocess.run`` returning ``dummy-key``)
-        # and reset the cache so we can observe the first-call write.
-        # Env isolation: with PERPLEXITY_API_KEY set (v1.2 env-first
-        # resolution), the accessor would never shell out and the
-        # call-count assertion below would fail spuriously.
-        env_guard = mock.patch.dict(mcp_server.os.environ, {}, clear=False)
-        env_guard.start()
-        self.addCleanup(env_guard.stop)
-        mcp_server.os.environ.pop("PERPLEXITY_API_KEY", None)
-        original = mcp_server._perplexity_client_cache
-        try:
-            mcp_server._perplexity_client_cache = None
-            call_count = {"n": 0}
-
-            def counting_run(*args, **kwargs):
-                call_count["n"] += 1
-                return types.SimpleNamespace(returncode=0, stdout="k\n")
-
-            with mock.patch.object(
-                mcp_server.subprocess, "run", side_effect=counting_run
-            ):
-                first = mcp_server._get_perplexity_client()
-                second = mcp_server._get_perplexity_client()
-
-            self.assertIs(first, second)
-            self.assertEqual(call_count["n"], 1)
-        finally:
-            mcp_server._perplexity_client_cache = original
 
 
 if __name__ == "__main__":

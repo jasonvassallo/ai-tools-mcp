@@ -2,9 +2,9 @@
   "manifest_version": "0.3",
   "name": "ai-tools-mcp",
   "display_name": "AI Tools MCP",
-  "version": "1.5.4",
-  "description": "Perplexity Sonar (quick), Sonar Pro (deep), and Agent API Search-as-Code (bulk) research, Google Gemini Deep Research (async, long-form reports), local Ollama delegation, and local conversation-session persistence \u2014 exposed as 13 MCP tools.",
-  "long_description": "Five families of tools: (1) quick_research uses Perplexity Sonar for fast single-source citation-backed answers, and deep_research uses Sonar Pro for inline multi-source synthesis. (2) agent_research drives Perplexity's Agent API with the sandbox tool (Search as Code): a hosted agent writes and runs code that searches programmatically, covering every item in bulk/enumerable research tasks \u2014 synchronous or background via agent_research_result polling. (3) gemini_deep_research_start/_result run long-form research tasks (5\u201360 minutes) on Google's Deep Research model and poll for results. (4) local_delegate sends a task to a local-first Ollama endpoint chain \u2014 input stays on your own machines: on-device when localhost serves the model, otherwise only your own Cloudflare-Access-gated endpoint, never a third-party API \u2014 synchronously or in the background via local_delegate_result polling. (5) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
+  "version": "1.6.0",
+  "description": "Gemini Flash grounded search (quick + deep research), Perplexity Agent API Search-as-Code (bulk) research, Google Gemini Deep Research (async, long-form reports), local Ollama delegation, and local conversation-session persistence \u2014 exposed as 13 MCP tools.",
+  "long_description": "Five families of tools: (1) quick_research and deep_research use Gemini Flash on Vertex AI with Google Search grounding (ADC-authenticated, no API key) \u2014 quick for fast single-source citation-backed answers, deep for inline multi-source synthesis. (2) agent_research drives Perplexity's Agent API with the sandbox tool (Search as Code): a hosted agent writes and runs code that searches programmatically, covering every item in bulk/enumerable research tasks \u2014 synchronous or background via agent_research_result polling. (3) gemini_deep_research_start/_result run long-form research tasks (5\u201360 minutes) on Google's Deep Research model and poll for results. (4) local_delegate sends a task to a local-first Ollama endpoint chain \u2014 input stays on your own machines: on-device when localhost serves the model, otherwise only your own Cloudflare-Access-gated endpoint, never a third-party API \u2014 synchronously or in the background via local_delegate_result polling. (5) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
   "author": {
     "name": "Jason Vassallo",
     "email": "jasonvassallo@mac.com"
@@ -75,11 +75,11 @@
   "tools": [
     {
       "name": "quick_research",
-      "description": "Perplexity Sonar \u2014 fast, concise, citation-backed answers for well-scoped questions (inline, a few seconds, cheaper than deep_research)."
+      "description": "Gemini Flash grounded search \u2014 fast, concise, citation-backed answers for well-scoped questions (inline, a few seconds, smaller answer budget than deep_research)."
     },
     {
       "name": "deep_research",
-      "description": "Perplexity Sonar Pro deep research with multi-source synthesis and citations (inline, seconds)."
+      "description": "Gemini Flash grounded deep research with multi-source synthesis and citations (inline, seconds)."
     },
     {
       "name": "agent_research",

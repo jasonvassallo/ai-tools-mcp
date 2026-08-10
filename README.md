@@ -7,7 +7,7 @@ This repository is intentionally narrow in scope:
 - It exposes hosted AI providers and the machine's local Ollama server behind one MCP surface.
 - No model weights live in this repo — the local family only calls an already-running Ollama.
 - It currently exposes thirteen tools across three families:
-  - Research: `quick_research` (Perplexity Sonar), `deep_research` (Perplexity Sonar Pro), `agent_research` / `agent_research_result` (Perplexity Agent API, Search-as-Code), `gemini_deep_research_start`, `gemini_deep_research_result`
+  - Research: `quick_research` / `deep_research` (Gemini Flash on Vertex AI with Google Search grounding), `agent_research` / `agent_research_result` (Perplexity Agent API, Search-as-Code), `gemini_deep_research_start`, `gemini_deep_research_result`
   - Local delegate: `local_delegate` / `local_delegate_result` (Ollama, on-device)
   - Sessions: `list_sessions`, `save_session`, `load_session`, `update_session`, `delete_session`
 
@@ -39,16 +39,18 @@ The following identifiers are meant to stay stable unless intentionally changed:
 
 ### `quick_research`
 
-- Provider: Perplexity
-- Model: `sonar`
+- Provider: Vertex AI `generateContent` with `googleSearch` grounding (location `global`)
+- Model: `gemini-flash-latest`
+- Auth: Google Cloud ADC bearer token — no API key
 - Purpose: fast, concise, citation-backed answers for well-scoped questions
 - Latency: a few seconds (synchronous)
-- Use when: a single-source answer with citations is enough; cheaper than `deep_research`
+- Use when: a single-source answer with citations is enough; smaller answer budget than `deep_research`
 
 ### `deep_research`
 
-- Provider: Perplexity
-- Model: `sonar-pro`
+- Provider: Vertex AI `generateContent` with `googleSearch` grounding (same backend as `quick_research`)
+- Model: `gemini-flash-latest`
+- Auth: Google Cloud ADC bearer token — no API key
 - Purpose: deep research with multi-source synthesis, cross-referencing, and citations
 - Latency: seconds (synchronous)
 - Use when: the answer should come back inline in the current session and spans multiple sources
@@ -96,7 +98,7 @@ It:
 
 - starts an MCP server named `ai-tools-mcp`
 - reads API credentials from environment variables, Windows Credential Manager (CF Access token, Windows only), or the macOS Keychain — in that order, first non-empty wins
-- calls the Perplexity API through the `openai` Python client
+- calls Vertex AI (grounded search), the Gemini Deep Research API, and the Perplexity Agent API via `httpx`
 - calls the local Ollama server (native /api/chat) for the local_delegate family
 - returns plain text MCP responses
 
@@ -117,7 +119,7 @@ Claude Code plugin (loaded via `claude --plugin-dir .`):
 - `.claude-plugin/plugin.json`: Plugin manifest (name, version, author)
 - `.mcp.json`: MCP server registration (points at `mcp_server.py` via `${CLAUDE_PLUGIN_ROOT}`)
 - `commands/`: Eleven slash commands (`/ai-tools-mcp:quick-research`, `:deep-research`, `:agent-research`, `:gemini-start`, `:gemini-result`, `:local-delegate`, `:sessions`, `:save-session`, `:load-session`, `:update-session`, `:delete-session`)
-- `skills/using-ai-research/`: When-to-use routing skill (WebSearch vs. Perplexity vs. Gemini)
+- `skills/using-ai-research/`: When-to-use routing skill (WebSearch vs. grounded Gemini vs. Agent API vs. Deep Research)
 - `skills/session-workflows/`: Save/load/rename/delete patterns
 - `hooks/hooks.json` + `hooks/preflight.sh`: `SessionStart` hook that runs `--check` and surfaces credential health to Claude
 
@@ -150,7 +152,7 @@ Safe to run multiple times — updates existing config without clobbering.
 
 ### B. Claude Code plugin (commands + skills + hooks + MCP server)
 
-Bundles the MCP server with slash commands (`/ai-tools-mcp:deep-research <q>`, `/ai-tools-mcp:sessions`, etc.), routing skills (when to use Perplexity vs. Gemini vs. WebSearch, session-management workflows), and a `SessionStart` preflight hook that verifies Perplexity Keychain + ADC are healthy before your first query.
+Bundles the MCP server with slash commands (`/ai-tools-mcp:deep-research <q>`, `/ai-tools-mcp:sessions`, etc.), routing skills (when to use grounded Gemini vs. the Agent API vs. WebSearch, session-management workflows), and a `SessionStart` preflight hook that verifies ADC + the Perplexity Keychain entry are healthy before your first query.
 
 Test locally — Claude Code loads the plugin directly from this directory:
 
@@ -170,7 +172,7 @@ Build the single-file `.mcpb` archive:
 
 Then drag `dist/ai-tools-mcp.mcpb` into Claude Desktop → Settings → Extensions. The extension's user-config UI exposes the `uv_path` field (defaults to `/opt/homebrew/bin/uv` for Apple-Silicon Homebrew installs).
 
-First-run note: macOS may show a one-time Keychain access prompt when the server reads your Perplexity key — approve it.
+First-run note: macOS may show a one-time Keychain access prompt when the server reads your Perplexity key (`agent_research` only) — approve it.
 
 ### D. Windows (Claude Code CLI, Claude Code desktop app, or Claude Desktop)
 
@@ -294,7 +296,7 @@ each remedy that applies to the host.
 
 | Credential | Env var | Windows vault target | Keychain (service / account) | Needed for |
 |---|---|---|---|---|
-| Perplexity API key | `PERPLEXITY_API_KEY` | — | `api_tokens` / `perplexity` | quick/deep/agent research |
+| Perplexity API key | `PERPLEXITY_API_KEY` | — | `api_tokens` / `perplexity` | agent_research only |
 | CF Access client id | `OLLAMA_CF_ACCESS_CLIENT_ID` | `ai-tools-mcp-cf-access/client-id` | `OLLAMA_CF_ACCESS_CLIENT_ID` / `$USER` | remote Ollama endpoints |
 | CF Access client secret | `OLLAMA_CF_ACCESS_CLIENT_SECRET` | `ai-tools-mcp-cf-access/client-secret` | `OLLAMA_CF_ACCESS_CLIENT_SECRET` / `$USER` | remote Ollama endpoints |
 | Extra Ollama endpoint (optional) | `OLLAMA_URL` | — | `OLLAMA_URL` / `$USER` | appended to the chain |
@@ -374,7 +376,8 @@ short-lived bearer tokens transparently via the `google-auth` library. The
 billing project is auto-detected from ADC.
 
 The preflight check (`uv run mcp_server.py --check`) verifies both the
-Perplexity key and ADC, refreshing a token to confirm credentials are live.
+Perplexity key (agent_research) and ADC (quick/deep research + Deep
+Research), refreshing a token to confirm credentials are live.
 
 ## Running
 
@@ -431,8 +434,8 @@ Input schema:
 
 Output behavior:
 
-- returns a formatted text block with research results
-- relies on Perplexity response content to include citations
+- returns a formatted text block with research results and a Sources
+  section built from Google Search grounding metadata
 - response is routed through a redactor that masks secret-shape strings
   (Google API keys, OAuth tokens, JWTs, private-key blocks)
 

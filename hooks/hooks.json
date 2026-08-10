@@ -1,5 +1,5 @@
 {
-  "description": "ai-tools-mcp session-start preflight: verify Perplexity Keychain entry + Google ADC are healthy before the user issues their first research query.",
+  "description": "ai-tools-mcp session-start preflight: verify Google ADC (quick/deep_research, gemini_*) + the Perplexity Keychain entry (agent_research) are healthy before the user issues their first research query.",
   "hooks": {
     "SessionStart": [
       {

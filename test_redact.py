@@ -56,10 +56,6 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     pytest's discovery order).
     """
 
-    class _FakeOpenAI:
-        def __init__(self, *a, **kw):
-            pass
-
     # httpx is imported at module level by mcp_server.py for the Gemini
     # Deep Research HTTP client. Tests never exercise the network path —
     # the TestGemini* tool-boundary tests mock.patch.object the helper
@@ -154,7 +150,6 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     transport_mod.requests = transport_requests_mod
 
     return {
-        "openai": _make("openai", OpenAI=_FakeOpenAI),
         "mcp": _make("mcp"),
         "mcp.server": _make("mcp.server", Server=_FakeServer),
         "mcp.server.stdio": _make("mcp.server.stdio", stdio_server=_fake_stdio_server),
@@ -801,6 +796,176 @@ class TestGetGeminiInteractionHelper(unittest.TestCase):
         self.assertIn("JSON", data["error"])
 
 
+class TestVertexGenerateContentHelper(unittest.TestCase):
+    """Unit tests for the Vertex grounded-search helper (client mocked, no
+    network) — same failure-envelope contract as the Deep Research helpers,
+    plus URL/payload shape checks: the URL must be built from module
+    constants only, and the request must carry the googleSearch tool.
+    """
+
+    def _run_helper(self, fake_client):
+        async def fake_get_client():
+            return fake_client
+
+        async def fake_headers():
+            return {"Authorization": "Bearer test-token"}
+
+        with (
+            mock.patch.object(mcp_server, "_gemini_headers", side_effect=fake_headers),
+            mock.patch.object(
+                mcp_server, "_get_http_client", side_effect=fake_get_client
+            ),
+            mock.patch.object(mcp_server, "_gemini_billing_project", "proj-1"),
+        ):
+            return asyncio.run(
+                mcp_server._vertex_generate_content(
+                    system_prompt="be brief", query="q", max_tokens=64
+                )
+            )
+
+    def test_url_and_payload_shape(self):
+        captured = {}
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"candidates": []}
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                captured["url"] = url
+                captured["json"] = kwargs.get("json")
+                return _FakeResponse()
+
+        self._run_helper(_FakeClient())
+        self.assertEqual(
+            captured["url"],
+            "https://aiplatform.googleapis.com/v1/projects/proj-1"
+            "/locations/global/publishers/google/models"
+            f"/{mcp_server._VERTEX_RESEARCH_MODEL}:generateContent",
+        )
+        self.assertEqual(captured["json"]["tools"], [{"googleSearch": {}}])
+        self.assertEqual(captured["json"]["generationConfig"], {"maxOutputTokens": 64})
+
+    def test_http_error_becomes_failure_envelope(self):
+        class _FakeErrorResponse:
+            status_code = 429
+            text = "quota exceeded"
+
+            def raise_for_status(self):
+                exc = mcp_server.httpx.HTTPStatusError("429")
+                exc.response = self
+                raise exc
+
+            def json(self):  # pragma: no cover - raise_for_status fires first
+                return {}
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                return _FakeErrorResponse()
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("429", data["error"])
+
+    def test_request_error_becomes_failure_envelope(self):
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                raise mcp_server.httpx.RequestError("connection refused")
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("connection refused", data["error"])
+
+    def test_credential_errors_propagate(self):
+        async def failing_headers():
+            raise RuntimeError("ADC credentials unavailable")
+
+        with (
+            mock.patch.object(
+                mcp_server, "_gemini_headers", side_effect=failing_headers
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            asyncio.run(
+                mcp_server._vertex_generate_content(
+                    system_prompt="s", query="q", max_tokens=64
+                )
+            )
+
+
+class TestRenderGroundedAnswer(unittest.TestCase):
+    """Rendering contract for Vertex grounded responses: answer text plus a
+    Sources section from groundingChunks; malformed/empty responses fail
+    closed with an explicit error string rather than raising."""
+
+    def test_renders_text_sources_and_queries(self):
+        data = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "Answer body."}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"title": "Example", "uri": "https://e.x/1"}},
+                            {"web": {"domain": "no-title.example"}},
+                        ],
+                        "webSearchQueries": ["q1", "q2"],
+                    },
+                }
+            ]
+        }
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("## Quick Research", out)
+        self.assertIn("Answer body.", out)
+        self.assertIn("- Example: https://e.x/1", out)
+        # A chunk with no URI is dropped rather than rendered as a bare dash.
+        self.assertNotIn("no-title.example", out)
+        self.assertIn("*Search queries: q1, q2*", out)
+
+    def test_empty_candidates_fail_closed(self):
+        out = mcp_server._render_grounded_answer({}, "Quick Research")
+        self.assertIn("Error", out)
+        self.assertIn("no candidates", out)
+
+    def test_empty_text_fails_closed(self):
+        data = {"candidates": [{"content": {"parts": []}}]}
+        out = mcp_server._render_grounded_answer(data, "Research Results")
+        self.assertIn("Error", out)
+        self.assertIn("empty answer", out)
+
+    def test_handler_redacts_secret_shapes(self):
+        # The call_tool handler must pass rendered output through
+        # redact_secrets — grounded web content is untrusted.
+        data = {
+            "candidates": [
+                {"content": {"parts": [{"text": f"leaked {FAKE_GOOG_API_KEY} key"}]}}
+            ]
+        }
+
+        async def fake_vertex(**kwargs):
+            return data
+
+        with mock.patch.object(
+            mcp_server, "_vertex_generate_content", side_effect=fake_vertex
+        ):
+            result = asyncio.run(mcp_server.call_tool("quick_research", {"query": "q"}))
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", result[0].text)
+        self.assertNotIn(FAKE_GOOG_API_KEY, result[0].text)
+
+    def test_handler_surfaces_failure_envelope(self):
+        async def fake_vertex(**kwargs):
+            return {"status": "failed", "error": "503: upstream"}
+
+        with mock.patch.object(
+            mcp_server, "_vertex_generate_content", side_effect=fake_vertex
+        ):
+            result = asyncio.run(mcp_server.call_tool("deep_research", {"query": "q"}))
+        self.assertIn("deep_research failed", result[0].text)
+        self.assertIn("503", result[0].text)
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     loader = unittest.TestLoader()
@@ -812,6 +977,8 @@ if __name__ == "__main__":
             loader.loadTestsFromTestCase(TestGeminiResultTerminalStates),
             loader.loadTestsFromTestCase(TestPostGeminiInteractionHelper),
             loader.loadTestsFromTestCase(TestGetGeminiInteractionHelper),
+            loader.loadTestsFromTestCase(TestVertexGenerateContentHelper),
+            loader.loadTestsFromTestCase(TestRenderGroundedAnswer),
         ]
     )
     sys.exit(0 if runner.run(suite).wasSuccessful() else 1)
