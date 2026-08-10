@@ -362,8 +362,9 @@ chain; the similarly named `AI_TOOLS_OLLAMA_URL`/`AI_TOOLS_OLLAMA_URLS`
 
 ### Google Cloud Application Default Credentials (ADC)
 
-The Gemini Deep Research tools authenticate via **ADC**, not a static API
-key. Set this up once with:
+All Google-backed tools — `quick_research` and `deep_research` (Vertex
+grounded search) plus the Gemini Deep Research pair — authenticate via
+**ADC**, not a static API key. Set this up once with:
 
 ```bash
 gcloud auth application-default login
