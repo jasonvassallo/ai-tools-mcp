@@ -111,10 +111,44 @@ class TestKeyLoading(unittest.TestCase):
         self.assertEqual(argv[0], "/usr/bin/security")
         self.assertIn("DELEGATE_QUEUE_KEY", argv)
 
+    def test_lookup_targets_the_system_keychain_explicitly(self):
+        """A pathless lookup would resolve login.keychain-db first.
+
+        macOS searches the caller's keychain *list* when no keychain is
+        named, and login.keychain-db precedes the System keychain there.
+        A same-named login item would then shadow the System item that
+        DEPLOY.md provisions, the service would start on the wrong key,
+        and every stored job would fail authenticated decryption. Pin the
+        argv so that regression cannot return silently.
+        """
+        raw = secrets.token_bytes(32)
+        _, run = self._load(stdout=base64.b64encode(raw).decode())
+        argv = run.call_args.args[0]
+        self.assertEqual(
+            argv,
+            [
+                "/usr/bin/security",
+                "find-generic-password",
+                "-s",
+                "DELEGATE_QUEUE_KEY",
+                "-a",
+                "jasonvassallo",
+                "-w",
+                "/Library/Keychains/System.keychain",
+            ],
+        )
+        # The path is an argument in its own right, not glued to -w.
+        self.assertEqual(argv[-1], queue_server.KEY_KEYCHAIN)
+        self.assertEqual(argv[-2], "-w")
+
     def test_missing_item_refuses_to_start(self):
         with self.assertRaises(RuntimeError) as ctx:
             self._load(returncode=44)
-        self.assertIn("refusing to start", str(ctx.exception))
+        message = str(ctx.exception)
+        self.assertIn("refusing to start", message)
+        # Name the keychain that was actually searched, so a miss caused
+        # by looking in the wrong store is diagnosable from the log.
+        self.assertIn("/Library/Keychains/System.keychain", message)
 
     def test_invalid_base64_refuses(self):
         with self.assertRaises(RuntimeError) as ctx:

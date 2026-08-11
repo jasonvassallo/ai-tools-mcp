@@ -115,11 +115,15 @@ LaunchAgent on JVMBPro, not per-MCP-launch): stdlib plus a pinned
   logs to `~/Library/Logs/delegate-queue.log`.
 - `DEPLOY.md` — key provisioning (one pipeline into the v3
   `keychain-write` wrapper, secret never printed), install/bootstrap,
-  cloudflared ingress snippet (before the catch-all; needs sudo), DNS
-  CNAME `queue-mbp` → `47b3a9bb-7c29-421d-b7ad-c2739652f9d2.cfargotunnel.com`
-  via the Cloudflare API, Access self-hosted app with a `non_identity`
-  service-token policy reusing the existing Ollama token, and the
-  403-bare / 200-with-token verification.
+  then the edge steps in gate-before-front-door order: Access
+  self-hosted app with a `non_identity` service-token policy reusing the
+  existing Ollama token, cloudflared ingress snippet carrying that app's
+  AUD tag (before the catch-all; needs sudo), and only then the proxied
+  DNS CNAME `queue-mbp` → `<TUNNEL_UUID>.cfargotunnel.com` via the
+  Cloudflare API — the record comes last because it is what exposes the
+  hostname, and the service itself has no auth. Ends with the 403-bare /
+  200-with-token verification. Concrete tunnel/zone/token identifiers
+  are placeholders in the runbook; this repo is public.
 
 ## Fallback story
 

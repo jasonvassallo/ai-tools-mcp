@@ -100,6 +100,12 @@ DEFAULT_DB = Path.home() / ".local" / "state" / "delegate-queue" / "queue.db"
 
 KEY_SERVICE = "DELEGATE_QUEUE_KEY"
 KEY_ACCOUNT = "jasonvassallo"
+# Search this keychain EXPLICITLY. A pathless find-generic-password
+# searches the caller's keychain *list*, which puts login.keychain-db
+# ahead of the System keychain: a same-named login item would shadow the
+# provisioned System one and the service would start with the wrong key,
+# then fail authenticated decryption on every stored job.
+KEY_KEYCHAIN = "/Library/Keychains/System.keychain"
 
 MAX_BODY_BYTES = 2 * 1024 * 1024  # ~2 MB submit cap
 # Backpressure: submits beyond this many already-queued jobs draw a 429
@@ -138,10 +144,17 @@ def load_key_from_system_keychain() -> bytes:
     """Read the AES-256 key from the System keychain. FAIL CLOSED.
 
     ``security find-generic-password -s DELEGATE_QUEUE_KEY -a
-    jasonvassallo -w`` must return the base64 of exactly 32 bytes. Any
-    miss, decode failure, or wrong length raises — the service must not
-    start with a missing or malformed key, and neither the raised error
-    nor any log line ever contains key material.
+    jasonvassallo -w /Library/Keychains/System.keychain`` must return the
+    base64 of exactly 32 bytes. Any miss, decode failure, or wrong length
+    raises — the service must not start with a missing or malformed key,
+    and neither the raised error nor any log line ever contains key
+    material.
+
+    The System keychain path is passed explicitly and is not optional.
+    Without it ``security`` searches the caller's keychain list, which
+    resolves ``login.keychain-db`` first; a stale or unrelated login item
+    of the same service/account name would silently win over the item
+    DEPLOY.md provisions in the System keychain.
     """
     try:
         result = subprocess.run(
@@ -153,6 +166,7 @@ def load_key_from_system_keychain() -> bytes:
                 "-a",
                 KEY_ACCOUNT,
                 "-w",
+                KEY_KEYCHAIN,
             ],
             capture_output=True,
             check=False,
@@ -165,7 +179,7 @@ def load_key_from_system_keychain() -> bytes:
         ) from exc
     if result.returncode != 0:
         raise RuntimeError(
-            f"Encryption key not found in the System keychain (service "
+            f"Encryption key not found in {KEY_KEYCHAIN} (service "
             f"{KEY_SERVICE!r}, account {KEY_ACCOUNT!r}). Provision it per "
             "deploy/jvmbpro-delegate-queue/DEPLOY.md; refusing to start."
         )
