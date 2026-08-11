@@ -1035,6 +1035,54 @@ class TestRenderGroundedAnswer(unittest.TestCase):
                 self.assertIsInstance(out, str)
                 self.assertTrue(out.startswith(("## Quick Research", "Error:")), out)
 
+    def test_max_tokens_ceiling_matches_vertex_exclusive_range(self):
+        # Vertex documents its range as "1 (inclusive) to 65536 (exclusive)",
+        # so 65535 is the largest accepted value and 65536 itself 400s.
+        # Verified live 2026-08-10 against gemini-flash-latest. An
+        # off-by-one here would let a caller pass local validation and then
+        # fail at the API — exactly what this boundary exists to prevent.
+        self.assertEqual(mcp_server._VERTEX_MAX_OUTPUT_TOKENS, 65535)
+        ok = mcp_server._validate_research_arguments(
+            "quick_research", {"query": "q", "max_tokens": 65535}
+        )
+        self.assertEqual(ok, ("q", 65535))
+        rejected = mcp_server._validate_research_arguments(
+            "quick_research", {"query": "q", "max_tokens": 65536}
+        )
+        self.assertIsInstance(rejected, str)
+        self.assertIn("max_tokens", rejected)
+
+    def test_non_string_title_falls_back_instead_of_repr(self):
+        # A truthy non-string title/domain must not be repr'd into the
+        # citation line; fall through to the next usable string, else
+        # the "source" placeholder.
+        data = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "body"}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"title": {"a": 1}, "uri": "https://e.x/1"}},
+                            {"web": {"domain": 42, "uri": "https://e.x/2"}},
+                            {
+                                "web": {
+                                    "title": ["x"],
+                                    "domain": "fallback.example",
+                                    "uri": "https://e.x/3",
+                                }
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("- source: https://e.x/1", out)
+        self.assertIn("- source: https://e.x/2", out)
+        self.assertIn("- fallback.example: https://e.x/3", out)
+        for leaked in ("{'a': 1}", "['x']", ": 42"):
+            self.assertNotIn(leaked, out)
+
     def test_source_needs_a_usable_uri(self):
         # A chunk whose uri is missing or the wrong type is skipped, not
         # rendered as a bare dash or crashed on.

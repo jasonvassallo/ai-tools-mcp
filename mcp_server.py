@@ -1279,11 +1279,14 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
 # --- Vertex grounded search (quick_research / deep_research) -------------
 
 
-# Ceiling for the research tools' max_tokens argument. Matches the Gemini
-# flash generation limit (65,536 output tokens); a value above it would be
-# rejected by Vertex anyway, so validate at the tool boundary instead of
-# spending an authenticated request to find out.
-_VERTEX_MAX_OUTPUT_TOKENS = 65536
+# Ceiling for the research tools' max_tokens argument. Vertex states its
+# supported range as "from 1 (inclusive) to 65536 (exclusive)", so the
+# largest ACCEPTED value is 65535 — 65536 itself returns HTTP 400. Verified
+# live against gemini-flash-latest 2026-08-10: 8192/16384/32768 accepted,
+# 65536 and 65537 rejected. Off-by-one here would defeat the whole point of
+# validating at the tool boundary, since the caller would pass local
+# validation and then fail at the API.
+_VERTEX_MAX_OUTPUT_TOKENS = 65535
 
 
 def _validate_research_arguments(
@@ -1422,7 +1425,16 @@ def _render_grounded_answer(data: dict[str, Any], heading: str) -> str:
         uri = web.get("uri")
         if not isinstance(uri, str) or not uri:
             continue
-        title = web.get("title") or web.get("domain") or "source"
+        # Narrow to str: a truthy non-string title/domain would otherwise be
+        # repr'd straight into the citation line ("- {'nested': 'dict'}: ...").
+        title = next(
+            (
+                value
+                for value in (web.get("title"), web.get("domain"))
+                if isinstance(value, str) and value
+            ),
+            "source",
+        )
         sources.append(f"- {title}: {uri}")
     if sources:
         sections += ["", "### Sources", *sources]
