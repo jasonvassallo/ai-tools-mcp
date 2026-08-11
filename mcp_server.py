@@ -1346,7 +1346,7 @@ async def _vertex_generate_content(
             url, json=payload, headers=headers, timeout=timeout_s
         )
         response.raise_for_status()
-        return response.json()
+        decoded = response.json()
     except httpx.HTTPStatusError as exc:
         return _http_error_payload(exc)
     except httpx.RequestError as exc:
@@ -1359,6 +1359,20 @@ async def _vertex_generate_content(
             "status": "failed",
             "error": f"invalid JSON from Vertex API: {redact_secrets(str(exc))}",
         }
+    # Valid JSON is not necessarily an object. An array/string/number/null
+    # body decodes cleanly and then explodes on the caller's very first
+    # ``data.get(...)`` — before the renderer's own type-narrowing can
+    # produce its fail-closed message. Normalize here so every caller of
+    # this helper receives either a mapping or the failure envelope.
+    if not isinstance(decoded, dict):
+        return {
+            "status": "failed",
+            "error": (
+                f"unexpected JSON type from Vertex API: "
+                f"{type(decoded).__name__}, expected object"
+            ),
+        }
+    return decoded
 
 
 def _render_grounded_answer(data: dict[str, Any], heading: str) -> str:

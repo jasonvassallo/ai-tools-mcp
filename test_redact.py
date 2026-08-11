@@ -849,6 +849,61 @@ class TestVertexGenerateContentHelper(unittest.TestCase):
         self.assertEqual(captured["json"]["tools"], [{"googleSearch": {}}])
         self.assertEqual(captured["json"]["generationConfig"], {"maxOutputTokens": 64})
 
+    def test_non_object_json_becomes_failure_envelope(self):
+        # A syntactically valid but non-object body (array/string/number/
+        # null) decodes fine and would then blow up on the handler's first
+        # data.get(...), ahead of the renderer's own guards. Normalizing
+        # in the helper keeps every caller on the mapping-or-envelope
+        # contract. Reproduced on all four shapes during PR #67 review.
+        for payload in ([{"candidates": []}], "unexpected", 42, None):
+            with self.subTest(payload=type(payload).__name__):
+
+                class _FakeResponse:
+                    def raise_for_status(self):
+                        pass
+
+                    def json(self, _p=payload):
+                        return _p
+
+                class _FakeClient:
+                    async def post(self, url, **kwargs):
+                        return _FakeResponse()
+
+                data = self._run_helper(_FakeClient())
+                self.assertEqual(data["status"], "failed")
+                self.assertIn("expected object", data["error"])
+
+    def test_handler_survives_non_object_json(self):
+        # End-to-end: the tool call must return the failure envelope text,
+        # not raise AttributeError on data.get("status").
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return ["not", "an", "object"]
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                return _FakeResponse()
+
+        async def fake_get_client():
+            return _FakeClient()
+
+        async def fake_headers():
+            return {"Authorization": "Bearer test-token"}
+
+        with (
+            mock.patch.object(mcp_server, "_gemini_headers", side_effect=fake_headers),
+            mock.patch.object(
+                mcp_server, "_get_http_client", side_effect=fake_get_client
+            ),
+            mock.patch.object(mcp_server, "_gemini_billing_project", "proj-1"),
+        ):
+            result = asyncio.run(mcp_server.call_tool("quick_research", {"query": "q"}))
+        self.assertIn("quick_research failed", result[0].text)
+        self.assertIn("expected object", result[0].text)
+
     def test_http_error_becomes_failure_envelope(self):
         class _FakeErrorResponse:
             status_code = 429
