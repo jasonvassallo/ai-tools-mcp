@@ -1579,8 +1579,12 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # codegen/transform prompts this tool is used for. Pinning temperature 0 cuts
 # it to 6% but does NOT recover the score (0.733) — the failures just become
 # deterministic, which is why the default is a model change and not an
-# options change. Suspected serving-side cause (unproven):
-# OLLAMA_KV_CACHE_TYPE=q8_0 with OLLAMA_KEEP_ALIVE=-1.
+# options change. Root-caused 2026-07-31 (48-call repeat protocol, both qwen
+# families): long-lived runner state under OLLAMA_KEEP_ALIVE=-1 — it
+# reproduces across q8_0 AND f16 KV cache, MoE AND dense qwen, Ollama 0.31.1
+# AND 0.32.5. keep_alive:0 per request eliminates it (0/96 measured); gemma
+# is immune under the identical config (0/141 lifetime). Hence the
+# qwen-conditional keep_alive default below.
 #
 # The qwen tags remain selectable and are still the better pick for
 # long-context code work; neither model can be trusted to count or aggregate
@@ -1621,6 +1625,28 @@ _OLLAMA_URL_KEYCHAIN_SERVICE = "OLLAMA_URL"
 # `0` (unload immediately) or 1-9999 seconds/minutes/hours. Strict so a
 # malformed value cannot smuggle arbitrary JSON into the Ollama request.
 _DELEGATE_KEEP_ALIVE_RE = re.compile(r"^(0|[1-9][0-9]{0,3}(s|m|h))$")
+
+# Models whose omitted keep_alive defaults to "0" (unload after the call)
+# instead of inheriting the server's OLLAMA_KEEP_ALIVE. This is the
+# repeat-call contamination mitigation (see the allowlist comment above):
+# a resident qwen runner returns other prompts' answers on ~15-25% of repeat
+# calls; unloading between calls measured 0/96 contaminated. Prefix match so
+# every qwen tag — built-in or env-overridden — is covered. An explicit
+# caller keep_alive always wins (deliberate warm-pinning stays possible).
+_KEEP_ALIVE_ZERO_MODEL_PREFIXES: tuple[str, ...] = ("qwen",)
+
+
+def _keep_alive_zero_default_applies(model: str) -> bool:
+    """True when an omitted keep_alive should default to "0" for this tag.
+
+    Matches on the final path component, case-folded: the env-overridable
+    allowlist accepts arbitrary tags (e.g. "hf.co/acme/qwen-model",
+    "Qwen3:latest"), where a bare whole-tag prefix check would silently
+    skip the mitigation (PR #60 review findings).
+    """
+    name = model.rsplit("/", 1)[-1].lower()
+    return name.startswith(_KEEP_ALIVE_ZERO_MODEL_PREFIXES)
+
 
 # Shared-client default is 30s; delegate calls pass explicit per-request
 # timeouts (same mechanism as _AGENT_API_TIMEOUT_SECONDS).
@@ -2695,9 +2721,11 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Optional: how long Ollama keeps the model loaded "
                             "after the call ('0' = unload immediately — use "
-                            "after a big -256k job). Omit to inherit the "
-                            "server's OLLAMA_KEEP_ALIVE. Pattern: 0 or "
-                            "<1-9999><s|m|h>."
+                            "after a big -256k job). Omitted: qwen tags "
+                            "default to '0' (repeat-call contamination "
+                            "mitigation; pass e.g. '5m' to deliberately keep "
+                            "one warm); other models inherit the server's "
+                            "OLLAMA_KEEP_ALIVE. Pattern: 0 or <1-9999><s|m|h>."
                         ),
                     },
                     "timeout_s": {
@@ -3311,6 +3339,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     "built-in allowlist tag reports it) if you need reasoning.\n\n"
                 )
         advisory = implicit_note + think_note
+
+        # After final model resolution (implicit calls may have re-resolved
+        # `model` above): qwen tags default to keep_alive "0" — the proven
+        # repeat-call contamination mitigation. Explicit caller values win.
+        if keep_alive is None and _keep_alive_zero_default_applies(model):
+            keep_alive = "0"
 
         messages: list[dict[str, str]] = []
         if system:

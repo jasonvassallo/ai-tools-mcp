@@ -79,7 +79,7 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Latency: seconds-to-minutes, synchronous by default, or pass `background=true` to get a `job_id` and poll `local_delegate_result`
 - Privacy: **input stays on your machines** — on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API. Synchronous calls write nothing to disk. `background=true` jobs prefer the durable queue service (`queue_server.py`) when one is reachable: payloads and results are then persisted **AES-256-GCM-encrypted at rest** in SQLite on the queue host (key in the macOS System keychain; 72 h TTL), still only on your own machines. The queue is opt-in by deployment — with no queue deployed (the default for everyone but the repo owner's JVMBPro), background jobs fall back to the legacy in-memory, single-collect store
 - `think`: off by default (faster); set `true` only for reasoning-heavy asks
-- `keep_alive`: omit to inherit the server's `OLLAMA_KEEP_ALIVE`
+- `keep_alive`: omitted, qwen tags default to `'0'` (unload after the call — mitigates a measured cross-task contamination bug where a resident qwen runner returns other prompts' answers on repeat calls; pass e.g. `'5m'` to deliberately keep one warm) while other models inherit the server's `OLLAMA_KEEP_ALIVE`
 
 Together these complement Claude's built-in `WebSearch`: use `WebSearch` for
 quick lookups, `deep_research` for thorough inline investigation,
