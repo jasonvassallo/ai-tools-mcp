@@ -143,17 +143,20 @@ calls. It is **not** a claim of correctness — see §8.
 
 ### 5.1 The diff must include files the agent CREATED
 
-A plain `git diff <base_ref>` **omits untracked files** — so a model that
-adds `tests/test_new.py` and stops "completed" would hand Claude a diff that
-is missing the very file it created, and Claude would gate the wrong thing.
-This is the diff-gate's core promise, so it is specified explicitly:
+A model that adds
+`tests/test_new.py` and stops "completed" must not hand Claude a diff missing
+the very file it created. **But it is computed by reading file bytes, never by
+running git in the worktree** — see §6.5, which is the security spine of this
+tool and overrides any git-command phrasing here. Concretely:
 
-- Diff extraction stages everything first — `git add -A` (which honours the
-  worktree's `.gitignore`) — then `git diff --cached <base_ref>`. Untracked
-  additions, deletions and renames all appear.
-- The staging is confined to the throwaway worktree and is discarded with it;
-  it never touches the user's index.
-- `changed_files` is derived from that same staged diff, so the two never
+- The host walks the worktree filesystem directly, applies a host-owned copy
+  of the base ref's `.gitignore` (captured at creation, never re-read from the
+  sandbox), and diffs those bytes against the base ref's tree read from the
+  **real repo's object store** (located from the `repo` param, outside the
+  mount). Untracked additions, deletions and renames all appear because the
+  comparison is byte-level, not index-based.
+- No staging touches the user's index (no git runs at all).
+- `changed_files` is derived from the same byte comparison, so the two never
   disagree.
 - **The diff and transcript are size-capped.** `read_file` already caps and
   rejects binaries, but without a cap here a model that writes one large or
@@ -194,7 +197,7 @@ worktree.
 
 Consequence to state plainly: the model *can* also touch files indirectly via
 `run_command` (`sed -i`, `echo > file`). That is fine — those writes are still
-confined to the mount and still show up in the staged diff (§5.1). The
+confined to the mount and still appear in the byte-level diff (§5.1/§6.5). The
 host-side guard protects the *host* filesystem, which `run_command` cannot
 reach at all.
 
@@ -228,15 +231,19 @@ Per task:
      toolchain, which is the property that mattered.
 3. On any stop condition **or** any error: `docker rm -f`, then worktree
    teardown per §6.6. Cleanup runs in a `finally` **wrapped in
-   `asyncio.shield`** — the outer wall-clock ceiling cancels the loop with
-   `CancelledError`, and an unshielded `await docker rm` inside `finally`
-   would itself be cancelled, turning the timeout that is supposed to bound a
-   runaway into a leak path.
+   `asyncio.shield(asyncio.wait_for(cleanup, T_cleanup))`** — shielded so the
+   outer wall-clock ceiling's `CancelledError` cannot cancel the teardown
+   itself (that would turn the runaway-bounding timeout into a leak path), and
+   *its own* bounded so a hung `docker rm` cannot wedge teardown forever. The
+   awaiting coroutine catches the one `CancelledError` delivered at the shield
+   boundary.
 4. Concurrency: **exactly one** coding-agent container at a time, enforced by
    a **dedicated single-slot lock** — *not* by reusing `_DELEGATE_JOB_CAP`.
    That cap is 4 and is shared with `local_delegate`; reusing it would permit
    four containers, each with a 31B inference stream, on a box that has honest
-   capacity for one. The registry pattern is reused; the cap is not.
+   capacity for one. The registry pattern is reused; the cap is not. A second
+   concurrent `coding_agent` is **rejected with a clear message** (matching
+   `_launch`'s existing over-cap behaviour), not queued.
 
 Path safety in `write_file`/`read_file` is enforced **on the host side** by
 resolving the real path — **for a not-yet-existing file, resolve the parent
@@ -264,35 +271,55 @@ all reachable once the model controls `.git/config`, which is trivial because
 *host*. A merely-buggy model (`git init`, `rm -rf .git`) can trip this by
 accident; a poisoned repo or prompt-injected task trips it on purpose.
 
-**Requirements (all of them, not a menu):**
+**The rule that actually closes this — mandatory, not a menu.** A second
+adversarial pass **demonstrated** that a per-call env/`-c` allowlist does NOT
+work: the `filter.*` clean/smudge vector uses an *attacker-named* config key
+(`.gitattributes: secret filter=pwn` + repo-local `[filter "pwn"] clean=…`),
+and you cannot `-c filter.<name>=` a name you don't know; and
+`-c core.attributesFile=/dev/null` does **not** disable an *in-tree*
+`.gitattributes` (verified — it only overrides the user/global file). It also
+demonstrated that "tamper-detect then call git" is a check-then-use TOCTOU: a
+process left running inside the container re-mangles `.git` in the window
+between the check and git's own `open(".git")` — **15 host-code executions in
+20 seconds through the full neutralized env.** So:
 
-1. **Every host-side git invocation against the worktree runs with a
-   neutralized environment:** `GIT_CONFIG_GLOBAL=/dev/null`,
-   `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, and explicit
-   `-c core.fsmonitor= -c core.hooksPath=/dev/null -c core.pager=cat
-   -c core.sshCommand=false`, plus filters and textconv disabled. No ambient
-   config, ever.
-2. **Tamper detection before every host git call:** the worktree's `.git`
-   must still be the original gitdir *pointer file* with the exact content
-   written at creation. If it is not (replaced by a directory, edited, or
-   missing), the run stops with `stop_reason: error` and **no git command is
-   executed** — the diff is instead assembled from a byte-level snapshot
-   comparison (below), so the operator still sees what happened.
-3. **`.gitattributes` and `.gitmodules` in the worktree are ignored for
-   host-side operations:** diff/hash use `-c core.attributesFile=/dev/null`
-   and never recurse submodules (`--ignore-submodules=all`); the sandbox can
-   write those files, so they are model-controlled input, not configuration.
-4. **Preferred structure over hardening:** compute the diff and the no-progress
-   hash **without trusting the worktree's `.git` at all** — snapshot tracked
-   +untracked file bytes (`.gitignore` honoured via a *host-owned* copy of the
-   base ref's ignore rules) and diff against the base ref's tree read from the
-   **user's real repository object store**, which the sandbox cannot reach.
-   The `.git` pointer in the worktree is then only used by the *model* inside
-   the container, never by the host. Implementation may start with (1)-(3)
-   and move to (4); the plan must say which.
-5. **A test that reproduces the exact `core.fsmonitor` attack and asserts the
-   planted script does NOT run** — this is a regression test for a
-   demonstrated escape, not a hypothetical.
+1. **No host-side `git` command is ever executed inside the worktree.** Not
+   for the end-of-loop diff (§5.1), not for the per-turn no-progress hash
+   (§7a), not for cleanup registration reads. This is structural and absolute;
+   it is the only thing that closes the class, because the config-driven
+   execution surface of `git` cannot be enumerated and neutralized per-call,
+   and the per-turn hash cannot be protected by killing the container (the
+   container must stay alive between turns).
+2. **The diff and the content hash are computed by reading FILE BYTES, not by
+   invoking git in the worktree.** The host walks the worktree path directly
+   (a plain filesystem read — no git, no config, no hooks), applies a
+   **host-owned** copy of the base ref's `.gitignore` rules (captured at
+   creation from the real repo, never re-read from the sandbox), and diffs
+   against the base ref's tree read from the **user's real repository object
+   store**. That store is located from the **`repo` MCP parameter** (host-known
+   input), *never* from the worktree's `.git`/`commondir` pointer (sandbox-
+   controlled). The store lives outside the `:/work` mount, so the sandbox
+   cannot reach or alter it.
+3. **The container is destroyed (`docker rm -f`, confirmed no process can still
+   write `/work`) BEFORE any host-side read of the worktree used to build the
+   returned result.** The end-of-loop sequence is: stop condition → kill
+   container → read bytes → assemble diff → teardown worktree. Ordering is
+   normative, not incidental.
+4. **The worktree's `.git` pointer is used only by the model, inside the
+   container.** The host treats everything under the mount, `.git` included,
+   as untrusted bytes.
+5. **Regression tests (git only, no docker) that MUST pass:** the exact
+   `core.fsmonitor` escape; the `filter`/`.gitattributes` escape; and a
+   **concurrent-writer TOCTOU** harness (a loop re-mangling `.git` while the
+   host builds the result) — each asserting **no planted payload executes**,
+   which holds trivially once rule (1) is met because no `git` runs at all.
+
+This supersedes the earlier draft's "(1)–(3) hardening, may move to (4)"
+framing, which the second pass proved unsafe: the hardening path shipped a
+demonstrable operator-level RCE. There is no (1)–(3) path. §5.1's
+`git add -A`/`git diff --cached` wording is **overridden by this section** —
+where they conflict, this section wins, and §5.1 is implemented as the
+byte-snapshot of rule (2).
 
 ### 6.6 Cleanup must not depend on `git worktree remove` succeeding
 
@@ -302,12 +329,19 @@ Also **demonstrated**: after the same `.git` tampering, `git worktree remove
 repo — directly contradicting §9's promise. Cleanup is therefore layered and
 each layer is unconditional:
 
-1. `docker rm -f <container>` (shielded, see item 3 above)
-2. attempt `git worktree remove --force` (with the §6.5 neutralized env)
-3. **regardless of 2's result:** `rm -rf <worktree-path>` on the host, then
-   `git worktree prune` in the real repo (neutralized env)
-4. verify both are gone; any residue is surfaced to the caller as an error,
-   never swallowed.
+1. `docker rm -f <container>` (shielded + bounded, per §6 item 3).
+2. attempt `git worktree remove --force` — but run it **in the REAL repo**
+   (`git -C <repo> worktree remove --force <path>`), never inside the worktree,
+   so §6.5's no-git-in-the-worktree rule holds. This step is best-effort; a
+   tampered `.git` makes it fail, which is expected.
+3. **regardless of 2's result:** `rm -rf <worktree-path>` where
+   `<worktree-path>` is the **literal absolute path recorded at creation**,
+   never a path re-resolved through the (sandbox-controlled) worktree — so it
+   cannot be redirected by a planted symlink. Then `git -C <repo> worktree
+   prune` in the real repo.
+4. verify both are gone (path absent on disk **and** absent from
+   `git -C <repo> worktree list`); any residue is surfaced to the caller as an
+   error, never swallowed.
 
 §10's tests must include a run with a **deliberately mangled `.git`** and
 assert zero residue — the container-crash case alone does not cover this.
@@ -335,10 +369,11 @@ The loop stops on the **first** of:
 - `max_seconds` reached (wall clock, checked before every model call)
 - **no-progress:** `N` consecutive turns (default 5) in which **none** of
   three signals moved:
-  (a) the content hash of the worktree — computed over **all files
-  `git add -A` would stage** (tracked *and* new untracked, `.gitignore`
-  honoured), because a model whose whole job was to create a new file must
-  not be scored "no progress" for it;
+  (a) the content hash of the worktree — computed by the **same host-side
+  byte walk as §5.1/§6.5, never by `git add -A`** (running git in the worktree
+  every turn is exactly the escape §6.5 forbids). It covers tracked *and* new
+  untracked files (host-owned `.gitignore` honoured), because a model whose
+  whole job was to create a new file must not be scored "no progress" for it;
   (b) the **(command, exit status) pair** of the most recent `run_command` —
   a *different* command, or the same command flipping fail↔pass, both count;
   (c) any `write_file` call at all in the turn.
