@@ -298,8 +298,23 @@ between the check and git's own `open(".git")` — **15 host-code executions in
    against the base ref's tree read from the **user's real repository object
    store**. That store is located from the **`repo` MCP parameter** (host-known
    input), *never* from the worktree's `.git`/`commondir` pointer (sandbox-
-   controlled). The store lives outside the `:/work` mount, so the sandbox
-   cannot reach or alter it.
+   controlled), and every base-tree read uses the real-repo gitdir as cwd
+   (`git -C <repo> …`, never `git -C <worktree> …`, which would re-anchor
+   config resolution on the hostile worktree). The store lives outside the
+   `:/work` mount, so the sandbox cannot reach or alter it.
+   **The walk must NOT follow symlinks or read special files — this is the one
+   protection removing git took away.** git stored a symlink as a harmless
+   `120000` blob (its target *text*); a naive `os.walk` + `open().read()` on
+   the same tree instead *dereferences* a planted `/work/leak ->
+   ~/.ssh/id_ed25519` and reads the host secret's bytes straight into the diff
+   Claude sees — **demonstrated** in the third adversarial pass, and it inverts
+   §4's "credentials stay out of the sandbox" into "credentials get pulled
+   back in." So the walk: `lstat` every entry; represent a symlink by its
+   **target string**, exactly as git's `120000` mode does, and never
+   dereference it or descend a symlinked directory; read **only regular
+   files** (skip FIFOs/sockets/devices — a FIFO would hang `open().read()`
+   forever, a DoS); stay on the worktree's device; and exclude the top-level
+   `.git` entry as opaque.
 3. **The container is destroyed (`docker rm -f`, confirmed no process can still
    write `/work`) BEFORE any host-side read of the worktree used to build the
    returned result.** The end-of-loop sequence is: stop condition → kill
@@ -454,15 +469,28 @@ reports which expected tools the current image is missing.
   including **new untracked files present in the diff**; diff size cap and
   binary-blob handling; single-slot container lock.
 - **Security regression (git only, no docker needed — MUST pass):**
-  1. the **exact `core.fsmonitor` escape** from §6.5: mangle the worktree's
-     `.git` into a directory with a hostile `config`, run the host-side
-     diff/hash path, **assert the planted script did not execute** and the
-     run stopped with `stop_reason: error` via tamper detection;
-  2. the same with `core.hooksPath` and a `filter` in `.gitattributes`;
-  3. **cleanup with a deliberately mangled `.git`** (§6.6): assert zero
-     residue on disk *and* zero stale entries in `git worktree list` of the
-     real repo.
-  These exist because the escape was **demonstrated**, not hypothesised.
+  1. **`core.fsmonitor` escape:** mangle the worktree's `.git` into a directory
+     with a hostile `config`, run the host-side diff/hash path, and assert
+     **no `git` subprocess was spawned against the worktree** and **no payload
+     marker executed** — the byte-walk treats a mangled `.git` as opaque bytes
+     to skip and still returns a diff. (It does **not** "detect tampering and
+     error": under §6.5 there is nothing to detect and a mangled `.git` from a
+     merely-buggy model is harmless. Asserting an error here would push the
+     implementer back toward the check-then-use gate §6.5 proved unsafe.)
+  2. the same with `core.hooksPath`, and with a `filter` named in an in-tree
+     `.gitattributes` (the vector the env-allowlist could not stop);
+  3. a **concurrent-writer TOCTOU** harness — a loop re-mangling `/work/.git`
+     while the host builds the result — asserting no payload runs (trivially
+     true once rule 1 holds: no `git` runs at all);
+  4. **symlink read-exfiltration:** plant `/work/leak_abs ->
+     ~/.ssh/id_ed25519`, a relative `..`-escape symlink, and a symlinked
+     directory pointing outside the mount; assert the diff and the content
+     hash contain only the symlink **target text**, never the target's
+     **contents**, and that a planted FIFO does not hang the walk;
+  5. **cleanup with a deliberately mangled `.git`** (§6.6): assert zero
+     residue on disk *and* zero stale entries in `git -C <repo> worktree list`.
+  These exist because every one of these escapes was **demonstrated** across
+  three adversarial passes, not hypothesised.
 - **Integration (docker required, skipped if absent):** a real loop against a
   fixture repo with a deliberately failing test and a fake Ollama that emits a
   scripted tool-call sequence — asserts the diff, the `completed` stop, and
