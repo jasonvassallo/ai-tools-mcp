@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      pull-requests: write   # needs write so `gh pr comment` can post the review
+      pull-requests: write   # the deterministic marker step posts the verdict comment
       issues: write
       id-token: write
 
@@ -41,13 +41,12 @@ jobs:
         id: claude-review
         uses: anthropics/claude-code-action@e90deca47693f9457b72f2b53c17d7c445a87342 # v1
         env:
-          GH_TOKEN: ${{ github.token }}   # so the `gh pr comment` step authenticates
+          GH_TOKEN: ${{ github.token }}   # read-only gh commands (pr diff/view) need auth
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
-            REVIEWED HEAD SHA: ${{ github.event.pull_request.head.sha }}
 
             Please review this pull request and provide feedback on:
             - Code quality and best practices
@@ -59,26 +58,36 @@ jobs:
             Use the repository's CLAUDE.md (if present) for style and conventions.
             Be constructive and concise; skip purely stylistic nits.
 
-            Use `gh pr comment` with your Bash tool to leave your review as a comment on the PR.
-
-            Your structured output is the machine-read verdict for this exact
-            head: set no_major_issues to true ONLY if your review raised no
-            blocking or major findings; when false, also set highest_severity
-            and a one-line verdict_summary.
+            Your structured output is the ONLY channel for your verdict — you
+            have no comment-writing access, and a later deterministic step posts
+            the verdict from it. Set no_major_issues to true ONLY if your review
+            raised no blocking or major findings; when false, also set
+            highest_severity and a one-line verdict_summary naming the worst
+            finding. Your full review text is preserved in this workflow's log.
 
           claude_args: |
-            --allowedTools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"
+            --allowedTools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"
             --json-schema '{"type":"object","properties":{"no_major_issues":{"type":"boolean"},"highest_severity":{"type":"string","enum":["critical","major","minor"]},"verdict_summary":{"type":"string"}},"required":["no_major_issues"]}'
 
       - name: Post exact-head verdict marker
         # The review-pipeline Stage 2 watcher fail-closes the Claude reviewer
         # slot unless an issue comment carries the literal marker
         # <!-- review-pipeline: reviewer=claude head=<sha> --> plus a
-        # clean-phrase or severity-prefixed verdict body. Build that comment
-        # deterministically from the schema-validated structured output —
-        # never from model-copied free text. If the model produced no
-        # structured output, or this step fails, no marker is posted and the
+        # clean-phrase or severity-prefixed verdict line. Build that comment
+        # deterministically from the schema-validated structured output — never
+        # from model-authored free text, and never by the model itself: the
+        # model's allowedTools above contain no write-capable command, so this
+        # step is the only path to the trusted comment. If the model produced
+        # no structured output, or this step fails, no marker is posted and the
         # watcher stays fail-closed (unverified), which is the safe direction.
+        #
+        # Contradiction clamps (fail closed, both directions):
+        #  - no_major_issues=true with highest_severity critical/major is a
+        #    contradiction; the clean line is NOT posted.
+        #  - no_major_issues=false with highest_severity minor contradicts the
+        #    boolean's definition (a blocking or major finding exists); the
+        #    severity is clamped up to major so Stage 2 cannot read a
+        #    merge-blocking verdict as a nit.
         if: steps.claude-review.outputs.structured_output != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -88,14 +97,22 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # The trusted comment is 100% deterministic text. verdict_summary is
+          # model-controlled and deliberately NEVER reaches it — the findings
+          # and summary live in this workflow's log. The only model influence
+          # on the comment is one schema-validated boolean and a clamped enum.
           clean="$(printf '%s' "$STRUCTURED_OUTPUT" | jq -r '.no_major_issues')"
-          if [ "$clean" = "true" ]; then
+          sev="$(printf '%s' "$STRUCTURED_OUTPUT" | jq -r '.highest_severity // ""')"
+          if [ "$clean" = "true" ] && { [ "$sev" = "critical" ] || [ "$sev" = "major" ]; }; then
+            line1="${sev^}: contradictory structured verdict (no_major_issues=true with highest_severity=${sev}); treating as not clean — see workflow log"
+          elif [ "$clean" = "true" ]; then
             line1="No major issues found."
           else
-            sev="$(printf '%s' "$STRUCTURED_OUTPUT" | jq -r '.highest_severity // "major"')"
-            case "$sev" in critical|major|minor) ;; *) sev="major" ;; esac
-            summary="$(printf '%s' "$STRUCTURED_OUTPUT" | jq -r '.verdict_summary // "see review comment"' | tr '\n' ' ' | cut -c1-300)"
-            line1="${sev^}: ${summary}"
+            case "$sev" in
+              critical|major) ;;
+              *) sev="major" ;;
+            esac
+            line1="${sev^}: see workflow log for findings"
           fi
           body="$(printf '%s\n%s' "$line1" "<!-- review-pipeline: reviewer=claude head=${HEAD_SHA} -->")"
           gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" -f body="$body"
