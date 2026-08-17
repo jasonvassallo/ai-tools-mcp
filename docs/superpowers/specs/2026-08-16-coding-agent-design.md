@@ -57,7 +57,7 @@ The two also serve different asks. `local_delegate` = "think about this text."
 | Oversight | Sandbox-autonomous; **Claude gates the diff** | Per-step approval would make Claude do all the thinking with a network hop per action — it defeats delegating. Oversight comes from *where the gate sits*, not how often Claude is consulted |
 | Isolation | Docker, `--network=none` | Strongest boundary available and already installed. Also enables the loop-on-host architecture (§4) |
 | Termination | Hard caps **and** no-progress detection | A stochastic loop with shell access does not reliably self-terminate; PR #25 (82 commits / 64h) is this fleet's proof. The agent cannot elect to continue |
-| Model | `gemma4:31b-nvfp4`, resolved via role config | Scored 1.000 on the 8-scenario agentic benchmark and was the **only** model that reliably recovered from a tool error — the failure mode that matters most in a loop |
+| Model | `gemma4:31b-nvfp4`, resolved via role config | Best-measured on the wide review corpus (78 runs/arm: lowest false-flag, tersest findings, fastest) **and** the only arm to recover from a tool error on the 8-scenario agentic harness. Honest weight: the agentic result is small-n and *indicative*, not decisive on its own; the wide-corpus run is the load-bearing evidence. Because the model is a role-config value, this choice is revisable without a code change |
 
 ## 4. Architecture — the loop runs on the host; the sandbox only executes
 
@@ -77,9 +77,18 @@ Claude ──MCP──▶ ai-tools-mcp (host process)
 **The single most important property:** because the loop lives in the MCP
 server, the container needs **no network at all**. The model never talks to
 Ollama from inside; the server does. So `--network=none` is absolute — no
-exfiltration, no remote-code-fetch, no phone-home — with nothing to argue
-about. The alternative (agent process inside the sandbox calling Ollama)
-would force a network hole open and then require policing what it reaches.
+exfiltration, no remote-code-fetch, no phone-home. The alternative (agent
+process inside the sandbox calling Ollama) would force a network hole open
+and then require policing what it reaches.
+
+**But the container is NOT the whole boundary — and an earlier draft of this
+spec wrongly said it was.** The orchestrator runs `git` **on the host**, inside
+a worktree the sandboxed model fully controls (§5.1 diff, §7 hash, cleanup).
+git is a config/hook/filter-driven execution engine, not a passive reader, and
+`.git` in a worktree is a plain *file* inside the bind mount. Adversarial
+review **demonstrated on this host** that the model can replace it and get
+code run as the operator via a single `git add -A`. That threat is handled in
+§6.5 and is a hard requirement, not a hardening nice-to-have.
 
 **Second property, nearly free:** the working copy is a `git worktree`, so
 **only tracked files enter the sandbox**. `.env`, credentials, ignored build
@@ -121,7 +130,7 @@ Returns (or, in background mode, `coding_agent_result` returns on collect):
   "stop_reason": "completed | max_turns | max_seconds | no_progress | error",
   "turns": 17,
   "elapsed_seconds": 412,
-  "diff": "<unified diff, worktree vs base_ref>",
+  "diff": "<unified diff, worktree vs base_ref, INCLUDING new files — see §5.1>",
   "changed_files": ["src/x.py", "tests/test_x.py"],
   "last_command": {"cmd": "pytest tests/test_x.py", "exit": 0, "output_tail": "..."},
   "transcript": [ {"turn":1,"tool":"read_file","args":{...},"result_head":"..."}, ... ],
@@ -132,41 +141,191 @@ Returns (or, in background mode, `coding_agent_result` returns on collect):
 `completed` means the model emitted a final message with no further tool
 calls. It is **not** a claim of correctness — see §8.
 
+### 5.1 The diff must include files the agent CREATED
+
+A plain `git diff <base_ref>` **omits untracked files** — so a model that
+adds `tests/test_new.py` and stops "completed" would hand Claude a diff that
+is missing the very file it created, and Claude would gate the wrong thing.
+This is the diff-gate's core promise, so it is specified explicitly:
+
+- Diff extraction stages everything first — `git add -A` (which honours the
+  worktree's `.gitignore`) — then `git diff --cached <base_ref>`. Untracked
+  additions, deletions and renames all appear.
+- The staging is confined to the throwaway worktree and is discarded with it;
+  it never touches the user's index.
+- `changed_files` is derived from that same staged diff, so the two never
+  disagree.
+- **The diff and transcript are size-capped.** `read_file` already caps and
+  rejects binaries, but without a cap here a model that writes one large or
+  binary file gets it staged and returned inline, blowing up the MCP response
+  and Claude's context. Binary blobs are annotated (`Binary files differ`, path
+  + size) rather than embedded; the text diff is truncated with a marker past
+  a configured byte limit, exactly as `run_command` output already is; and the
+  full diff is written to a file the caller can fetch, so nothing is lost.
+- The no-progress detector in §7 is real but **not adversarially robust**: a
+  model that writes one throwaway byte per turn defeats it. Against a
+  non-cooperative loop, only `max_turns` and `max_seconds` bound anything.
+  It is a defense against *stuck*, not against *malicious*; the caps are the
+  actual budget control.
+
 ### `coding_agent_result`
 
 Identical semantics to `local_delegate_result`: poll by `job_id`, single-collect,
 jobs do not survive a server restart.
 
-### Tools the model sees (inside the sandbox)
+### Tools the model sees — and WHERE each one runs
 
-| tool | behaviour | limits |
-|---|---|---|
-| `list_files(path=".")` | recursive listing, respects `.gitignore` | capped entries |
-| `read_file(path)` | returns text | size cap; binary rejected |
-| `write_file(path, content)` | full overwrite | path must resolve inside the worktree; **no symlink escape** (resolve real path, then prefix-check) |
-| `run_command(cmd)` | `sh -c` inside the container | per-command timeout; output truncated with a marker; **no network exists to reach** |
+| tool | runs | behaviour | limits |
+|---|---|---|---|
+| `list_files(path=".")` | **host** | recursive listing, respects `.gitignore` | capped entries |
+| `read_file(path)` | **host** | returns text | size cap; binary rejected |
+| `write_file(path, content)` | **host** | full overwrite | path must resolve inside the worktree; **no symlink escape** (resolve real path, then prefix-check) |
+| `run_command(cmd)` | **container** | `sh -c` via `docker exec` | per-command timeout; output truncated with a marker; **no network exists to reach** |
+
+**Only `run_command` crosses into the container.** The three file tools need no
+execution — just I/O against the worktree path — so they run in the MCP server
+process on the host, where the path-safety check lives. This is deliberate and
+better than routing everything through `docker exec`: it is faster, it keeps
+the host-side symlink/prefix guard as the *primary* enforcement for file I/O
+(not a mirror of the mount boundary), and it means the container's only job is
+executing commands — a smaller surface to reason about. The container still
+sees every file the host tools wrote, because they share the bind-mounted
+worktree.
+
+Consequence to state plainly: the model *can* also touch files indirectly via
+`run_command` (`sed -i`, `echo > file`). That is fine — those writes are still
+confined to the mount and still show up in the staged diff (§5.1). The
+host-side guard protects the *host* filesystem, which `run_command` cannot
+reach at all.
 
 ## 6. Isolation, precisely
 
 Per task:
 
 1. `git worktree add <tmp> <base_ref>` — throwaway, detached.
-2. `docker run --rm --network=none --user <non-root> --read-only`
-   `--tmpfs /tmp --cpus <cap> --memory <cap> --pids-limit <cap>`
+2. `docker run --rm --network=none --user <host-uid>:<host-gid> --read-only`
+   `--tmpfs /tmp --tmpfs /home/agent -e HOME=/home/agent -e TMPDIR=/tmp`
+   `--cpus <cap> --memory <cap> --pids-limit <cap>`
    `-v <worktree>:/work:rw -w /work <image> sleep infinity`
-   (a long-lived container per task; each tool call is `docker exec` into it,
-   avoiding per-command startup cost).
-3. On any stop condition **or** any error: `docker rm -f`, then
-   `git worktree remove --force`. Cleanup is unconditional (`finally`).
-4. Concurrency: **one** coding-agent container at a time on this host, on top
-   of the existing delegate job cap. The 64GB box already keeps a 31B model
-   resident; a second container plus a second inference stream is not honest
-   capacity.
+   (a long-lived container per task; every `run_command` is a `docker exec`
+   into it, avoiding per-command startup cost).
+
+   Two details here are load-bearing, both learned the cheap way from review:
+
+   - **`--user` is the HOST uid:gid, not an arbitrary non-root user.** The
+     worktree is created by the host user; a container running as some other
+     uid cannot write to it, and `git` inside refuses to operate at all
+     (`fatal: detected dubious ownership in repository at '/work'`). Matching
+     the uid removes both. The image additionally sets
+     `git config --system --add safe.directory /work` as belt-and-braces.
+   - **`--read-only` needs a writable `$HOME`, not just `/tmp`.** `pytest`
+     writes `.pytest_cache`, `ruff`/`mypy`/`uv`/`npm` write under
+     `~/.cache`, `~/.local`, `~/.npm`. With only `/tmp` writable, the first
+     test run fails on `EROFS` inside the sandbox and looks like a model
+     failure. So `$HOME` is a tmpfs too, and cache dirs are steered there
+     (`UV_CACHE_DIR`, `NPM_CONFIG_CACHE`, `PIP_CACHE_DIR` → under `/tmp`).
+     The read-only root is kept: it still blocks tampering with the image's
+     toolchain, which is the property that mattered.
+3. On any stop condition **or** any error: `docker rm -f`, then worktree
+   teardown per §6.6. Cleanup runs in a `finally` **wrapped in
+   `asyncio.shield`** — the outer wall-clock ceiling cancels the loop with
+   `CancelledError`, and an unshielded `await docker rm` inside `finally`
+   would itself be cancelled, turning the timeout that is supposed to bound a
+   runaway into a leak path.
+4. Concurrency: **exactly one** coding-agent container at a time, enforced by
+   a **dedicated single-slot lock** — *not* by reusing `_DELEGATE_JOB_CAP`.
+   That cap is 4 and is shared with `local_delegate`; reusing it would permit
+   four containers, each with a 31B inference stream, on a box that has honest
+   capacity for one. The registry pattern is reused; the cap is not.
 
 Path safety in `write_file`/`read_file` is enforced **on the host side** by
-resolving the real path and prefix-checking against the worktree root, *in
-addition to* the container's own mount boundary. Belt and braces, because a
-mount boundary that is the only check is a single point of failure.
+resolving the real path — **for a not-yet-existing file, resolve the parent
+directory** — and prefix-checking against the worktree root, *in addition to*
+the container's own mount boundary. Belt and braces, because a mount boundary
+that is the only check is a single point of failure.
+
+### 6.5 Host-side git runs on HOSTILE repository contents — hard requirement
+
+This is the threat the first draft missed, and it is the most serious one in
+the design. Adversarial review **demonstrated it on JVMBPro (git 2.55.0)**,
+not reasoned about it:
+
+> Inside the sandbox, replace the worktree's `.git` *file* with a `.git`
+> *directory* whose `config` sets `core.fsmonitor = <worktree>/pwn.sh`.
+> On the host, run the spec's own §5.1 step, `git add -A`.
+> Result: the planted script executed **as the operator, on the host, outside
+> any container.**
+
+`core.fsmonitor` is one of a class: `core.hooksPath`, `filter.*.clean/smudge`
+via `.gitattributes`, `diff.*.textconv`, `core.sshCommand`, `core.pager` —
+all reachable once the model controls `.git/config`, which is trivial because
+`.git` lives inside the mount. `--network=none`, `--user`, `--read-only` and
+`safe.directory` all govern the *container*; the vulnerable `git` runs on the
+*host*. A merely-buggy model (`git init`, `rm -rf .git`) can trip this by
+accident; a poisoned repo or prompt-injected task trips it on purpose.
+
+**Requirements (all of them, not a menu):**
+
+1. **Every host-side git invocation against the worktree runs with a
+   neutralized environment:** `GIT_CONFIG_GLOBAL=/dev/null`,
+   `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1`, and explicit
+   `-c core.fsmonitor= -c core.hooksPath=/dev/null -c core.pager=cat
+   -c core.sshCommand=false`, plus filters and textconv disabled. No ambient
+   config, ever.
+2. **Tamper detection before every host git call:** the worktree's `.git`
+   must still be the original gitdir *pointer file* with the exact content
+   written at creation. If it is not (replaced by a directory, edited, or
+   missing), the run stops with `stop_reason: error` and **no git command is
+   executed** — the diff is instead assembled from a byte-level snapshot
+   comparison (below), so the operator still sees what happened.
+3. **`.gitattributes` and `.gitmodules` in the worktree are ignored for
+   host-side operations:** diff/hash use `-c core.attributesFile=/dev/null`
+   and never recurse submodules (`--ignore-submodules=all`); the sandbox can
+   write those files, so they are model-controlled input, not configuration.
+4. **Preferred structure over hardening:** compute the diff and the no-progress
+   hash **without trusting the worktree's `.git` at all** — snapshot tracked
+   +untracked file bytes (`.gitignore` honoured via a *host-owned* copy of the
+   base ref's ignore rules) and diff against the base ref's tree read from the
+   **user's real repository object store**, which the sandbox cannot reach.
+   The `.git` pointer in the worktree is then only used by the *model* inside
+   the container, never by the host. Implementation may start with (1)-(3)
+   and move to (4); the plan must say which.
+5. **A test that reproduces the exact `core.fsmonitor` attack and asserts the
+   planted script does NOT run** — this is a regression test for a
+   demonstrated escape, not a hypothetical.
+
+### 6.6 Cleanup must not depend on `git worktree remove` succeeding
+
+Also **demonstrated**: after the same `.git` tampering, `git worktree remove
+--force` fails (`validation failed, cannot remove working tree ... error code
+10`) and the worktree stays on disk **and** stays registered in the user's real
+repo — directly contradicting §9's promise. Cleanup is therefore layered and
+each layer is unconditional:
+
+1. `docker rm -f <container>` (shielded, see item 3 above)
+2. attempt `git worktree remove --force` (with the §6.5 neutralized env)
+3. **regardless of 2's result:** `rm -rf <worktree-path>` on the host, then
+   `git worktree prune` in the real repo (neutralized env)
+4. verify both are gone; any residue is surfaced to the caller as an error,
+   never swallowed.
+
+§10's tests must include a run with a **deliberately mangled `.git`** and
+assert zero residue — the container-crash case alone does not cover this.
+
+### 6.7 Docker Desktop on macOS — the uid claim is [plausible], not [verified]
+
+§6.2's `--user <host-uid>` rationale is **Linux-native Docker behaviour stated
+as fact**. The deployment target is a Mac running Docker Desktop, which runs a
+LinuxKit VM and shares bind mounts through virtiofs/gRPC-FUSE that
+*synthesizes* ownership to the container's runtime uid. On that platform the
+mount is typically writable regardless of `--user`, host uid 501 maps to no
+container user, and macOS gid 20 (`staff`) lands on an unrelated Linux group.
+So the "dubious ownership" failure the text predicts may simply not occur
+there — and the confident framing would mislead whoever debugs the first
+permission error. **The plan must include a spike on the real host** to
+establish which of `--user <host-uid>`, `--user 0:0` (root-in-container is not
+host root under Docker Desktop), or no `--user` is correct **before** the uid
+text is treated as settled. Until then it is [plausible].
 
 ## 7. Termination — mechanical, not aspirational
 
@@ -174,15 +333,25 @@ The loop stops on the **first** of:
 
 - `max_turns` reached
 - `max_seconds` reached (wall clock, checked before every model call)
-- **no-progress:** `N` consecutive turns (default 5) in which **neither** of
-  two signals moved: (a) the content hash of the worktree's tracked files, and
-  (b) the exit status of the most recent `run_command`. "Progress" is defined
-  purely mechanically — a file changed, or a command that was failing now
-  exits 0 (or vice-versa). This deliberately avoids trying to detect "tests"
-  by name or output-parsing: it catches the "productively-looking but stuck"
-  pattern (re-reading the same files, re-running the same failing command)
-  that turn/time caps alone let burn the whole budget, without any brittle
-  heuristic about what counts as a test
+- **no-progress:** `N` consecutive turns (default 5) in which **none** of
+  three signals moved:
+  (a) the content hash of the worktree — computed over **all files
+  `git add -A` would stage** (tracked *and* new untracked, `.gitignore`
+  honoured), because a model whose whole job was to create a new file must
+  not be scored "no progress" for it;
+  (b) the **(command, exit status) pair** of the most recent `run_command` —
+  a *different* command, or the same command flipping fail↔pass, both count;
+  (c) any `write_file` call at all in the turn.
+  "Progress" is defined purely mechanically. It deliberately does **not**
+  hash command *output*: test runners print timestamps and durations, so an
+  output hash would change every run and silently disable the detector. It
+  also does not try to recognise "tests" by name. What it catches is the
+  "productively-looking but stuck" pattern — re-reading the same files,
+  re-running the same failing command — that turn/time caps alone let burn
+  the whole budget. What it tolerates: a few consecutive read-only
+  investigation turns are normal early in a task; `N=5` is sized so that
+  legitimate exploration does not trip it, and it is a tunable, not a
+  constant
 - the model returns a final message with no tool calls (`completed`)
 - an unrecoverable error (docker/worktree failure)
 
@@ -245,13 +414,28 @@ reports which expected tools the current image is missing.
 
 - **Unit (no docker):** stop-condition logic (each of the five, in isolation
   and racing); no-progress detector against synthetic transcripts; path-escape
-  rejection for `write_file`/`read_file` including symlink and `..` cases;
-  transcript/diff assembly; job registry reuse.
+  rejection for `write_file`/`read_file` including symlink, `..`, and
+  not-yet-existing-file (parent-resolution) cases; transcript/diff assembly
+  including **new untracked files present in the diff**; diff size cap and
+  binary-blob handling; single-slot container lock.
+- **Security regression (git only, no docker needed — MUST pass):**
+  1. the **exact `core.fsmonitor` escape** from §6.5: mangle the worktree's
+     `.git` into a directory with a hostile `config`, run the host-side
+     diff/hash path, **assert the planted script did not execute** and the
+     run stopped with `stop_reason: error` via tamper detection;
+  2. the same with `core.hooksPath` and a `filter` in `.gitattributes`;
+  3. **cleanup with a deliberately mangled `.git`** (§6.6): assert zero
+     residue on disk *and* zero stale entries in `git worktree list` of the
+     real repo.
+  These exist because the escape was **demonstrated**, not hypothesised.
 - **Integration (docker required, skipped if absent):** a real loop against a
   fixture repo with a deliberately failing test and a fake Ollama that emits a
   scripted tool-call sequence — asserts the diff, the `completed` stop, and
-  **that the container and worktree are gone afterwards**. Plus one run that
-  simulates a container crash and asserts cleanup.
+  **that the container and worktree are gone afterwards**. Plus: one run that
+  simulates a container crash; one that fires the **outer wall-clock ceiling
+  mid-`run_command`** and asserts the shielded cleanup still removed both.
+- **Platform spike (manual, before implementation):** the Docker-Desktop-on-
+  macOS uid behaviour in §6.7 — settle `--user` empirically on JVMBPro.
 - **Live smoke (manual, documented):** one real task against `gemma4:31b`.
 - Follows the repo's existing conventions (`test_local_delegate.py` style,
   ruff, mypy strict).
