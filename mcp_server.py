@@ -1288,6 +1288,19 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
 # validation and then fail at the API.
 _VERTEX_MAX_OUTPUT_TOKENS = 65535
 
+# Default answer budgets. These must clear the THINKING floor, not just the
+# expected answer length: gemini-flash-latest is a thinking model and its
+# thought tokens are billed against maxOutputTokens. Measured live on
+# 2026-08-10 across ~20 runs, thoughtsTokenCount ranged 666-1851 — so the
+# original 1024/2048 defaults were at or below the thinking spend alone and
+# produced finishReason=MAX_TOKENS on roughly a third of ordinary
+# multi-source queries, truncating answers mid-sentence. These budgets are
+# ceilings, not allocations: an answer that finishes early costs only what it
+# used, so raising them buys headroom without raising the price of a typical
+# call.
+_QUICK_DEFAULT_MAX_TOKENS = 8192
+_DEEP_DEFAULT_MAX_TOKENS = 16384
+
 
 def _validate_research_arguments(
     tool_name: str, arguments: dict
@@ -1301,7 +1314,10 @@ def _validate_research_arguments(
     if not isinstance(query, str) or not query.strip():
         return f"Error: {tool_name} requires a non-empty string 'query'"
     max_tokens = arguments.get(
-        "max_tokens", 1024 if tool_name == "quick_research" else 2048
+        "max_tokens",
+        _QUICK_DEFAULT_MAX_TOKENS
+        if tool_name == "quick_research"
+        else _DEEP_DEFAULT_MAX_TOKENS,
     )
     if (
         isinstance(max_tokens, bool)
@@ -1409,10 +1425,44 @@ def _render_grounded_answer(data: dict[str, Any], heading: str) -> str:
         for p in parts
         if isinstance(p, dict) and isinstance(p.get("text"), str)
     ).strip()
+
+    # finishReason distinguishes "the model said nothing" from "the model was
+    # cut off". Both arrive with thin or absent text, but they need opposite
+    # messages: the first is a failure, the second is a partial answer whose
+    # remedy is a bigger budget. Without this the caller was handed a truncated
+    # answer as an unqualified success — it simply stopped mid-sentence.
+    # Mirrors the agent_research renderer, which already surfaces a non-terminal
+    # upstream status for exactly this reason.
+    finish = candidate.get("finishReason")
+    finish = finish if isinstance(finish, str) else ""
+    truncated = finish.upper() == "MAX_TOKENS"
+
     if not text:
+        if truncated:
+            return (
+                f"Error: Vertex hit the output budget for {heading} before "
+                "producing any answer text — the model's internal reasoning "
+                "consumed the whole budget. Retry with a larger max_tokens."
+            )
+        if finish and finish.upper() != "STOP":
+            # Anything else abnormal (observed live: MALFORMED_FUNCTION_CALL
+            # when the budget is too small for the model to emit a well-formed
+            # grounding call; also SAFETY, RECITATION). Naming the reason beats
+            # a bare "empty answer" the caller cannot act on.
+            return (
+                f"Error: Vertex returned no answer text for {heading} "
+                f"(finishReason: {redact_secrets(finish)})"
+            )
         return f"Error: Vertex returned an empty answer for {heading}"
 
     sections = [f"## {heading}", "", text]
+    if truncated:
+        sections += [
+            "",
+            "> ⚠️ This answer was truncated: it reached the output budget "
+            "(`finishReason: MAX_TOKENS`). Re-run with a larger `max_tokens` "
+            "for the complete answer.",
+        ]
     grounding = candidate.get("groundingMetadata")
     if not isinstance(grounding, dict):
         grounding = {}
@@ -2366,8 +2416,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "max_tokens": {
                         "type": "integer",
-                        "description": "Maximum tokens for response (default: 1024)",
-                        "default": 1024,
+                        "description": (
+                            "Output budget, shared with the model's internal "
+                            f"reasoning (default: {_QUICK_DEFAULT_MAX_TOKENS}). "
+                            "Too small a value truncates the answer."
+                        ),
+                        "default": _QUICK_DEFAULT_MAX_TOKENS,
+                        "minimum": 1,
+                        "maximum": _VERTEX_MAX_OUTPUT_TOKENS,
                     },
                 },
                 "required": ["query"],
@@ -2397,8 +2453,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "max_tokens": {
                         "type": "integer",
-                        "description": "Maximum tokens for response (default: 2048)",
-                        "default": 2048,
+                        "description": (
+                            "Output budget, shared with the model's internal "
+                            f"reasoning (default: {_DEEP_DEFAULT_MAX_TOKENS}). "
+                            "Too small a value truncates the answer."
+                        ),
+                        "default": _DEEP_DEFAULT_MAX_TOKENS,
+                        "minimum": 1,
+                        "maximum": _VERTEX_MAX_OUTPUT_TOKENS,
                     },
                 },
                 "required": ["query"],
