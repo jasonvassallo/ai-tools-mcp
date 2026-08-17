@@ -292,11 +292,25 @@ between the check and git's own `open(".git")` — **15 host-code executions in
    container must stay alive between turns).
 2. **The diff and the content hash are computed by reading FILE BYTES, not by
    invoking git in the worktree.** The host walks the worktree path directly
-   (a plain filesystem read — no git, no config, no hooks), applies a
-   **host-owned** copy of the base ref's `.gitignore` rules (captured at
-   creation from the real repo, never re-read from the sandbox), and diffs
-   against the base ref's tree read from the **user's real repository object
-   store**. That store is located from the **`repo` MCP parameter** (host-known
+   (a plain filesystem read — no git, no config, no hooks) and diffs against
+   the base ref's tree read from the **user's real repository object store**.
+   The diff is a true **two-sided comparison of `base-tree ∪ worktree-walk`**,
+   so a tracked file the model deletes or replaces with a skipped special
+   file surfaces as a **deletion/typechange**, never silently vanishing.
+   **Ignore handling must be tracked-aware, or the gate can be blinded.**
+   git's real rule is that `.gitignore` does **not** apply to already-tracked
+   files — and a uniform pattern match does not know that. **Demonstrated in
+   the fourth adversarial pass:** a model overwriting a *tracked* file that
+   matches a base ignore pattern (a force-added file under an ignored dir, a
+   committed `*.cfg`/`config.json` predating the rule) produces a change git
+   would show but a naive ignore-filtered walk would hide — defeating the very
+   gate this whole tool exists for. So: **every path present in the base tree
+   appears in the diff regardless of ignore rules; ignore rules (a host-owned
+   copy of the base ref's `.gitignore` + `.git/info/exclude` +
+   `core.excludesFile`, captured at creation, never re-read from the sandbox)
+   apply ONLY to paths not in the base tree.** Bias toward under-ignoring:
+   over-showing an ignored artifact is harmless to a gate; under-showing a
+   real change is the danger. That store is located from the **`repo` MCP parameter** (host-known
    input), *never* from the worktree's `.git`/`commondir` pointer (sandbox-
    controlled), and every base-tree read uses the real-repo gitdir as cwd
    (`git -C <repo> …`, never `git -C <worktree> …`, which would re-anchor
@@ -313,8 +327,26 @@ between the check and git's own `open(".git")` — **15 host-code executions in
    **target string**, exactly as git's `120000` mode does, and never
    dereference it or descend a symlinked directory; read **only regular
    files** (skip FIFOs/sockets/devices — a FIFO would hang `open().read()`
-   forever, a DoS); stay on the worktree's device; and exclude the top-level
-   `.git` entry as opaque.
+   forever, a DoS; skipping also moots a `mknod` raw-disk device node under a
+   root-in-container `--user 0:0`); stay on the worktree's device; and exclude
+   the top-level `.git` entry as opaque. **The symlink target string is
+   attacker-controlled** (a sandbox `ln -s "<forged diff header>" leak` round-
+   trips arbitrary newlines and `--- a/…` bytes — demonstrated), so it must be
+   rendered into the unified diff **exactly as git renders a `120000` blob:
+   every target line carries a leading `+`, so no target byte can land in
+   column 0 as a spurious `---`/`+++`/`@@` header, and the `@@` line count
+   matches the emitted lines.** A hand-rolled encoding that embeds the target
+   raw reintroduces diff-structure injection.
+   (Note the belt-and-braces framing honestly: on the macOS target the
+   worktree and `~/.ssh` share one APFS volume, so "stay on-device" protects
+   nothing about host secrets — the real guard is never-follow-symlinks +
+   only-walking-real-directories, so the walk never *constructs* a path
+   outside the root. Hardlinks are `lstat`-indistinguishable from a regular
+   file and the walk has no defense against one; safety there rests entirely
+   on the container mount model — host secrets are not in the container's
+   mount namespace to be `link()`ed, and `/work` is a different device from
+   image/tmpfs so a cross-device link fails. Document this dependency so a
+   future extra bind-mount does not silently reopen it.)
 3. **The container is destroyed (`docker rm -f`, confirmed no process can still
    write `/work`) BEFORE any host-side read of the worktree used to build the
    returned result.** The end-of-loop sequence is: stop condition → kill
@@ -484,9 +516,19 @@ reports which expected tools the current image is missing.
      true once rule 1 holds: no `git` runs at all);
   4. **symlink read-exfiltration:** plant `/work/leak_abs ->
      ~/.ssh/id_ed25519`, a relative `..`-escape symlink, and a symlinked
-     directory pointing outside the mount; assert the diff and the content
-     hash contain only the symlink **target text**, never the target's
-     **contents**, and that a planted FIFO does not hang the walk;
+     directory pointing outside the mount; assert the diff shows only the
+     symlink **target text**, never the target's **contents**, that the
+     content hash is invariant to the target file's contents (changes only
+     when the target *string* changes), and that a planted FIFO does not hang
+     the walk;
+  4b. **diff-structure injection:** a symlink whose target is a forged
+     `--- a/… / +++ / @@` block cannot introduce a column-0 diff header and
+     the `@@` counts stay accurate;
+  4c. **gate cannot be blinded (the load-bearing one):** an edit to a
+     *tracked* file that matches a base `.gitignore` pattern **still appears**
+     in the diff; and a tracked file replaced by a skipped special file
+     (`rm foo.py; mkfifo foo.py`) surfaces as a deletion/typechange, not a
+     silent disappearance;
   5. **cleanup with a deliberately mangled `.git`** (§6.6): assert zero
      residue on disk *and* zero stale entries in `git -C <repo> worktree list`.
   These exist because every one of these escapes was **demonstrated** across
