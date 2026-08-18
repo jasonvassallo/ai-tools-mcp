@@ -1671,8 +1671,9 @@ _OLLAMA_DEFAULT_MODEL_ENV_VAR = "AI_TOOLS_OLLAMA_DEFAULT_MODEL"
 
 # v1.1 (spec amendment): local-first endpoint chain. The remote defaults are
 # the user's own Cloudflare-Access-gated tunnels — never a third-party
-# service. Order: local → JVMBPro (64k/256k tags, laptop, may be off) →
-# jvmacmini (32k base tag, always-on server).
+# service. Order: local → JVMBPro (ollama-mbp: gemma4:31b/12b, qwen3.8;
+# 64k host window; laptop, may be off) → jvmacmini (ollama.djvassallo.com:
+# gemma4:12b-nvfp4 only, 32k host window, always-on server).
 _OLLAMA_DEFAULT_CHAIN: tuple[str, ...] = (
     "http://localhost:11434",
     "https://ollama-mbp.djvassallo.com",
@@ -2544,13 +2545,13 @@ async def list_tools() -> list[Tool]:
                             "that is gemma4:12b-nvfp4 — it outscored the qwen tags "
                             "on mechanical delegate work (0.92 vs 0.73) and is "
                             "the safer pick for short repeated prompts. Prefer "
-                            "a qwen tag for "
-                            "long-context code work. Neither is reliable at "
-                            "counting or aggregating over long inputs. The "
-                            "qwen base tag inherits each serving host's "
-                            "context window (64k on JVMBPro, 32k on "
-                            "jvmacmini); -32k/-256k pin explicit windows "
-                            "(-256k = several GB of KV cache, JVMBPro only). "
+                            "gemma4:31b-nvfp4 for review and long-context code "
+                            "work (served by the MBP only). Neither is reliable "
+                            "at counting or aggregating over long inputs. There "
+                            "is no per-request context window: every call runs "
+                            "at the serving host's OLLAMA_CONTEXT_LENGTH (64k on "
+                            "JVMBPro, 32k on jvmacmini) — no -32k/-64k/-256k "
+                            "tag variants exist any more. "
                             "Explicit tags resolve strictly: the endpoint "
                             "chain is probed per call and the first endpoint "
                             "serving the tag wins, else the call fails. "
@@ -2589,7 +2590,7 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Optional: how long Ollama keeps the model loaded "
                             "after the call ('0' = unload immediately — use "
-                            "after a big -256k job). Omitted: qwen tags "
+                            "after a big one-off job). Omitted: qwen tags "
                             "default to '0' (repeat-call contamination "
                             "mitigation; pass e.g. '5m' to deliberately keep "
                             "one warm); other models inherit the server's "
