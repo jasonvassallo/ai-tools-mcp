@@ -1584,9 +1584,14 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # is immune under the identical config (0/141 lifetime). Hence the
 # qwen-conditional keep_alive default below.
 #
-# The qwen tags remain selectable and are still the better pick for
-# long-context code work; neither model can be trusted to count or aggregate
-# over long inputs (both scored 0.33 on that task).
+# The measurement above is against qwen3.6:35b-a3b, which no longer exists on
+# the endpoint (retired 2026-08-17). The surviving qwen tag, qwen3.8:27b-nvfp4,
+# has NOT been benchmarked here and its "long-context advantage" is gone with
+# the per-context tag variants: every call now runs at the serving host's
+# window regardless of tag. Prefer gemma4:31b-nvfp4 for review and
+# long-context work (see the tool schema description and the allowlist comment
+# below); neither family can be trusted to count or aggregate over long inputs
+# (both scored 0.33 on that task).
 _OLLAMA_MODELS_ENV_VAR = "AI_TOOLS_OLLAMA_MODELS"
 _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "gemma4:12b-nvfp4",
@@ -2542,9 +2547,10 @@ async def list_tools() -> list[Tool]:
                             "is the `default` field above (it follows the "
                             "allowlist's first entry, which AI_TOOLS_OLLAMA_"
                             "MODELS can override per machine). Out of the box "
-                            "that is gemma4:12b-nvfp4 — it outscored the qwen tags "
-                            "on mechanical delegate work (0.92 vs 0.73) and is "
-                            "the safer pick for short repeated prompts. Prefer "
+                            "that is gemma4:12b-nvfp4 — it outscored the (since-"
+                            "retired) qwen3.6 tags on mechanical delegate work "
+                            "(0.92 vs 0.73) and is the safer pick for short "
+                            "repeated prompts; qwen3.8:27b-nvfp4 is unbenchmarked. Prefer "
                             "gemma4:31b-nvfp4 for review and long-context code "
                             "work (served by the MBP only). Neither is reliable "
                             "at counting or aggregating over long inputs. There "
