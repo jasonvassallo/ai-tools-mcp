@@ -56,16 +56,21 @@ wrong twice. Query `/api/tags` (creds in Credential Manager) rather than believi
 ## The one fact that changes the math
 
 With flash attention + q8_0 KV quantization (how every host here runs), the KV cache
-**grows with tokens actually used, not with the window size** — a 5k-token task on a
-host configured for 262144 costs about the same RAM as on one configured for 32768. So
-for a *small* prompt there is no per-call memory reason to prefer a smaller-window host.
+**grows with tokens actually used, not with the window size** — in a measurement taken
+on these hosts (2026-07, flash attention + q8_0 KV), a 5k-token task on a host configured
+for 262144 cost about the same RAM as on one configured for 32768. Treat that as a
+**version-specific observation, not a guarantee**: Ollama documents that memory grows
+with `OLLAMA_CONTEXT_LENGTH` and scales with `OLLAMA_NUM_PARALLEL`; flash attention and
+q8_0 *reduce* KV-cache usage, they do not remove the constraint. So for a *small* prompt
+there is little per-call memory reason to prefer a smaller-window host — but re-measure
+before relying on it after an Ollama upgrade.
 
-But the configured window is still a **memory constraint at the host level**, not a free
-setting: it bounds the *peak* KV cache the host must be able to reach, and Ollama's
-`OLLAMA_NUM_PARALLEL` multiplies that. This repo's own history recorded the old `-256k`
-tag needing several GB of KV cache. So: pick the host by whether the prompt FITS its
-window and whether it is awake; and if you are the one raising `OLLAMA_CONTEXT_LENGTH`
-on a host, size it to that host's memory, not to the model's advertised maximum.
+The configured window IS a **memory constraint at the host level**: it bounds the *peak*
+KV cache the host must be able to reach, and parallelism multiplies that. This repo's own
+history recorded the old `-256k` tag needing several GB of KV cache. So: pick the host by
+whether the prompt FITS its window and whether it is awake; and if you are the one raising
+`OLLAMA_CONTEXT_LENGTH` on a host, size it to that host's memory, not to the model's
+advertised maximum.
 
 ## Sizing rule of thumb
 
@@ -133,9 +138,14 @@ only one of them:
   silently truncated at the *input* side. `local_delegate` cannot raise the window per
   call: move the job to the larger-window host (MBP 64k over the mini's 32k), raise
   `OLLAMA_CONTEXT_LENGTH` on that host, or use `~\.ollama-qodo\review.ps1`.
-- **Generation-limit truncation** — the *output* stops early with `done_reason: length`
-  (check `done_reason` / `eval_count` in the response). That is `num_predict`, not the
-  window; a bigger host changes nothing. Ask for a shorter answer, split the task, or
-  reduce `think` — `local_delegate` exposes no `num_predict` either.
+- **Generation-limit truncation** — the *output* stops early: mid-sentence, mid-list,
+  or mid-code-block. Underneath, Ollama reported `done_reason: length` — but
+  `local_delegate` returns only `message.content` and **discards `done_reason` and
+  `eval_count`**, so through this tool you can only infer it from the shape of the text.
+  (Calling Ollama directly, e.g. `review.ps1`, you can read those fields.) This is
+  `num_predict`, not the window; a bigger host changes nothing. Ask for a shorter
+  answer, split the task, or reduce `think` — `local_delegate` exposes no `num_predict`
+  either. Surfacing `done_reason` in the tool's response would make this diagnosable
+  instead of guessed; that is a code change, not a doc one.
 
 Never trim the user's input to force a fit without saying so.
