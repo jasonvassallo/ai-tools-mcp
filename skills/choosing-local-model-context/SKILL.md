@@ -1,6 +1,6 @@
 ---
 name: choosing-local-model-context
-description: Size the context window (num_ctx) for a local_delegate call and pick the host that can serve it. Use whenever calling local_delegate with anything other than a trivially small prompt, when a delegate call fails because the prompt exceeded the model window, when choosing the model param explicitly, or when deciding whether a task can run on the always-on endpoint vs the laptop-only one. Note the per-context model tags (-32k/-64k/-256k) NO LONGER EXIST — and local_delegate exposes NO num_ctx parameter, so the window is whatever the serving host's OLLAMA_CONTEXT_LENGTH is.
+description: Estimate a local_delegate prompt's token size and pick (or configure) a host whose context window fits it. local_delegate has NO num_ctx parameter and no per-context model tags — every call runs at the serving host's OLLAMA_CONTEXT_LENGTH — so "sizing" means choosing the right host or raising that setting, never passing a per-call window. Use whenever calling local_delegate with anything other than a trivially small prompt, when a delegate call fails or truncates because the prompt exceeded the host window, when choosing the model param explicitly, or when deciding whether a task can run on the always-on endpoint vs the laptop-only one.
 ---
 
 # Choosing a Context Window for local_delegate
