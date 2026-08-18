@@ -1584,16 +1584,31 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # is immune under the identical config (0/141 lifetime). Hence the
 # qwen-conditional keep_alive default below.
 #
-# The qwen tags remain selectable and are still the better pick for
-# long-context code work; neither model can be trusted to count or aggregate
-# over long inputs (both scored 0.33 on that task).
+# The measurement above is against qwen3.6:35b-a3b, which no longer exists on
+# the endpoint (retired 2026-08-17). The surviving qwen tag, qwen3.8:27b-nvfp4,
+# has NOT been benchmarked here and its "long-context advantage" is gone with
+# the per-context tag variants: every call now runs at the serving host's
+# window regardless of tag. Prefer gemma4:31b-nvfp4 for review and
+# long-context work (see the tool schema description and the allowlist comment
+# below); neither family can be trusted to count or aggregate over long inputs
+# (both scored 0.33 on that task).
 _OLLAMA_MODELS_ENV_VAR = "AI_TOOLS_OLLAMA_MODELS"
 _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "gemma4:12b-nvfp4",
-    "qwen3.6:35b-a3b-coding-nvfp4",
-    "qwen3.6:35b-a3b-coding-nvfp4-32k",
-    "qwen3.6:35b-a3b-coding-nvfp4-64k",
-    "qwen3.6:35b-a3b-coding-nvfp4-256k",
+    # 2026-08-17: the qwen3.6 tags were removed from the endpoint. There are no
+    # per-context-window tag variants any more -- both remaining large tags
+    # advertise context_length 262144 (verified via /api/show on ollama-mbp
+    # 2026-08-18: gemma4.context_length=262144, qwen3_5.context_length=262144 --
+    # `qwen3_5` there is Ollama's model_info ARCHITECTURE key for the qwen3.8:27b
+    # tag, not a typo: the family key is independent of the release tag name;
+    # this is the model's advertised window, NOT a quality benchmark -- qwen3.8
+    # remains unbenchmarked here), but local_delegate sends no options.num_ctx,
+    # so a call runs at the serving host's OLLAMA_CONTEXT_LENGTH (64k on JVMBPro,
+    # 32k on jvmacmini). gemma4:31b is the reviewer/long-context tier (kept warm on the
+    # MBP); qwen3.8:27b is the surviving qwen-family tag, still subject to the
+    # qwen keep_alive:"0" contamination default below.
+    "gemma4:31b-nvfp4",
+    "qwen3.8:27b-nvfp4",
 )
 
 
@@ -1666,8 +1681,9 @@ _OLLAMA_DEFAULT_MODEL_ENV_VAR = "AI_TOOLS_OLLAMA_DEFAULT_MODEL"
 
 # v1.1 (spec amendment): local-first endpoint chain. The remote defaults are
 # the user's own Cloudflare-Access-gated tunnels — never a third-party
-# service. Order: local → JVMBPro (64k/256k tags, laptop, may be off) →
-# jvmacmini (32k base tag, always-on server).
+# service. Order: local → JVMBPro (ollama-mbp: gemma4:31b/12b, qwen3.8;
+# 64k host window; laptop, may be off) → jvmacmini (ollama.djvassallo.com:
+# gemma4:12b-nvfp4 only, 32k host window, always-on server).
 _OLLAMA_DEFAULT_CHAIN: tuple[str, ...] = (
     "http://localhost:11434",
     "https://ollama-mbp.djvassallo.com",
@@ -2536,16 +2552,17 @@ async def list_tools() -> list[Tool]:
                             "is the `default` field above (it follows the "
                             "allowlist's first entry, which AI_TOOLS_OLLAMA_"
                             "MODELS can override per machine). Out of the box "
-                            "that is gemma4:12b-nvfp4 — it outscored the qwen tags "
-                            "on mechanical delegate work (0.92 vs 0.73) and is "
-                            "the safer pick for short repeated prompts. Prefer "
-                            "a qwen tag for "
-                            "long-context code work. Neither is reliable at "
-                            "counting or aggregating over long inputs. The "
-                            "qwen base tag inherits each serving host's "
-                            "context window (64k on JVMBPro, 32k on "
-                            "jvmacmini); -32k/-256k pin explicit windows "
-                            "(-256k = several GB of KV cache, JVMBPro only). "
+                            "that is gemma4:12b-nvfp4 — it outscored the (since-"
+                            "retired) qwen3.6 tags on mechanical delegate work "
+                            "(0.92 vs 0.73) and is the safer pick for short "
+                            "repeated prompts; qwen3.8:27b-nvfp4 is unbenchmarked. Prefer "
+                            "gemma4:31b-nvfp4 for review and long-context code "
+                            "work (served by the MBP only). Neither is reliable "
+                            "at counting or aggregating over long inputs. There "
+                            "is no per-request context window: every call runs "
+                            "at the serving host's OLLAMA_CONTEXT_LENGTH (64k on "
+                            "JVMBPro, 32k on jvmacmini) — no -32k/-64k/-256k "
+                            "tag variants exist any more. "
                             "Explicit tags resolve strictly: the endpoint "
                             "chain is probed per call and the first endpoint "
                             "serving the tag wins, else the call fails. "
@@ -2562,13 +2579,19 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                         "description": (
                             "Enable the model's thinking mode. Off by default "
-                            "for speed; enable for reasoning-heavy asks. Every "
-                            "built-in allowlist tag reports the 'thinking' "
-                            "capability; if an overridden tag does not, the "
-                            "server disables the flag and prefixes an advisory "
-                            "instead of letting Ollama reject the call. Note "
-                            "qwen thinking can consume the whole output budget "
-                            "on large inputs and return no answer at all."
+                            "for speed. KEEP IT OFF for the gemma4 tags "
+                            "(including the gemma4:31b-nvfp4 reviewer): with "
+                            "thinking on they put the generation in "
+                            "message.thinking, which this tool discards, so the "
+                            "call returns 'Error: Ollama returned no content'. "
+                            "Enable it only on a model whose content you have "
+                            "confirmed survives it. Every built-in allowlist tag "
+                            "reports the 'thinking' capability; if an overridden "
+                            "tag does not, the server disables the flag and "
+                            "prefixes an advisory instead of letting Ollama "
+                            "reject the call. Qwen thinking can likewise consume "
+                            "the whole output budget on large inputs and return "
+                            "no answer at all."
                         ),
                     },
                     "background": {
@@ -2584,7 +2607,7 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Optional: how long Ollama keeps the model loaded "
                             "after the call ('0' = unload immediately — use "
-                            "after a big -256k job). Omitted: qwen tags "
+                            "after a big one-off job). Omitted: qwen tags "
                             "default to '0' (repeat-call contamination "
                             "mitigation; pass e.g. '5m' to deliberately keep "
                             "one warm); other models inherit the server's "
