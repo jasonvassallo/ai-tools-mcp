@@ -22,7 +22,13 @@ Copied from the spec; every task's requirements include these.
 - Termination: first of `max_turns` (default 25, hard max 60), `max_seconds` (default 600, hard max 1800), no-progress (`N=5` turns with no change in walk-hash, `(cmd, exit)` pair, or `write_file`), `completed`, error (§7).
 - Docker run flags (§6.2): `--rm --init --network=none <USER-FLAG per §6.7 spike> --read-only --tmpfs /tmp --tmpfs /home/agent -e HOME=/home/agent -e TMPDIR=/tmp -e UV_CACHE_DIR=/tmp/uv -e PIP_CACHE_DIR=/tmp/pip -e NPM_CONFIG_CACHE=/tmp/npm --cpus <cap> --memory <cap> --pids-limit <cap> -v <worktree>:/work:rw -w /work <image> sleep infinity`.
 - New code lives in a new package `coding_agent/`, NOT in `mcp_server.py` (3,285 lines). `mcp_server.py` gains only tool registration + dispatch.
-- Repo conventions: `ruff format` + `ruff check` clean, `mypy --strict` clean, tests are stdlib `unittest` run via `uv run --with pytest pytest <file> -q`.
+- Repo conventions: `ruff format` + `ruff check .` clean (this IS the repo's
+  convention and is clean at baseline). **`mypy --strict` applies to
+  `coding_agent/` ONLY** — ruled 2026-08-17: mypy is not a repo convention
+  (no config, not in CI, not in AGENTS.md) and `mcp_server.py` carries 37
+  pre-existing `--strict` errors. Never run `--strict` against
+  `mcp_server.py`; never 'fix' those 37 — that is out of scope.
+  Tests are stdlib `unittest` run via `uv run --with pytest pytest <file> -q`.
 - Version bump `mcpb/manifest.json` **and** `.claude-plugin/plugin.json` in lockstep (currently both `1.5.4` → this ships as `1.6.0`, a new tool = minor bump).
 - Delivery tier: **T2** per the review-pipeline convergence policy (introduces arbitrary execution into a server that had none).
 
@@ -250,6 +256,57 @@ class SymlinkExfiltration(unittest.TestCase):
         snap = snapshot_tree(str(self.root), lambda p: False)
         self.assertNotIn("trap.fifo", snap.entries)
 
+    def test_filter_attribute_escape_cannot_run(self):
+        """Spec §10 test 2. The filter vector needs host git to honour an
+        in-tree .gitattributes plus a repo-local [filter] config. Nothing in
+        the walk invokes git, so the payload can never fire. Written rather
+        than 'subsumed' because it is the REGRESSION GUARD if host git is ever
+        reintroduced (ruled 2026-08-17)."""
+        marker = Path(self.tmp) / "PWNED_FILTER"
+        (self.root / ".gitattributes").write_text("*.py filter=pwn\n")
+        (self.root / ".git").mkdir(exist_ok=True)
+        (self.root / ".git" / "config").write_text(
+            '[filter "pwn"]\n\tclean = sh -c "touch ' + str(marker) + '"\n'
+        )
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertFalse(marker.exists(), "a filter driver executed during the walk")
+        # .gitattributes is DATA to the walk, never configuration
+        self.assertEqual(snap.entries[".gitattributes"].data, b"*.py filter=pwn\n")
+
+    def test_concurrent_writer_toctou_cannot_win(self):
+        """Spec §10 test 3. A writer re-mangling .git mid-run defeated the
+        earlier check-then-invoke design (15 host executions in 20s). With no
+        invocation at all there is no window. Guards a future reintroduction."""
+        import threading
+
+        marker = Path(self.tmp) / "PWNED_TOCTOU"
+        stop = threading.Event()
+
+        def remangle() -> None:
+            g = self.root / ".git"
+            while not stop.is_set():
+                try:
+                    if g.is_dir():
+                        (g / "config").write_text(
+                            '[core]\n\tfsmonitor = sh -c "touch '
+                            + str(marker)
+                            + '"\n'
+                        )
+                    else:
+                        g.mkdir(exist_ok=True)
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=remangle, daemon=True)
+        t.start()
+        try:
+            for _ in range(50):
+                snapshot_tree(str(self.root), lambda p: False)
+        finally:
+            stop.set()
+            t.join(timeout=2)
+        self.assertFalse(marker.exists(), "TOCTOU payload executed during the walk")
+
     def test_top_level_dot_git_is_opaque(self):
         (self.root / ".git").mkdir()
         (self.root / ".git" / "config").write_text("[core]\n\tfsmonitor = /tmp/pwn.sh\n")
@@ -363,7 +420,7 @@ def tree_hash(snap: TreeSnapshot) -> str:
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `uv run --with pytest --with pathspec pytest test_coding_agent_security.py -q`
-Expected: 4 passed.
+Expected: 6 passed.
 
 - [ ] **Step 5: Add a plain unit test file for the happy path**
 
@@ -1720,7 +1777,7 @@ Expected: all pass.
 - [ ] **Step 5: Lint/type and commit**
 
 ```bash
-ruff format . && ruff check . && mypy --strict mcp_server.py coding_agent
+ruff format . && ruff check . && mypy --strict coding_agent
 git add mcp_server.py test_coding_agent_loop.py
 git commit -m "feat(mcp): register coding_agent + coding_agent_result (dispatch only; loop lives in coding_agent/)"
 ```
@@ -1926,7 +1983,7 @@ Then invoke the `review-pipeline` skill: classify **T2** in the PR description (
 
 ## Self-Review
 
-**Spec coverage** — every load-bearing section maps to a task: §4/§5 tools + dispatch (T6, T8, T9); §5.1 diff incl. new files, size cap, tracked-aware (T3, T4); §6.2 docker flags (T5, T10); §6.5 rules 1–5 (T2, T3, T4, T5, T8 ordering); §6.6 layered cleanup (T5); §6.7 spike (T0); §7 termination (T7, T8); §8 honesty clauses (T9 description, T12 README); §10 every regression test — fsmonitor/opaque-.git (T2), filter/.gitattributes is subsumed by "no git runs" and pinned by the T5 mangled-.git + T2 opaque tests, TOCTOU (subsumed: no git runs — T8 ordering test), symlink exfil (T2), header injection (T4), tracked-not-blinded (T3), typechange (T4), symlinked-parent write (T6), mangled-.git cleanup (T5), crash + ceiling (T11); §12 allowlist prerequisite (T1) + lockstep bump (T12).
+**Spec coverage** — every load-bearing section maps to a task: §4/§5 tools + dispatch (T6, T8, T9); §5.1 diff incl. new files, size cap, tracked-aware (T3, T4); §6.2 docker flags (T5, T10); §6.5 rules 1–5 (T2, T3, T4, T5, T8 ordering); §6.6 layered cleanup (T5); §6.7 spike (T0); §7 termination (T7, T8); §8 honesty clauses (T9 description, T12 README); §10 every regression test — fsmonitor/opaque-.git (T2), filter/.gitattributes (T2, written as a regression guard), TOCTOU (T2, written as a regression guard), symlink exfil (T2), header injection (T4), tracked-not-blinded (T3), typechange (T4), symlinked-parent write (T6), mangled-.git cleanup (T5), crash + ceiling (T11); §12 allowlist prerequisite (T1) + lockstep bump (T12).
 
 **Placeholder scan** — one deliberate: `SANDBOX_USER_FLAG` in T5 is set to `[]` with an instruction to replace it with T0's recorded DECISION. That is a data dependency on the spike, not a TODO; the step says exactly what to write.
 
