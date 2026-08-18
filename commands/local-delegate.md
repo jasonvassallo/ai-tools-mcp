@@ -11,8 +11,11 @@ Guidance:
 - Include any needed file content inline in the prompt — the server never reads files.
 - Default model is gemma4:12b-nvfp4 (stronger on short mechanical work); pass model=gemma4:31b-nvfp4
   for review and long-context code work (MBP only; there are no -256k / per-context tags any
-  more — every call runs at the serving host's window), and keep_alive="0"
-  to unload afterward.
+  more — every call runs at the serving host's window).
+- Leave keep_alive alone for the gemma4 tags: they are kept WARM on their hosts by design, and
+  keep_alive="0" would unload the 31B after every review and force a cold reload next time.
+  Only qwen tags default to keep_alive="0" (repeat-call contamination mitigation), and the
+  server applies that automatically — you don't need to pass it.
 - Pass think=true only for reasoning-heavy asks (slower).
 - For long jobs pass background=true, then poll with the `local_delegate_result` tool.
 - Output quality is below frontier models — treat results as a draft to verify, not a final answer.
