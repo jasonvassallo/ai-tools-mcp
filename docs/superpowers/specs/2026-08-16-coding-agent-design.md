@@ -183,7 +183,7 @@ jobs do not survive a server restart.
 | `list_files(path=".")` | **host** | recursive listing, respects `.gitignore` | capped entries |
 | `read_file(path)` | **host** | returns text | size cap; binary rejected |
 | `write_file(path, content)` | **host** | full overwrite | path must resolve inside the worktree; **no symlink escape** (resolve real path, then prefix-check) |
-| `run_command(cmd)` | **container** | `sh -c` via `docker exec` | per-command timeout; output truncated with a marker; **no network exists to reach** |
+| `run_command(cmd)` | **container** | `sh -c` via `docker exec` | per-command timeout **kills the exec's process group** (not just the client — a bare `docker exec` timeout leaves the in-container process spinning); output truncated with a marker; **no network exists to reach** |
 
 **Only `run_command` crosses into the container.** The three file tools need no
 execution — just I/O against the worktree path — so they run in the MCP server
@@ -206,21 +206,31 @@ reach at all.
 Per task:
 
 1. `git worktree add <tmp> <base_ref>` — throwaway, detached.
-2. `docker run --rm --network=none --user <host-uid>:<host-gid> --read-only`
-   `--tmpfs /tmp --tmpfs /home/agent -e HOME=/home/agent -e TMPDIR=/tmp`
-   `--cpus <cap> --memory <cap> --pids-limit <cap>`
+2. `docker run --rm --init --network=none <USER-FLAG — see §6.7>`
+   `--read-only --tmpfs /tmp --tmpfs /home/agent -e HOME=/home/agent`
+   `-e TMPDIR=/tmp --cpus <cap> --memory <cap> --pids-limit <cap>`
    `-v <worktree>:/work:rw -w /work <image> sleep infinity`
+   (`<USER-FLAG>` is `--user <host-uid>:<host-gid>`, `--user 0:0`, or omitted —
+   **unresolved on Docker Desktop/macOS until the §6.7 spike**; do not hardcode
+   one before that runs.)
+   (`--init` runs tini as pid 1 so processes the model backgrounds — e.g. the
+   re-tamper writer from the §6.5 TOCTOU — are reaped rather than lingering as
+   zombies; `--pids-limit` bounds a fork bomb.)
    (a long-lived container per task; every `run_command` is a `docker exec`
    into it, avoiding per-command startup cost).
 
    Two details here are load-bearing, both learned the cheap way from review:
 
-   - **`--user` is the HOST uid:gid, not an arbitrary non-root user.** The
-     worktree is created by the host user; a container running as some other
-     uid cannot write to it, and `git` inside refuses to operate at all
-     (`fatal: detected dubious ownership in repository at '/work'`). Matching
-     the uid removes both. The image additionally sets
-     `git config --system --add safe.directory /work` as belt-and-braces.
+   - **The uid question.** On native Linux Docker the worktree is created by
+     the host user and a container running as a *different* uid cannot write to
+     it (and in-container `git` errors `dubious ownership`), so `--user
+     <host-uid>` is the fix there. On the actual target — Docker Desktop/macOS
+     — virtiofs synthesizes ownership and this may not apply at all; §6.7 owns
+     resolving it, and until then no `--user` value is hardcoded (§6.2 step 2).
+     Regardless of the outcome, the image sets `git config --system --add
+     safe.directory '*'` as belt-and-braces — but note that only matters for
+     the model's *own* in-container git; the host never runs git in the
+     worktree (§6.5).
    - **`--read-only` needs a writable `$HOME`, not just `/tmp`.** `pytest`
      writes `.pytest_cache`, `ruff`/`mypy`/`uv`/`npm` write under
      `~/.cache`, `~/.local`, `~/.npm`. With only `/tmp` writable, the first
@@ -246,10 +256,22 @@ Per task:
    `_launch`'s existing over-cap behaviour), not queued.
 
 Path safety in `write_file`/`read_file` is enforced **on the host side** by
-resolving the real path — **for a not-yet-existing file, resolve the parent
-directory** — and prefix-checking against the worktree root, *in addition to*
-the container's own mount boundary. Belt and braces, because a mount boundary
-that is the only check is a single point of failure.
+**`os.path.realpath` (symlink-following), not `normpath`** — and
+prefix-checking `realpath(target).startswith(realpath(worktree_root) + os.sep)`,
+*in addition to* the container's own mount boundary. Belt and braces, because
+a mount boundary that is the only check is a single point of failure.
+
+**The parent must be realpath-resolved, and a symlinked parent is the specific
+threat.** For a not-yet-existing file, resolve the **parent directory** with
+realpath before the check: if the model earlier did `ln -s /etc /work/sub`
+(inside the sandbox), then `write_file("sub/passwd", …)` has a target whose
+`normpath` is innocently `/work/sub/passwd` but whose `realpath(parent)` is
+`/etc` — the prefix check catches it *only* because realpath followed the
+symlink out. A `normpath`-based guard would write to the host's `/etc/passwd`.
+Same rule for `read_file` (a symlinked parent would exfiltrate). This is the
+write-side twin of the read-walk's never-dereference rule (§6.5): the walk
+never *follows* a symlink, and these two tools never *write/read through* one
+out of the tree.
 
 ### 6.5 Host-side git runs on HOSTILE repository contents — hard requirement
 
@@ -305,10 +327,16 @@ between the check and git's own `open(".git")` — **15 host-code executions in
    committed `*.cfg`/`config.json` predating the rule) produces a change git
    would show but a naive ignore-filtered walk would hide — defeating the very
    gate this whole tool exists for. So: **every path present in the base tree
-   appears in the diff regardless of ignore rules; ignore rules (a host-owned
-   copy of the base ref's `.gitignore` + `.git/info/exclude` +
-   `core.excludesFile`, captured at creation, never re-read from the sandbox)
-   apply ONLY to paths not in the base tree.** Bias toward under-ignoring:
+   appears in the diff regardless of ignore rules; ignore rules apply ONLY to
+   paths not in the base tree.** The host-owned ignore set is captured at
+   creation from the real repo and never re-read from the sandbox, and it must
+   include **every `.gitignore` in the base tree, not just the root** — repos
+   routinely carry `packages/x/.gitignore`, and missing a nested one would
+   hide a real untracked change or spuriously show an ignored artifact.
+   Enumerate them from `git -C <repo> ls-tree -r <base_ref>` (plus
+   `.git/info/exclude` and `core.excludesFile`) and feed the lot into the host
+   path filter (a `pathspec`-style engine). A sandbox-written `.gitignore` is
+   model-controlled input, never consulted. Bias toward under-ignoring:
    over-showing an ignored artifact is harmless to a gate; under-showing a
    real change is the danger. That store is located from the **`repo` MCP parameter** (host-known
    input), *never* from the worktree's `.git`/`commondir` pointer (sandbox-
@@ -406,7 +434,11 @@ there — and the confident framing would mislead whoever debugs the first
 permission error. **The plan must include a spike on the real host** to
 establish which of `--user <host-uid>`, `--user 0:0` (root-in-container is not
 host root under Docker Desktop), or no `--user` is correct **before** the uid
-text is treated as settled. Until then it is [plausible].
+text is treated as settled. Working hypothesis to test first, not to assume:
+on Docker Desktop's virtiofs, **omitting `--user`** (image-default user) often
+mounts and writes cleanly while sidestepping the uid-mismatch entirely — but
+that must be confirmed against the read-only-root + tmpfs-`$HOME` combination,
+not adopted on reputation. Until the spike runs it is [plausible].
 
 ## 7. Termination — mechanical, not aspirational
 
@@ -526,9 +558,14 @@ reports which expected tools the current image is missing.
      the `@@` counts stay accurate;
   4c. **gate cannot be blinded (the load-bearing one):** an edit to a
      *tracked* file that matches a base `.gitignore` pattern **still appears**
-     in the diff; and a tracked file replaced by a skipped special file
+     in the diff; a new untracked file matching a **nested**
+     `packages/x/.gitignore` is correctly hidden while one matching no rule is
+     shown; and a tracked file replaced by a skipped special file
      (`rm foo.py; mkfifo foo.py`) surfaces as a deletion/typechange, not a
      silent disappearance;
+  4d. **write-side symlinked-parent escape (§6):** after `ln -s /etc /work/sub`,
+     `write_file("sub/passwd", …)` and `read_file("sub/passwd")` are both
+     rejected by the realpath-parent prefix check;
   5. **cleanup with a deliberately mangled `.git`** (§6.6): assert zero
      residue on disk *and* zero stale entries in `git -C <repo> worktree list`.
   These exist because every one of these escapes was **demonstrated** across
