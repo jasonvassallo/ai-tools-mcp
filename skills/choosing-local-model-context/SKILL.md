@@ -138,7 +138,11 @@ local probe and falls through the endpoint chain. Whatever tag you put first MUS
 `ollama list` shows locally, or implicit calls skip it and go remote. Keep
 `think:false` on these boxes and expect ~4–8 tok/s from a dense 12–14B q4.
 
-See the `local-delegate-routing` skill for which model to force per task type.
+Which model to force per task type, in short: `gemma4:12b-nvfp4` (the default) for
+short mechanical delegation; `gemma4:31b-nvfp4` with `think:false` for review and
+long-context work (MBP only — if the MBP is asleep there is no 31b anywhere, drop to
+12b and say so); your small local model for anything that must stay on-device or
+offline. Neither gemma nor qwen can be trusted to count or aggregate over long inputs.
 
 ## When a call fails on length
 
