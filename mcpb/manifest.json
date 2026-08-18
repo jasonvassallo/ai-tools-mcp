@@ -67,7 +67,7 @@
     "ollama_models": {
       "type": "string",
       "title": "Ollama model allowlist",
-      "description": "Comma-separated model tags local_delegate may use; first entry is the default model. Leave blank for the built-in tags (default gemma4:12b-nvfp4, then gemma4:31b-nvfp4 and qwen3.8:27b-nvfp4). Calls that omit the model resolve local-first across this list, falling back to the next tag with a note when the default isn't served. On constrained machines set e.g. 'coder7k:latest,gemma4:12b-nvfp4,gemma4:31b-nvfp4' so small tasks run locally and remote-only tags fall through to the endpoint chain.",
+      "description": "Comma-separated model tags local_delegate may use; first entry is the default model. Leave blank for the built-in tags (default gemma4:12b-nvfp4, then gemma4:31b-nvfp4 and qwen3.8:27b-nvfp4). Calls that omit the model resolve local-first across this list, falling back to the next tag with a note when the default isn't served. On constrained machines set e.g. 'qwen2.5-coder:14b,gemma4:12b-nvfp4,gemma4:31b-nvfp4' (a small model you have pulled locally first) so small tasks run locally and remote-only tags fall through to the endpoint chain.",
       "required": false,
       "default": ""
     }
