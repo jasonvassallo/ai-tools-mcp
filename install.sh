@@ -28,9 +28,13 @@ MCP_SERVER_KEY="ai-tools-mcp"
 # Keychain service name (shared across all your MCP tools)
 KEYCHAIN_SERVICE="api_tokens"
 
-# API tokens required: "account_name|display_name|description"
-REQUIRED_TOKENS=(
-    "perplexity|Perplexity API Key|Get one at https://www.perplexity.ai/settings/api"
+# API tokens offered at install: "account_name|display_name|description"
+# None are required as of v1.6 — the default research path (quick_research /
+# deep_research) authenticates via Google ADC, and the Perplexity key backs
+# only the explicit-invocation `agent_research` tool. Declining it leaves a
+# fully usable install.
+OPTIONAL_TOKENS=(
+    "perplexity|Perplexity API Key (optional, agent_research only)|Get one at https://www.perplexity.ai/settings/api"
 )
 # Gemini Deep Research authenticates via Google Cloud Application Default
 # Credentials (ADC), not a static API key. ADC must be configured separately:
@@ -150,7 +154,7 @@ fi
 
 print_step "Setting up API tokens (macOS Keychain)"
 
-for token_spec in "${REQUIRED_TOKENS[@]}"; do
+for token_spec in "${OPTIONAL_TOKENS[@]}"; do
     IFS='|' read -r account display_name description <<< "$token_spec"
 
     # Check if already stored
@@ -245,13 +249,14 @@ else
 fi
 
 # Check tokens
-for token_spec in "${REQUIRED_TOKENS[@]}"; do
+for token_spec in "${OPTIONAL_TOKENS[@]}"; do
     IFS='|' read -r account display_name _ <<< "$token_spec"
     if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$account" -w >/dev/null 2>&1; then
         print_ok "${display_name} found in Keychain"
     else
-        print_warn "${display_name} not in Keychain — server will fail to start"
-        errors=1
+        # Not an error since v1.6: agent_research is the only consumer and it
+        # fails closed at call time. The default research path uses ADC.
+        print_warn "${display_name} not in Keychain — agent_research unavailable; quick_research/deep_research unaffected"
     fi
 done
 

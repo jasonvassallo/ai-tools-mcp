@@ -513,12 +513,21 @@ def _report_cf_access_credentials() -> None:
 def run_check() -> None:
     """Validate configuration and exit. Used by install.sh to verify setup."""
     errors = 0
+    # Non-fatal since v1.6: the Perplexity key backs only `agent_research`,
+    # an explicit-invocation tool. The default research path (quick_research
+    # / deep_research) runs on ADC-authenticated Vertex, so an install with
+    # no Perplexity key is a perfectly usable deployment and must not be
+    # reported as unhealthy — the installer and every SessionStart preflight
+    # read this exit status. Same rule the Ollama block below already
+    # applies, and `agent_research` still fails closed at call time.
     try:
         _, source = _resolve_credential("api_tokens", "perplexity")
         print(f"ok: perplexity key found ({source}) [agent_research only]")
     except ValueError as e:
-        print(f"fail: {e}")
-        errors += 1
+        print(
+            f"warn: perplexity key not found — agent_research unavailable; "
+            f"quick_research/deep_research are unaffected. {e}"
+        )
 
     try:
         creds, project = _load_adc()
