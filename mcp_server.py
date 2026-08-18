@@ -1590,10 +1590,14 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 _OLLAMA_MODELS_ENV_VAR = "AI_TOOLS_OLLAMA_MODELS"
 _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "gemma4:12b-nvfp4",
-    "qwen3.6:35b-a3b-coding-nvfp4",
-    "qwen3.6:35b-a3b-coding-nvfp4-32k",
-    "qwen3.6:35b-a3b-coding-nvfp4-64k",
-    "qwen3.6:35b-a3b-coding-nvfp4-256k",
+    # 2026-08-17: the qwen3.6 tags were removed from the endpoint. There are no
+    # per-context-window tag variants any more -- both remaining large tags
+    # advertise context_length 262144 and the window is chosen per request via
+    # num_ctx. gemma4:31b is the reviewer/long-context tier (kept warm on the
+    # MBP); qwen3.8:27b is the surviving qwen-family tag, still subject to the
+    # qwen keep_alive:"0" contamination default below.
+    "gemma4:31b-nvfp4",
+    "qwen3.8:27b-nvfp4",
 )
 
 

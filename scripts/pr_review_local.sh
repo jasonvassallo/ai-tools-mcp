@@ -34,7 +34,7 @@ command -v pr-agent >/dev/null \
 
 UPSTREAM="${OLLAMA_API_BASE:-http://localhost:11434}"
 PROXY_PORT="${PR_AGENT_PROXY_PORT:-11435}"
-MODEL="${PR_AGENT_OLLAMA_MODEL:-ollama/qwen3.6:35b-a3b-coding-nvfp4}"
+MODEL="${PR_AGENT_OLLAMA_MODEL:-ollama/gemma4:31b-nvfp4}"
 NUM_CTX="${PR_AGENT_NUM_CTX:-16384}"
 case "$NUM_CTX" in
   ''|*[!0-9]*) echo "PR_AGENT_NUM_CTX must be a positive integer, got: ${NUM_CTX}" >&2; exit 1;;

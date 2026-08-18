@@ -464,7 +464,7 @@ class TestPostOllamaChat(unittest.TestCase):
         # a dead endpoint must evict it too, or omitted-model calls keep
         # resolving to the corpse for up to a TTL.
         mcp_server._implicit_resolution_cache["gemma4:12b-nvfp4"] = (
-            "qwen3.6:35b-a3b-coding-nvfp4",
+            "qwen3.8:27b-nvfp4",
             "http://localhost:11434",
             "Note: substituted.\n\n",
             mcp_server.time.monotonic() + 60,
@@ -480,9 +480,9 @@ class TestPostOllamaChat(unittest.TestCase):
             response=_FakeResponse(status_code=404, text="model not found")
         )
         with self._with_selection():
-            out = self._post(client, payload={"model": "qwen3.6:35b-a3b-coding-nvfp4"})
+            out = self._post(client, payload={"model": "qwen3.8:27b-nvfp4"})
         self.assertEqual(out["status"], "failed")
-        self.assertIn("ollama pull qwen3.6:35b-a3b-coding-nvfp4", out["error"])
+        self.assertIn("ollama pull qwen3.8:27b-nvfp4", out["error"])
 
     def test_non_404_http_error_no_pull_hint(self):
         client = _FakeClient(response=_FakeResponse(status_code=500, text="boom"))
@@ -540,7 +540,7 @@ class TestPostOllamaChat(unittest.TestCase):
         self.assertNotIn("m", mcp_server._ollama_endpoint_cache)
 
 
-_MODEL = "qwen3.6:35b-a3b-coding-nvfp4"
+_MODEL = "qwen3.8:27b-nvfp4"
 
 
 def _no_keychain(service, account):
@@ -654,7 +654,7 @@ class TestDelegateDefaultModel(unittest.TestCase):
             )
 
     def test_allowlisted_env_override_honored(self):
-        tag = "qwen3.6:35b-a3b-coding-nvfp4-32k"
+        tag = "qwen3.8:27b-nvfp4"
         with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": tag}):
             self.assertEqual(mcp_server._delegate_default_model(), tag)
 
@@ -811,7 +811,7 @@ class TestResolveImplicitModel(unittest.TestCase):
     EP1 = "http://localhost:11434"
     EP2 = "http://127.0.0.1:11435"
     DEFAULT = "gemma4:12b-nvfp4"
-    QWEN = "qwen3.6:35b-a3b-coding-nvfp4"
+    QWEN = "qwen3.8:27b-nvfp4"
 
     def setUp(self):
         mcp_server._ollama_endpoint_cache.clear()
@@ -857,7 +857,7 @@ class TestResolveImplicitModel(unittest.TestCase):
         client = _FakeTagsClient(tags_by_url={self.EP1: [], self.EP2: [self.QWEN]})
         model, endpoint, note = self._resolve(client)
         self.assertEqual((model, endpoint), (self.QWEN, self.EP2))
-        self.assertIn("using qwen3.6:35b-a3b-coding-nvfp4", note)
+        self.assertIn("using qwen3.8:27b-nvfp4", note)
 
     def test_nothing_served_anywhere_raises(self):
         client = _FakeTagsClient(tags_by_url={self.EP1: [], self.EP2: []})
@@ -1003,10 +1003,10 @@ class TestThinkingModelAdvisory(unittest.TestCase):
         out, _ = self._delegate(
             {"prompt": "hi"},
             self.THINKING,
-            resolved="qwen3.6:35b-a3b-coding-nvfp4",
+            resolved="qwen3.8:27b-nvfp4",
             note="Note: default model gemma4:12b-nvfp4 is not served by any "
             "reachable endpoint checked before localhost; using "
-            "qwen3.6:35b-a3b-coding-nvfp4 (localhost) instead.\n\n",
+            "qwen3.8:27b-nvfp4 (localhost) instead.\n\n",
         )
         self.assertTrue(out[0].text.startswith("Note: default model"))
         self.assertIn("## Local Delegate", out[0].text)
@@ -1055,7 +1055,7 @@ class TestThinkingModelAdvisory(unittest.TestCase):
         out, fake = self._delegate(
             {"prompt": "hi", "think": True},
             self.NO_THINKING,
-            resolved="qwen3.6:35b-a3b-coding-nvfp4",
+            resolved="qwen3.8:27b-nvfp4",
             note=note,
         )
         text = out[0].text
@@ -1099,7 +1099,7 @@ class TestThinkingModelAdvisory(unittest.TestCase):
 class TestRenderDelegateAnswer(unittest.TestCase):
     def test_happy_path(self):
         out = mcp_server._render_delegate_answer(
-            {"model": "qwen3.6:35b-a3b-coding-nvfp4", "message": {"content": "answer"}}
+            {"model": "qwen3.8:27b-nvfp4", "message": {"content": "answer"}}
         )
         self.assertIn("answer", out[0].text)
         self.assertIn("Local Delegate", out[0].text)
@@ -1317,7 +1317,7 @@ class TestLocalDelegateValidation(unittest.TestCase):
 
     def test_model_not_in_allowlist(self):
         out = _call("local_delegate", {"prompt": "x", "model": "llama3:8b"})
-        self.assertIn("qwen3.6:35b-a3b-coding-nvfp4", out[0].text)
+        self.assertIn("qwen3.8:27b-nvfp4", out[0].text)
 
     def test_think_must_be_bool(self):
         out = _call("local_delegate", {"prompt": "x", "think": "yes"})
@@ -1393,7 +1393,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         # casing rather than a bare whole-tag prefix check.
         applies = mcp_server._keep_alive_zero_default_applies
         for tag in (
-            "qwen3.6:35b-a3b-coding-nvfp4",
+            "qwen3.8:27b-nvfp4",
             "qwen3.6:27b-coding-nvfp4-64k",
             "Qwen3:latest",
             "QWEN2.5-coder:7b",
@@ -1415,7 +1415,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call(
                 "local_delegate",
-                {"prompt": "p", "model": "qwen3.6:35b-a3b-coding-nvfp4"},
+                {"prompt": "p", "model": "qwen3.8:27b-nvfp4"},
             )
         payload, _ = fake.call_args.args
         self.assertEqual(payload["keep_alive"], "0")
@@ -1427,7 +1427,7 @@ class TestLocalDelegateSync(unittest.TestCase):
                 "local_delegate",
                 {
                     "prompt": "p",
-                    "model": "qwen3.6:35b-a3b-coding-nvfp4-64k",
+                    "model": "qwen3.8:27b-nvfp4",
                     "keep_alive": "5m",
                 },
             )
@@ -1440,7 +1440,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
         resolver = mock.AsyncMock(
             return_value=(
-                "qwen3.6:35b-a3b-coding-nvfp4",
+                "qwen3.8:27b-nvfp4",
                 "http://127.0.0.1:11434",
                 "",
             )
@@ -1451,7 +1451,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         ):
             _call("local_delegate", {"prompt": "p"})
         payload, _ = fake.call_args.args
-        self.assertEqual(payload["model"], "qwen3.6:35b-a3b-coding-nvfp4")
+        self.assertEqual(payload["model"], "qwen3.8:27b-nvfp4")
         self.assertEqual(payload["keep_alive"], "0")
 
     def test_qwen_default_also_requests_a_pre_unload(self):
@@ -1464,7 +1464,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call(
                 "local_delegate",
-                {"prompt": "p", "model": "qwen3.6:35b-a3b-coding-nvfp4"},
+                {"prompt": "p", "model": "qwen3.8:27b-nvfp4"},
             )
         self.assertTrue(fake.call_args.kwargs["pre_unload"])
 
@@ -1482,7 +1482,7 @@ class TestLocalDelegateSync(unittest.TestCase):
                     "local_delegate",
                     {
                         "prompt": "p",
-                        "model": "qwen3.6:35b-a3b-coding-nvfp4",
+                        "model": "qwen3.8:27b-nvfp4",
                         "keep_alive": ka,
                     },
                 )
@@ -1521,7 +1521,7 @@ class TestLocalDelegateSync(unittest.TestCase):
                     "think": True,
                     "keep_alive": "0",
                     "timeout_s": 600,
-                    "model": "qwen3.6:35b-a3b-coding-nvfp4-256k",
+                    "model": "qwen3.8:27b-nvfp4",
                 },
             )
         payload, timeout_s = fake.call_args.args
@@ -1531,7 +1531,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         self.assertEqual(payload["messages"][1], {"role": "user", "content": "p"})
         self.assertIs(payload["think"], True)
         self.assertEqual(payload["keep_alive"], "0")
-        self.assertEqual(payload["model"], "qwen3.6:35b-a3b-coding-nvfp4-256k")
+        self.assertEqual(payload["model"], "qwen3.8:27b-nvfp4")
         self.assertEqual(timeout_s, 600.0)
 
     def test_failure_envelope_reaches_caller(self):
@@ -1585,7 +1585,7 @@ class TestLocalDelegateBackground(unittest.TestCase):
                 "local_delegate",
                 {
                     "prompt": "p",
-                    "model": "qwen3.6:35b-a3b-coding-nvfp4",
+                    "model": "qwen3.8:27b-nvfp4",
                     "background": True,
                 },
             )
@@ -2346,11 +2346,11 @@ class TestModelAllowlistOverride(unittest.TestCase):
             )
 
     def test_override_parses_orders_and_dedupes(self):
-        raw = " qwen2.5-coder:14b , qwen3.6:35b-a3b-coding-nvfp4 ,qwen2.5-coder:14b "
+        raw = " qwen2.5-coder:14b , qwen3.8:27b-nvfp4 ,qwen2.5-coder:14b "
         with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_MODELS": raw}):
             self.assertEqual(
                 mcp_server._resolve_delegate_models(),
-                ("qwen2.5-coder:14b", "qwen3.6:35b-a3b-coding-nvfp4"),
+                ("qwen2.5-coder:14b", "qwen3.8:27b-nvfp4"),
             )
 
     def test_effectively_empty_override_fails_closed_to_builtin(self):
