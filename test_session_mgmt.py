@@ -1276,12 +1276,17 @@ class TestLazyKeychainImport(unittest.TestCase):
         self.assertIsNone(module._gemini_credentials)
 
     def test_perplexity_keychain_error_propagates(self):
-        """When ``agent_research`` resolves its key on a system without
-        the keychain CLI, the failure must surface — we are deferring the
-        lookup, not silently swallowing it. v1.2 (issue #20): a missing
-        security(1) no longer leaks a raw FileNotFoundError; it raises
-        the actionable ValueError naming the env-var remedy, so the
-        laziness still preserves a loud, actionable failure signal."""
+        """Contract test for ``get_api_key_from_keychain`` itself — the
+        helper ``agent_research`` calls to resolve its Perplexity key.
+
+        Exercised directly rather than through the tool handler: the
+        property under test is that deferring the lookup does not swallow
+        it, which belongs to the helper, and driving it through the tool
+        would add network mocking that tests nothing extra. v1.2 (issue
+        #20): a missing security(1) no longer leaks a raw
+        FileNotFoundError; it raises the actionable ValueError naming the
+        env-var remedy, so the laziness still preserves a loud,
+        actionable failure signal."""
         module = self._import_with_failing_keychain(drop_fcntl=False)
         env_guard = mock.patch.dict(module.os.environ, {}, clear=False)
         env_guard.start()

@@ -56,9 +56,14 @@ Perplexity Agent research stays available on the user's key.
   `_get_bearer_token()` ADC path and the shared lazy `httpx.AsyncClient`.
   Location `global` per the verified-cheapest Vertex note.
 - `quick_research` and `deep_research` keep their names (AGENTS.md stable
-  surface) and their max_tokens defaults (1024 / 2048), both move to
-  `gemini-flash-latest`, differing by system prompt exactly as the
-  Sonar/Sonar-Pro split did. Responses render synthesized text plus a
+  surface), both move to `gemini-flash-latest`, differing by system prompt
+  exactly as the Sonar/Sonar-Pro split did. The defaults were planned as
+  1024 / 2048 (carried over from Sonar) but **shipped as 8192 / 16384**:
+  Stage 3 adversarial review demonstrated live that this model bills its
+  thinking tokens against `maxOutputTokens` (measured 666–1851), so the
+  carried-over budgets truncated ordinary answers mid-sentence. The
+  renderer now also reads `finishReason` so a truncated or otherwise
+  abnormal response is named rather than returned as a clean answer. Responses render synthesized text plus a
   Sources section from `groundingMetadata.groundingChunks`
   (title + URI) and `webSearchQueries`; all output passes
   `redact_secrets` as before.
