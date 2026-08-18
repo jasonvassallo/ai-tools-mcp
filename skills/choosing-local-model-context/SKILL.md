@@ -39,7 +39,8 @@ callers like `review.ps1` that set it).
 **The consequence to internalize: the 31b exists on exactly ONE host, and that host is a
 laptop.** If the MBP is asleep there is no 31b anywhere — review and long-context work have
 no home, and the honest fallback is `gemma4:12b-nvfp4` on the always-on mini (or
-`coder7k:latest` locally) with a note in your reply that you dropped a tier. Never silently
+your small local model — e.g. `qwen2.5-coder:14b` on a constrained Windows box) with a
+note in your reply that you dropped a tier. Never silently
 substitute.
 
 **CF Access tokens are per-application.** The `ollama-mbp-cf-access/*` pair reaches only the
@@ -97,7 +98,8 @@ for the model to reply with, and Ollama then truncates the *input* silently.
 
 `gemma4:31b-nvfp4` is thinking-capable (`/api/show` lists `thinking`). Send
 **`think:false`** for review and delegation work — with thinking on, the generation is
-spent in the `thinking` field and the response comes back empty. `coder7k:latest` has
+spent in the `thinking` field and the response comes back empty. A small local
+coder like `qwen2.5-coder:14b` has
 no thinking support at all; the server strips a `think:true` it can't honor and says so.
 
 ## keep_alive: which tags stay resident
@@ -128,8 +130,11 @@ pin at most one tag per host.
 The 31B does not fit locally on TSDPUR012 / TSLPUR110, and the gemma4 tags are
 macOS/MLX builds that cannot even be pulled on Windows (`ollama pull` → 412). The
 allowlist is overridden per machine via `AI_TOOLS_OLLAMA_MODELS` with a small local
-model first — `coder7k:latest` — so short mechanical calls run on-device and anything
-naming a remote tag misses the local probe and falls through the endpoint chain. Keep
+model first — the one you actually pulled, e.g. `qwen2.5-coder:14b` per the README's
+Windows setup (`AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,gemma4:12b-nvfp4,gemma4:31b-nvfp4`)
+— so short mechanical calls run on-device and anything naming a remote tag misses the
+local probe and falls through the endpoint chain. Whatever tag you put first MUST be one
+`ollama list` shows locally, or implicit calls skip it and go remote. Keep
 `think:false` on these boxes and expect ~4–8 tok/s from a dense 12–14B q4.
 
 See the `local-delegate-routing` skill for which model to force per task type.
