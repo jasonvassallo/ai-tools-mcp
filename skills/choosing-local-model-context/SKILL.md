@@ -77,6 +77,11 @@ advertised maximum.
 Tokens ≈ characters ÷ 3.5 for code, ÷ 4 for prose. Budget = prompt + inlined files +
 expected answer + thinking tokens (if `think:true`, add 1–4k).
 
+The `~28k` and `~60k` figures below are **conservative safety thresholds, not the host
+limits** (those are 32k on the mini and 64k on the MBP). The gap is deliberate headroom
+for the answer plus any thinking — a prompt sized right up to the window leaves nothing
+for the model to reply with, and Ollama then truncates the *input* silently.
+
 - **≤ ~28k tokens** → anything works. Most delegations live here: a few files, a
   summary, boilerplate, a focused review.
 - **~28k–60k** → `gemma4:31b-nvfp4` on the MBP, whose host default is 64k. Multi-file
