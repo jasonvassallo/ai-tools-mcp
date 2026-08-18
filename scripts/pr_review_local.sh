@@ -6,7 +6,7 @@
 #
 #   scripts/pr_review_local.sh <pr_url> [review|describe|improve|ask "..."]
 #
-# qwen3.6 is a *thinking* model that runs away on pr-agent's single structured
+# gemma4:31b (like the qwen3.6 it replaced) is a *thinking* model that runs away on pr-agent's single structured
 # review call (timed out at 120s and 600s). pr-agent strips Ollama's `think:false`
 # from its config, so this script stands up a tiny local proxy that injects
 # `think:false` into every Ollama request (torn down on exit). Thinking-off makes
@@ -63,7 +63,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 data = json.loads(body)
                 if isinstance(data, dict):
-                    data["think"] = False  # force qwen3 thinking OFF
+                    data["think"] = False  # force thinking OFF (gemma4/qwen are thinking models)
                     # Guard: a caller-sent non-dict "options" (null, list)
                     # must not crash the injector.
                     if not isinstance(data.get("options"), dict):

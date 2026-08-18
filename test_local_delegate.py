@@ -1050,7 +1050,7 @@ class TestThinkingModelAdvisory(unittest.TestCase):
         note = (
             "Note: default model gemma4:12b-nvfp4 is not served by any "
             "reachable endpoint checked before localhost; using "
-            "qwen2.5-coder:14b (localhost) instead.\n\n"
+            "qwen3.8:27b-nvfp4 (localhost) instead.\n\n"
         )
         out, fake = self._delegate(
             {"prompt": "hi", "think": True},

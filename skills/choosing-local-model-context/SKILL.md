@@ -113,7 +113,7 @@ model first — `coder7k:latest` — so short mechanical calls run on-device and
 naming a remote tag misses the local probe and falls through the endpoint chain. Keep
 `think:false` on these boxes and expect ~4–8 tok/s from a dense 12–14B q4.
 
-See [[local-delegate-routing]] for which model to force per task type.
+See the `local-delegate-routing` skill for which model to force per task type.
 
 ## When a call fails on length
 
