@@ -654,7 +654,7 @@ class TestDelegateDefaultModel(unittest.TestCase):
             )
 
     def test_allowlisted_env_override_honored(self):
-        tag = "qwen3.6:35b-a3b-coding-nvfp4-32k"
+        tag = "qwen3.8:27b-nvfp4"
         with mock.patch.dict(os.environ, {"AI_TOOLS_OLLAMA_DEFAULT_MODEL": tag}):
             self.assertEqual(mcp_server._delegate_default_model(), tag)
 
@@ -811,7 +811,7 @@ class TestResolveImplicitModel(unittest.TestCase):
     EP1 = "http://localhost:11434"
     EP2 = "http://127.0.0.1:11435"
     DEFAULT = "gemma4:12b-nvfp4"
-    QWEN = "qwen3.6:35b-a3b-coding-nvfp4"
+    QWEN = "qwen3.8:27b-nvfp4"
 
     def setUp(self):
         mcp_server._ollama_endpoint_cache.clear()
@@ -857,7 +857,7 @@ class TestResolveImplicitModel(unittest.TestCase):
         client = _FakeTagsClient(tags_by_url={self.EP1: [], self.EP2: [self.QWEN]})
         model, endpoint, note = self._resolve(client)
         self.assertEqual((model, endpoint), (self.QWEN, self.EP2))
-        self.assertIn("using qwen3.6:35b-a3b-coding-nvfp4", note)
+        self.assertIn("using qwen3.8:27b-nvfp4", note)
 
     def test_nothing_served_anywhere_raises(self):
         client = _FakeTagsClient(tags_by_url={self.EP1: [], self.EP2: []})
@@ -1317,7 +1317,7 @@ class TestLocalDelegateValidation(unittest.TestCase):
 
     def test_model_not_in_allowlist(self):
         out = _call("local_delegate", {"prompt": "x", "model": "llama3:8b"})
-        self.assertIn("qwen3.6:35b-a3b-coding-nvfp4", out[0].text)
+        self.assertIn("qwen3.8:27b-nvfp4", out[0].text)
 
     def test_think_must_be_bool(self):
         out = _call("local_delegate", {"prompt": "x", "think": "yes"})
@@ -1415,7 +1415,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call(
                 "local_delegate",
-                {"prompt": "p", "model": "qwen3.6:35b-a3b-coding-nvfp4"},
+                {"prompt": "p", "model": "qwen3.8:27b-nvfp4"},
             )
         payload, _ = fake.call_args.args
         self.assertEqual(payload["keep_alive"], "0")
@@ -1427,7 +1427,7 @@ class TestLocalDelegateSync(unittest.TestCase):
                 "local_delegate",
                 {
                     "prompt": "p",
-                    "model": "qwen3.6:35b-a3b-coding-nvfp4-64k",
+                    "model": "qwen3.8:27b-nvfp4",
                     "keep_alive": "5m",
                 },
             )
@@ -1465,7 +1465,7 @@ class TestLocalDelegateSync(unittest.TestCase):
                     "think": True,
                     "keep_alive": "0",
                     "timeout_s": 600,
-                    "model": "qwen3.6:35b-a3b-coding-nvfp4-256k",
+                    "model": "qwen3.8:27b-nvfp4",
                 },
             )
         payload, timeout_s = fake.call_args.args
@@ -1475,7 +1475,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         self.assertEqual(payload["messages"][1], {"role": "user", "content": "p"})
         self.assertIs(payload["think"], True)
         self.assertEqual(payload["keep_alive"], "0")
-        self.assertEqual(payload["model"], "qwen3.6:35b-a3b-coding-nvfp4-256k")
+        self.assertEqual(payload["model"], "qwen3.8:27b-nvfp4")
         self.assertEqual(timeout_s, 600.0)
 
     def test_failure_envelope_reaches_caller(self):
@@ -1529,7 +1529,7 @@ class TestLocalDelegateBackground(unittest.TestCase):
                 "local_delegate",
                 {
                     "prompt": "p",
-                    "model": "qwen3.6:35b-a3b-coding-nvfp4",
+                    "model": "qwen3.8:27b-nvfp4",
                     "background": True,
                 },
             )
@@ -2079,6 +2079,15 @@ class TestModelAllowlistOverride(unittest.TestCase):
                 mcp_server._resolve_delegate_models(),
                 mcp_server._OLLAMA_BUILTIN_DELEGATE_MODELS,
             )
+
+    def test_builtin_allowlist_reflects_installed_fleet(self):
+        models = mcp_server._OLLAMA_BUILTIN_DELEGATE_MODELS
+        self.assertIn("gemma4:12b-nvfp4", models)
+        self.assertIn("gemma4:31b-nvfp4", models)
+        self.assertIn("qwen3.8:27b-nvfp4", models)
+        for m in models:
+            self.assertNotIn("qwen3.6", m, f"retired tag still allowlisted: {m}")
+        self.assertEqual(models[0], "gemma4:12b-nvfp4")  # default preserved
 
 
 if __name__ == "__main__":

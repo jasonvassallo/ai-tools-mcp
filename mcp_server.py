@@ -7,6 +7,7 @@
 #     "httpx>=0.27",
 #     "google-auth>=2.30",
 #     "requests>=2.31",
+#     "pathspec>=0.12",
 #     # transitive floors per pip-audit 2026-07-07 (starlette, python-multipart,
 #     # pyjwt, cryptography, pydantic-settings, idna)
 #     "starlette>=1.3.1",
@@ -1589,11 +1590,9 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # over long inputs (both scored 0.33 on that task).
 _OLLAMA_MODELS_ENV_VAR = "AI_TOOLS_OLLAMA_MODELS"
 _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
-    "gemma4:12b-nvfp4",
-    "qwen3.6:35b-a3b-coding-nvfp4",
-    "qwen3.6:35b-a3b-coding-nvfp4-32k",
-    "qwen3.6:35b-a3b-coding-nvfp4-64k",
-    "qwen3.6:35b-a3b-coding-nvfp4-256k",
+    "gemma4:12b-nvfp4",  # local_delegate default; cli-updates gate; Signal
+    "gemma4:31b-nvfp4",  # JVMBPro review/delegate default; coding_agent
+    "qwen3.8:27b-nvfp4",  # coding-assistant role (Qwen Code CLI)
 )
 
 
