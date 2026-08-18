@@ -147,10 +147,14 @@ only one of them:
   or mid-code-block. Underneath, Ollama reported `done_reason: length` — but
   `local_delegate` returns only `message.content` and **discards `done_reason` and
   `eval_count`**, so through this tool you can only infer it from the shape of the text.
-  (Calling Ollama directly, e.g. `review.ps1`, you can read those fields.) This is
-  `num_predict`, not the window; a bigger host changes nothing. Ask for a shorter
-  answer, split the task, or reduce `think` — `local_delegate` exposes no `num_predict`
-  either. Surfacing `done_reason` in the tool's response would make this diagnosable
-  instead of guessed; that is a code change, not a doc one.
+  (Calling Ollama directly, e.g. `review.ps1`, you can read those fields.) Note
+  `done_reason: length` is ambiguous on its own: it fires when the `num_predict` cap is
+  hit AND when the *remaining* context budget runs out mid-generation. Disambiguate by
+  the prompt size — a small prompt that stops early is `num_predict` (a bigger host
+  changes nothing: ask for a shorter answer, split the task, or reduce `think`); a
+  prompt near the host's window that stops early is the context budget, and belongs in
+  the bullet above. `local_delegate` exposes no `num_predict` either. Surfacing
+  `done_reason` in the tool's response would make this diagnosable instead of guessed;
+  that is a code change, not a doc one.
 
 Never trim the user's input to force a fit without saying so.
