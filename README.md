@@ -79,7 +79,7 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Latency: seconds-to-minutes, synchronous by default, or pass `background=true` to get a `job_id` and poll `local_delegate_result`
 - Privacy: **input stays on your machines** — on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API; nothing written to disk; jobs are in-memory and single-collect
 - `think`: off by default (faster); set `true` only for reasoning-heavy asks
-- `keep_alive`: omitted, qwen tags default to `'0'` (unload after the call — mitigates a measured cross-task contamination bug where a resident qwen runner returns other prompts' answers on repeat calls; pass e.g. `'5m'` to deliberately keep one warm) while other models inherit the server's `OLLAMA_KEEP_ALIVE`
+- `keep_alive`: omitted, qwen tags default to `'0'`, and any `'0'` on a qwen tag (defaulted or explicit) also **evicts the runner before the call** — the mitigation for a measured cross-task contamination bug where a resident qwen runner returns other prompts' answers on repeat calls; the post-response TTL alone cannot protect the request carrying it. A failed eviction is surfaced as a warning banner on the answer and a one-line stderr record. Pass e.g. `'5m'` to deliberately keep one warm (skips the protection); other models inherit the server's `OLLAMA_KEEP_ALIVE`
 
 Together these complement Claude's built-in `WebSearch`: use `WebSearch` for
 quick lookups, `deep_research` for thorough inline investigation,

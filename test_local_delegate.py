@@ -19,8 +19,10 @@ import contextlib
 import importlib.util
 import io
 import json
+import logging
 import os
 import sys
+import threading
 import time
 import types
 import unittest
@@ -351,7 +353,9 @@ class TestOllamaAuthHeaders(unittest.TestCase):
             with mock.patch.object(
                 mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
             ):
-                out = asyncio.run(mcp_server._post_ollama_chat({"model": _MODEL}, 30.0))
+                out, _ = asyncio.run(
+                    mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
+                )
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("sec-456", out["error"])
 
@@ -382,7 +386,9 @@ class TestOllamaAuthHeaders(unittest.TestCase):
             with mock.patch.object(
                 mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
             ):
-                out = asyncio.run(mcp_server._post_ollama_chat({"model": _MODEL}, 30.0))
+                out, _ = asyncio.run(
+                    mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
+                )
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("sec-456", out["error"])
         self.assertIn("[REDACTED_CF_ACCESS]", out["error"])
@@ -416,7 +422,9 @@ class TestOllamaAuthHeaders(unittest.TestCase):
             with mock.patch.object(
                 mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
             ):
-                out = asyncio.run(mcp_server._post_ollama_chat({"model": _MODEL}, 30.0))
+                out, _ = asyncio.run(
+                    mcp_server._post_ollama_chat({"model": _MODEL}, 30.0)
+                )
         self.assertEqual(out["status"], "failed")
         self.assertNotIn("sec-456", out["error"])
         self.assertNotIn("sec-4", out["error"])
@@ -431,10 +439,14 @@ class TestPostOllamaChat(unittest.TestCase):
         )
 
     def _post(self, client, payload=None, timeout_s=300.0):
+        # The eviction warning is out of band; these tests are about the
+        # body, and an unprotected call never has a warning to carry.
         with _with_client(client):
-            return asyncio.run(
+            data, warning = asyncio.run(
                 mcp_server._post_ollama_chat(payload or {"model": "m"}, timeout_s)
             )
+        self.assertEqual(warning, "")
+        return data
 
     def test_happy_path_posts_to_api_chat_with_timeout(self):
         client = _FakeClient(
@@ -951,7 +963,7 @@ class TestThinkingModelAdvisory(unittest.TestCase):
 
     def _delegate(self, args, caps, post=None, resolved="gemma4:12b-nvfp4", note=""):
         fake = post or mock.AsyncMock(
-            return_value={"model": resolved, "message": {"content": "ok"}}
+            return_value=({"model": resolved, "message": {"content": "ok"}}, "")
         )
         r1, r2, r3 = self._env(caps, resolved=resolved, note=note)
         with r1, r2, r3, mock.patch.object(mcp_server, "_post_ollama_chat", fake):
@@ -987,7 +999,10 @@ class TestThinkingModelAdvisory(unittest.TestCase):
 
     def test_think_false_never_consults_capabilities(self):
         fake = mock.AsyncMock(
-            return_value={"model": "gemma4:12b-nvfp4", "message": {"content": "ok"}}
+            return_value=(
+                {"model": "gemma4:12b-nvfp4", "message": {"content": "ok"}},
+                "",
+            )
         )
         caps = mock.AsyncMock(return_value=self.THINKING)
         r1, _, _ = self._env(self.THINKING)
@@ -1013,7 +1028,10 @@ class TestThinkingModelAdvisory(unittest.TestCase):
 
     def test_explicit_model_bypasses_implicit_resolver(self):
         fake = mock.AsyncMock(
-            return_value={"model": "gemma4:12b-nvfp4", "message": {"content": "ok"}}
+            return_value=(
+                {"model": "gemma4:12b-nvfp4", "message": {"content": "ok"}},
+                "",
+            )
         )
         resolver = mock.AsyncMock()
         with (
@@ -1152,17 +1170,17 @@ class TestDelegateJobs(unittest.TestCase):
 
             async def fake_post(payload, timeout_s, pre_unload=False):
                 await gate.wait()
-                return {"message": {"content": "done!"}}
+                return {"message": {"content": "done!"}}, ""
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
                 job_id = mcp_server._start_delegate_job({"model": "m"})
-                running = mcp_server._collect_delegate_job(job_id)
+                running, _ = mcp_server._collect_delegate_job(job_id)
                 self.assertEqual(running["status"], "running")
                 self.assertIsInstance(running["elapsed_s"], int)
                 gate.set()
                 task = mcp_server._delegate_jobs[job_id]["task"]
                 await _settle(task.done)  # let the wait_for-wrapped task finish
-                done = mcp_server._collect_delegate_job(job_id)
+                done, _ = mcp_server._collect_delegate_job(job_id)
                 self.assertEqual(done["message"]["content"], "done!")
                 with self.assertRaises(ValueError):
                     mcp_server._collect_delegate_job(job_id)  # single-collect
@@ -1175,7 +1193,7 @@ class TestDelegateJobs(unittest.TestCase):
 
             async def fake_post(payload, timeout_s, pre_unload=False):
                 await gate.wait()
-                return {}
+                return {}, ""
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
                 ids = [mcp_server._start_delegate_job({}) for _ in range(4)]
@@ -1210,9 +1228,12 @@ class TestDelegateJobs(unittest.TestCase):
                 with mock.patch.object(mcp_server, "_DELEGATE_BG_CEILING_S", 0.01):
                     job_id = mcp_server._start_delegate_job({})
                     await asyncio.sleep(0.05)
-                    out = mcp_server._collect_delegate_job(job_id)
+                    out, warning = mcp_server._collect_delegate_job(job_id)
                     self.assertEqual(out["status"], "failed")
                     self.assertIn("ceiling", out["error"])
+                    # No eviction result exists for a job cancelled before it
+                    # ever returned one.
+                    self.assertEqual(warning, "")
 
         asyncio.run(scenario())
 
@@ -1224,7 +1245,7 @@ class TestDelegateJobs(unittest.TestCase):
         # the newest window — instead of growing unboundedly.
         async def scenario():
             async def fake_post(payload, timeout_s, pre_unload=False):
-                return {"message": {"content": "done"}}
+                return {"message": {"content": "done"}}, ""
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
                 with mock.patch.object(mcp_server, "_DELEGATE_DONE_RETAINED", 3):
@@ -1267,7 +1288,7 @@ class TestDelegateJobs(unittest.TestCase):
             }
 
             async def fake_post(payload, timeout_s, pre_unload=False):
-                return {"message": {"content": "done"}}
+                return {"message": {"content": "done"}}, ""
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
                 with mock.patch.object(mcp_server, "_DELEGATE_DONE_RETAINED", 0):
@@ -1371,7 +1392,9 @@ class TestLocalDelegateSync(unittest.TestCase):
         _stub_resolution(self)
 
     def test_payload_construction_defaults(self):
-        fake = mock.AsyncMock(return_value={"model": "m", "message": {"content": "ok"}})
+        fake = mock.AsyncMock(
+            return_value=({"model": "m", "message": {"content": "ok"}}, "")
+        )
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             out = _call("local_delegate", {"prompt": "do the thing"})
         payload, timeout_s = fake.call_args.args
@@ -1411,7 +1434,7 @@ class TestLocalDelegateSync(unittest.TestCase):
     def test_qwen_defaults_keep_alive_zero(self):
         # Contamination mitigation: a resident qwen runner returns other
         # prompts' answers on repeat calls; omitted keep_alive → "0".
-        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        fake = mock.AsyncMock(return_value=({"message": {"content": "ok"}}, ""))
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call(
                 "local_delegate",
@@ -1421,7 +1444,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         self.assertEqual(payload["keep_alive"], "0")
 
     def test_qwen_explicit_keep_alive_wins_over_default(self):
-        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        fake = mock.AsyncMock(return_value=({"message": {"content": "ok"}}, ""))
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call(
                 "local_delegate",
@@ -1437,7 +1460,7 @@ class TestLocalDelegateSync(unittest.TestCase):
     def test_implicitly_resolved_qwen_gets_keep_alive_zero(self):
         # The qwen default must key off the FINAL model: an omitted-model call
         # resolves via _resolve_implicit_model, which may pick a qwen tag.
-        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        fake = mock.AsyncMock(return_value=({"message": {"content": "ok"}}, ""))
         resolver = mock.AsyncMock(
             return_value=(
                 "qwen3.6:35b-a3b-coding-nvfp4",
@@ -1460,7 +1483,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         # keep_alive:0 call landing on an already-resident dirty qwen runner
         # is contaminated at the same rate as an unprotected one. The
         # eviction is what puts the call on a fresh runner.
-        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        fake = mock.AsyncMock(return_value=({"message": {"content": "ok"}}, ""))
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call(
                 "local_delegate",
@@ -1476,7 +1499,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         # unprotected (Codex P1 + Gemini, PR #65). Explicit non-zero values
         # still opt out so deliberate warm-pinning works.
         for ka, expect_pre_unload in (("5m", False), ("0", True), ("1h", False)):
-            fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+            fake = mock.AsyncMock(return_value=({"message": {"content": "ok"}}, ""))
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
                 _call(
                     "local_delegate",
@@ -1494,7 +1517,7 @@ class TestLocalDelegateSync(unittest.TestCase):
 
     def test_explicit_zero_on_non_qwen_stays_unprotected(self):
         # The zero TTL alone must not trigger an eviction on an immune model.
-        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        fake = mock.AsyncMock(return_value=({"message": {"content": "ok"}}, ""))
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call(
                 "local_delegate",
@@ -1505,13 +1528,13 @@ class TestLocalDelegateSync(unittest.TestCase):
     def test_non_qwen_model_gets_no_pre_unload(self):
         # gemma is immune to the contamination (0/141 lifetime) — it must not
         # pay a reload it does not need.
-        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        fake = mock.AsyncMock(return_value=({"message": {"content": "ok"}}, ""))
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call("local_delegate", {"prompt": "p", "model": "gemma4:12b-nvfp4"})
         self.assertFalse(fake.call_args.kwargs["pre_unload"])
 
     def test_payload_with_system_think_keepalive_timeout(self):
-        fake = mock.AsyncMock(return_value={"message": {"content": "ok"}})
+        fake = mock.AsyncMock(return_value=({"message": {"content": "ok"}}, ""))
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             _call(
                 "local_delegate",
@@ -1535,7 +1558,7 @@ class TestLocalDelegateSync(unittest.TestCase):
         self.assertEqual(timeout_s, 600.0)
 
     def test_failure_envelope_reaches_caller(self):
-        fake = mock.AsyncMock(return_value={"status": "failed", "error": "down"})
+        fake = mock.AsyncMock(return_value=({"status": "failed", "error": "down"}, ""))
         with mock.patch.object(mcp_server, "_post_ollama_chat", fake):
             out = _call("local_delegate", {"prompt": "p"})
         self.assertIn("down", out[0].text)
@@ -1552,7 +1575,7 @@ class TestLocalDelegateBackground(unittest.TestCase):
 
             async def fake_post(payload, timeout_s, pre_unload=False):
                 await gate.wait()
-                return {"model": "m", "message": {"content": "bg answer"}}
+                return {"model": "m", "message": {"content": "bg answer"}}, ""
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
                 started = await mcp_server.call_tool(
@@ -1601,7 +1624,7 @@ class TestLocalDelegateBackground(unittest.TestCase):
 
             async def fake_post(payload, timeout_s, pre_unload=False):
                 await gate.wait()
-                return {}
+                return {}, ""
 
             with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
                 ids = []
@@ -1642,8 +1665,65 @@ class TestEvictOllamaRunner(unittest.TestCase):
     """
 
     _EP = "http://127.0.0.1:11434"
+    _LOG = "ai_tools_mcp.delegate.evict"
+
+    def setUp(self):
+        # _evict_stats is module-global and the *_total assertions below are
+        # absolute, so every test starts from a known count.
+        mcp_server._evict_stats.update(ok=0, absent=0, failed=0)
+        # Captured BEFORE the mute below, because one test needs the handler
+        # that really writes in order to prove where the write happens.
+        self._real_handlers = list(mcp_server._evict_log.handlers)
+        # Mute the module's real stderr handler for the duration of each test:
+        # it is the production channel, and letting it fire here interleaves
+        # warning lines with unittest's own output. It must be a NullHandler
+        # rather than an empty list — with no handlers AND propagate=False,
+        # logging falls back to its lastResort handler, which writes to
+        # stderr anyway. assertLogs/assertNoLogs swap logger.handlers
+        # wholesale, so the assertions below are unaffected either way.
+        muted = mock.patch.object(
+            mcp_server._evict_log, "handlers", [logging.NullHandler()]
+        )
+        muted.start()
+        self.addCleanup(muted.stop)
+
+    @staticmethod
+    def _stderr_sink(handler):
+        """The handler that actually writes: with a queue in front, the
+        listener's; without one, the handler itself."""
+        listener = getattr(handler, "listener", None)
+        return handler if listener is None else listener.handlers[0]
+
+    @staticmethod
+    def _unloaded():
+        """What a REAL eviction answers: 200, done_reason "unload" — the same
+        shape a PULLED-but-not-resident tag returns for its ~22 ms no-op. An
+        UN-PULLED tag answers 404 instead; see the 404 test below."""
+        return _FakeResponse(json_data={"done_reason": "unload"})
+
+    def _client(self, evict=None, chat=None):
+        """Two-leg fake: the eviction and the chat answer differently, which
+        the single-response _FakeClient cannot express. Pass an Exception as
+        `evict` to make that leg raise."""
+        evict = self._unloaded() if evict is None else evict
+        chat = _FakeResponse(json_data={"ok": True}) if chat is None else chat
+
+        class _TwoLeg:
+            def __init__(self):
+                self.calls: list = []
+
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                resp = evict if url.endswith("/api/generate") else chat
+                if isinstance(resp, Exception):
+                    raise resp
+                return resp
+
+        return _TwoLeg()
 
     def _run_chat(self, client, pre_unload):
+        """Returns the (body, evict_warning) pair _post_ollama_chat hands
+        back. The warning rides BESIDE the body, never inside it."""
         with (
             mock.patch.object(
                 mcp_server,
@@ -1658,10 +1738,26 @@ class TestEvictOllamaRunner(unittest.TestCase):
                 )
             )
 
+    def _remote_auth(self, headers):
+        """Patch selection + credentials onto a remote Access-gated host."""
+        return (
+            mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value="https://remote.example"),
+            ),
+            mock.patch.object(
+                mcp_server, "_ollama_auth_headers", mock.Mock(return_value=headers)
+            ),
+        )
+
     def test_evicts_before_the_chat_on_the_same_endpoint(self):
-        client = _FakeClient(response=_FakeResponse(json_data={"ok": True}))
-        out = self._run_chat(client, pre_unload=True)
+        client = self._client()
+        out, warning = self._run_chat(client, pre_unload=True)
+        # A PROVEN eviction annotates nothing: the body is byte-identical to
+        # the pre-change one and there is no warning to carry.
         self.assertEqual(out, {"ok": True})
+        self.assertEqual(warning, "")
         urls = [url for url, _ in client.calls]
         # Order is the whole point: evicting AFTER the chat would be the
         # no-op this change exists to fix.
@@ -1681,20 +1777,24 @@ class TestEvictOllamaRunner(unittest.TestCase):
     def test_eviction_failure_never_fails_the_callers_request(self):
         # A wedged/absent eviction must degrade to today's behaviour, not
         # turn a working delegate call into an error.
-        class _FailFirst:
-            def __init__(self):
-                self.calls: list = []
-
-            async def post(self, url, **kwargs):
-                self.calls.append((url, kwargs))
-                if url.endswith("/api/generate"):
-                    raise mcp_server.httpx.ConnectError("refused")
-                return _FakeResponse(json_data={"ok": True})
-
-        client = _FailFirst()
-        out = self._run_chat(client, pre_unload=True)
-        self.assertEqual(out, {"ok": True})
+        client = self._client(evict=mcp_server.httpx.ConnectError("refused"))
+        out, warning = self._run_chat(client, pre_unload=True)
+        self.assertEqual(out["ok"], True)
         self.assertEqual(len(client.calls), 2)
+        # ...but it is no longer SILENT.
+        self.assertTrue(warning)
+
+    def test_transport_failure_is_reported(self):
+        # The connection never landed, so nothing was evicted — and the class
+        # name is the whole reason string: no exception TEXT, which on a
+        # request error can echo the URL and its userinfo.
+        _, warning = self._run_chat(
+            self._client(evict=mcp_server.httpx.ConnectError("refused")),
+            pre_unload=True,
+        )
+        self.assertIn("request failed", warning)
+        self.assertIn("ConnectError", warning)
+        self.assertNotIn("refused", warning)
 
     def test_eviction_is_bounded_by_the_callers_timeout(self):
         # timeout_s is the documented ceiling for the whole delegate call, so
@@ -1731,7 +1831,7 @@ class TestEvictOllamaRunner(unittest.TestCase):
             ),
             _with_client(client),
         ):
-            asyncio.run(
+            _, warning = asyncio.run(
                 mcp_server._post_ollama_chat({"model": _MODEL}, 1.0, pre_unload=True)
             )
         # timeout_s=1 cannot afford an eviction on top of the chat's slice, so
@@ -1740,6 +1840,9 @@ class TestEvictOllamaRunner(unittest.TestCase):
         chat_timeout = client.calls[0][1]["timeout"]
         self.assertGreater(chat_timeout, 0.0)
         self.assertLessEqual(chat_timeout, 1.0)
+        # A skipped eviction leaves the call just as unprotected as a failed
+        # one, so it is reported the same way rather than passing for success.
+        self.assertIn("skipped", warning)
 
     def test_total_budget_is_bounded_by_the_callers_timeout(self):
         # The regression CodeRabbit asked for: a SLOW eviction must not let
@@ -1817,33 +1920,24 @@ class TestEvictOllamaRunner(unittest.TestCase):
             ),
             _with_client(client),
         ):
-            out = asyncio.run(
+            out, warning = asyncio.run(
                 mcp_server._post_ollama_chat({"model": _MODEL}, 30.0, pre_unload=True)
             )
         elapsed = time.monotonic() - started
         # Cut off near the 0.3s budget, nowhere near the 60s hang...
         self.assertLess(elapsed, 5.0)
-        # ...and the caller's real request still went out and succeeded.
-        self.assertEqual(out, {"ok": True})
+        # ...and the caller's real request still went out and succeeded...
+        self.assertEqual(out["ok"], True)
         self.assertEqual(client.calls[-1][0], f"{self._EP}/api/chat")
+        # ...while the cut-off eviction is reported, not swallowed.
+        self.assertIn("timed out", warning)
 
     def test_eviction_carries_the_same_auth_headers_as_the_chat(self):
         # A remote Access-gated endpoint would 403 the eviction — and a
         # silently-403ing eviction is an unprotected call that looks fine.
         client = _FakeClient(response=_FakeResponse(json_data={"ok": True}))
-        with (
-            mock.patch.object(
-                mcp_server,
-                "_select_ollama_endpoint",
-                mock.AsyncMock(return_value="https://remote.example"),
-            ),
-            mock.patch.object(
-                mcp_server,
-                "_ollama_auth_headers",
-                mock.Mock(return_value={"CF-Access-Client-Id": "id-123"}),
-            ),
-            _with_client(client),
-        ):
+        select, auth = self._remote_auth({"CF-Access-Client-Id": "id-123"})
+        with select, auth, _with_client(client):
             asyncio.run(
                 mcp_server._post_ollama_chat({"model": _MODEL}, 30.0, pre_unload=True)
             )
@@ -1851,6 +1945,528 @@ class TestEvictOllamaRunner(unittest.TestCase):
         chat_headers = client.calls[1][1]["headers"]
         self.assertEqual(evict_headers, chat_headers)
         self.assertEqual(evict_headers["CF-Access-Client-Id"], "id-123")
+
+    def test_rejected_eviction_is_reported_not_swallowed(self):
+        # The live-demonstrated failure: a host that 403s /api/generate (stale
+        # Access token) and 200s /api/chat used to hand back a clean answer
+        # with no sign the protection never ran. A 5xx is the same silent
+        # class. (404 has its own meaning; see the un-pulled-tag test.)
+        for code in (403, 500):
+            with self.subTest(code=code):
+                client = self._client(
+                    evict=_FakeResponse(json_data={}, status_code=code)
+                )
+                out, warning = self._run_chat(client, pre_unload=True)
+                self.assertEqual(out["ok"], True)
+                self.assertIn(str(code), warning)
+
+    def test_an_unpulled_tag_is_named_not_dressed_up_as_a_broken_mitigation(self):
+        # Measured twice on Ollama 0.32.7: an UN-PULLED tag answers HTTP 404
+        # {"error":"model ... not found"} — NOT the 200/done_reason:"unload"
+        # no-op a pulled-but-not-resident tag gives. Nothing was resident, so
+        # nothing could be contaminated, and the chat that follows fails on
+        # its own 404. Still reported (a proxy can 404 /api/generate while
+        # serving /api/chat), but as an operating condition rather than a
+        # broken mitigation an operator has to go chase.
+        client = self._client(evict=_FakeResponse(json_data={}, status_code=404))
+        with self.assertLogs(self._LOG, level="INFO") as logs:
+            out, warning = self._run_chat(client, pre_unload=True)
+        self.assertEqual(out["ok"], True)
+        self.assertIn("not pulled", warning)
+        line = logs.output[0]
+        self.assertTrue(line.startswith("INFO:"), msg=line)
+        self.assertIn("result=NO-RUNNER", line)
+        self.assertEqual(mcp_server._evict_stats["absent"], 1)
+        self.assertEqual(mcp_server._evict_stats["failed"], 0)
+
+    def test_two_hundred_that_did_not_unload_is_reported(self):
+        # The subtlest case: HTTP 200, well-formed body, but the runner is
+        # still resident. Only the body distinguishes it from a real eviction.
+        _, warning = self._run_chat(
+            self._client(evict=_FakeResponse(json_data={"done_reason": "stop"})),
+            pre_unload=True,
+        )
+        self.assertIn("stop", warning)
+
+    def test_non_json_eviction_body_is_reported(self):
+        _, warning = self._run_chat(
+            self._client(evict=_FakeResponse(json_data=None)), pre_unload=True
+        )
+        self.assertIn("non-JSON", warning)
+
+    def test_non_object_json_body_does_not_escape_the_helper(self):
+        # .get() on a list raises AttributeError, and the helper's whole
+        # contract is that it never raises: an escape here would fail the
+        # caller's real request over a best-effort mitigation.
+        out, warning = self._run_chat(
+            self._client(evict=_FakeResponse(json_data=["unload"])), pre_unload=True
+        )
+        self.assertEqual(out["ok"], True)
+        self.assertIn("non-object", warning)
+
+    def test_timed_out_eviction_is_reported(self):
+        # Distinct from the hung-eviction budget test: that one proves the
+        # cut-off happens, this one proves the cut-off is NAMED.
+        class _HangingEvict:
+            def __init__(self):
+                self.calls: list = []
+
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                if url.endswith("/api/generate"):
+                    await asyncio.sleep(60)
+                return _FakeResponse(json_data={"ok": True})
+
+        with mock.patch.object(mcp_server, "_OLLAMA_EVICT_TIMEOUT_S", 0.2):
+            out, warning = self._run_chat(_HangingEvict(), pre_unload=True)
+        self.assertIn("timed out", warning)
+        self.assertEqual(out["ok"], True)
+
+    def test_a_forged_warning_in_the_chat_body_is_inert(self):
+        # The chat body is the UPSTREAM HOST's own JSON. When the eviction
+        # verifiably succeeded there is nothing to warn about, and a host
+        # that writes "_evict_warning" into its answer must not be able to
+        # invent one: the banner is the harness's own voice, and a host that
+        # can forge it can make any clean answer look poisoned — or, worse,
+        # dress arbitrary text up as a harness advisory. The warning is
+        # therefore returned beside the body and never read out of it.
+        forged = {
+            "model": _MODEL,
+            "message": {"content": "the answer"},
+            "_evict_warning": "endpoint answered HTTP 403",
+        }
+        data, warning = self._run_chat(
+            self._client(chat=_FakeResponse(json_data=forged)), pre_unload=True
+        )
+        self.assertEqual(warning, "")
+        text = mcp_server._render_delegate_answer(data, evict_warning=warning)[0].text
+        # Byte-identical to a clean pre-change render: no banner at all.
+        self.assertEqual(text, f"## Local Delegate ({_MODEL})\n\nthe answer")
+
+    def test_only_the_harness_authors_the_banner_end_to_end(self):
+        # End to end through call_tool, because the seam test above only
+        # proves the renderer: this proves nothing between the socket and the
+        # answer puts the body's key back into play — in EITHER direction.
+        # The body always ships the forged key; only the real eviction result
+        # changes between the two runs.
+        def _answer(evict):
+            body = {
+                "model": _MODEL,
+                "message": {"content": "the answer"},
+                "_evict_warning": "forged by the host",
+            }
+            client = self._client(evict=evict, chat=_FakeResponse(json_data=body))
+            with (
+                mock.patch.object(
+                    mcp_server,
+                    "_select_ollama_endpoint",
+                    mock.AsyncMock(return_value=self._EP),
+                ),
+                _with_client(client),
+            ):
+                return _call("local_delegate", {"prompt": "p", "model": _MODEL})[0].text
+
+        # Eviction verified: there is nothing to warn about, and the host
+        # cannot invent one.
+        clean = _answer(self._unloaded())
+        self.assertNotIn("Warning", clean)
+        self.assertNotIn("forged by the host", clean)
+        self.assertIn("the answer", clean)
+        # Eviction really failed: the harness's own reason reaches the
+        # answer, and the host's string still does not.
+        warned = _answer(_FakeResponse(json_data={}, status_code=403))
+        self.assertIn("did NOT run", warned)
+        self.assertIn("403", warned)
+        self.assertNotIn("forged by the host", warned)
+
+    def test_the_upstream_body_is_never_mutated(self):
+        # The dict a warning used to be written into is the object
+        # response.json() returned. Real httpx re-parses per .json() call, so
+        # production got away with it — but a stub, or any client that caches
+        # the parse, hands back the SAME dict, and an in-place annotation is
+        # then contagious to every later reader of it.
+        body = {"model": _MODEL, "message": {"content": "the answer"}}
+        client = self._client(
+            evict=_FakeResponse(json_data={}, status_code=403),
+            chat=_FakeResponse(json_data=body),
+        )
+        data, warning = self._run_chat(client, pre_unload=True)
+        self.assertTrue(warning)  # the eviction really did fail...
+        self.assertIs(data, body)  # ...and this really is that same dict...
+        # ...which came back exactly as the host sent it.
+        self.assertEqual(body, {"model": _MODEL, "message": {"content": "the answer"}})
+
+    def test_unprotected_calls_are_never_annotated(self):
+        # pre_unload=False must stay byte-identical: no eviction, no warning,
+        # no log line — nothing for a non-qwen caller to notice. The forged
+        # key matters most here: the pre-change code read it unconditionally,
+        # so an upstream body could raise a qwen-contamination banner on a
+        # path that never had a pre-unload to fail in the first place.
+        forged = {
+            "model": _MODEL,
+            "message": {"content": "the answer"},
+            "_evict_warning": "endpoint answered HTTP 403",
+        }
+        client = self._client(
+            evict=_FakeResponse(json_data={}, status_code=403),
+            chat=_FakeResponse(json_data=forged),
+        )
+        with self.assertNoLogs(self._LOG):
+            data, warning = self._run_chat(client, pre_unload=False)
+        self.assertEqual([url for url, _ in client.calls], [f"{self._EP}/api/chat"])
+        self.assertEqual(warning, "")
+        self.assertEqual(mcp_server._evict_stats, {"ok": 0, "absent": 0, "failed": 0})
+        text = mcp_server._render_delegate_answer(data, evict_warning=warning)[0].text
+        self.assertEqual(text, f"## Local Delegate ({_MODEL})\n\nthe answer")
+
+    def test_skipped_eviction_is_reported_too(self):
+        # timeout_s=1 cannot afford an eviction, so the call runs
+        # unprotected — the same state a failed eviction leaves, and it says so.
+        client = self._client()
+        with (
+            mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value=self._EP),
+            ),
+            _with_client(client),
+            self.assertLogs(self._LOG, level="WARNING") as logs,
+        ):
+            _, warning = asyncio.run(
+                mcp_server._post_ollama_chat({"model": _MODEL}, 1.0, pre_unload=True)
+            )
+        # No eviction was even attempted...
+        self.assertEqual([url for url, _ in client.calls], [f"{self._EP}/api/chat"])
+        # ...and both channels say so.
+        self.assertIn("skipped", warning)
+        self.assertIn("ollama-preunload", logs.output[0])
+        self.assertIn("result=FAILED", logs.output[0])
+
+    def test_eviction_never_raises_out_of_the_helper(self):
+        # Constraint 1: whatever the endpoint does, the helper returns an
+        # outcome. Every arm it declares is exercised here, so a future edit
+        # that drops one fails rather than escaping into the caller.
+        cases = [
+            ("verified unload", _FakeResponse(json_data={"done_reason": "unload"})),
+            ("200 but resident", _FakeResponse(json_data={"done_reason": "stop"})),
+            ("non-JSON body", _FakeResponse(json_data=None)),
+            ("non-object JSON body", _FakeResponse(json_data=["unload"])),
+            ("HTTP 500", _FakeResponse(json_data={}, status_code=500)),
+            ("HTTP 404", _FakeResponse(json_data={}, status_code=404)),
+            ("connect error", mcp_server.httpx.ConnectError("refused")),
+            ("request error", mcp_server.httpx.RequestError("boom")),
+            (
+                "status error carrying a response",
+                mcp_server.httpx.HTTPStatusError(
+                    "boom",
+                    request=None,
+                    response=_FakeResponse(json_data={}, status_code=503),
+                ),
+            ),
+            # httpx builds these WITH a response, but nothing here guarantees
+            # the instance this arm catches has one — and reading
+            # exc.response.status_code off a response-less error would raise
+            # AttributeError straight out of the never-raises helper, making
+            # "never raises" conditional on someone else's constructor.
+            (
+                "status error with no response",
+                mcp_server.httpx.HTTPStatusError("boom", request=None, response=None),
+            ),
+        ]
+        for label, case in cases:
+            with self.subTest(case=label):
+                client = self._client(evict=case)
+                result = asyncio.run(
+                    mcp_server._evict_ollama_runner(client, self._EP, _MODEL, {}, 5.0)
+                )
+                self.assertIsInstance(result, mcp_server._EvictOutcome)
+                self.assertIsInstance(result.reason, str)
+
+    def test_warning_never_carries_header_values(self):
+        # The eviction sends Cloudflare Access service tokens; neither a 403
+        # whose BODY echoes them nor a 200 whose done_reason IS one may turn
+        # the call's own credentials into output — on the warning, the
+        # rendered answer, or the log line.
+        secret = "sec-456"
+        evictions = [
+            _FakeResponse(
+                json_data={},
+                status_code=403,
+                text=f"CF-Access-Client-Secret: {secret}",
+            ),
+            # The remote-controlled fragment: done_reason is echoed into the
+            # reason string, so a hostile/misconfigured body is the one way a
+            # header value could round-trip back out.
+            _FakeResponse(json_data={"done_reason": secret}),
+        ]
+        for evict in evictions:
+            with self.subTest(status=evict.status_code):
+                client = self._client(
+                    evict=evict,
+                    chat=_FakeResponse(
+                        json_data={
+                            "model": _MODEL,
+                            "message": {"content": "the answer"},
+                        }
+                    ),
+                )
+                select, auth = self._remote_auth(
+                    {
+                        "CF-Access-Client-Id": "id-123",
+                        "CF-Access-Client-Secret": secret,
+                    }
+                )
+                with (
+                    select,
+                    auth,
+                    _with_client(client),
+                    self.assertLogs(self._LOG, level="WARNING") as logs,
+                ):
+                    data, warning = asyncio.run(
+                        mcp_server._post_ollama_chat(
+                            {"model": _MODEL}, 30.0, pre_unload=True
+                        )
+                    )
+                rendered = mcp_server._render_delegate_answer(
+                    data, evict_warning=warning
+                )[0].text
+                for surface in (warning, rendered, "\n".join(logs.output)):
+                    self.assertNotIn(secret, surface)
+                    self.assertNotIn("id-123", surface)
+
+    def test_a_long_done_reason_is_capped(self):
+        # done_reason is remote-controlled and lands on BOTH surfaces:
+        # uncapped, a hostile host writes as much as it likes into the
+        # operator's log line and onto the answer the caller reads.
+        _, warning = self._run_chat(
+            self._client(evict=_FakeResponse(json_data={"done_reason": "z" * 5000})),
+            pre_unload=True,
+        )
+        self.assertLess(len(warning), 100)
+        self.assertNotIn("z" * 60, warning)
+
+    def test_done_reason_is_scrubbed_before_it_is_capped(self):
+        # The straddle: 35 filler chars then the secret, so the 40-char cap
+        # cuts through it. Scrub-then-cap redacts the whole value first and
+        # the cap only ever sees "[REDA…". Cap-then-scrub has nothing left to
+        # match the full value against and leaves "sec-4" in the clear —
+        # exactly the ordering bug the /api/chat body scrub guards at 500.
+        secret = "sec-456-and-more"
+        client = self._client(
+            evict=_FakeResponse(json_data={"done_reason": "a" * 35 + secret})
+        )
+        select, auth = self._remote_auth({"CF-Access-Client-Secret": secret})
+        with select, auth, _with_client(client):
+            _, warning = asyncio.run(
+                mcp_server._post_ollama_chat({"model": _MODEL}, 30.0, pre_unload=True)
+            )
+        self.assertNotIn(secret, warning)
+        self.assertNotIn("sec-4", warning)
+
+    def test_failed_eviction_is_logged_even_when_the_chat_fails(self):
+        # The case the banner CANNOT cover, and the whole reason the record is
+        # written at eviction time: the chat fails, so the caller gets a bare
+        # error. The stderr line is then the only surviving evidence that the
+        # mitigation is broken.
+        client = self._client(
+            evict=_FakeResponse(json_data={}, status_code=403),
+            chat=_FakeResponse(json_data={}, status_code=500),
+        )
+        with self.assertLogs(self._LOG, level="WARNING") as logs:
+            out, _ = self._run_chat(client, pre_unload=True)
+        self.assertEqual(out["status"], "failed")
+        self.assertIn("ollama-preunload", logs.output[0])
+        self.assertIn("result=FAILED", logs.output[0])
+        self.assertIn("403", logs.output[0])
+
+    def test_verified_unload_logs_ok(self):
+        with self.assertLogs(self._LOG, level="INFO") as logs:
+            self._run_chat(self._client(), pre_unload=True)
+        line = logs.output[0]
+        self.assertIn("ollama-preunload", line)
+        self.assertIn("result=OK", line)
+        self.assertIn("ok_total=1", line)
+        self.assertIn("fail_total=0", line)
+        # A localhost endpoint is named as such rather than echoed, so the
+        # log never becomes a place a remote URL's userinfo could land.
+        self.assertIn("endpoint=localhost", line)
+
+    def test_running_totals_count_every_outcome_class(self):
+        # One line in a log nobody greps is easy to miss; the running totals
+        # are what turn a mitigation that has been broken for weeks into
+        # something visible on any single later call.
+        self._run_chat(self._client(), pre_unload=True)
+        self._run_chat(
+            self._client(evict=_FakeResponse(json_data={}, status_code=404)),
+            pre_unload=True,
+        )
+        with self.assertLogs(self._LOG, level="WARNING") as logs:
+            self._run_chat(
+                self._client(evict=_FakeResponse(json_data={}, status_code=403)),
+                pre_unload=True,
+            )
+        self.assertEqual(mcp_server._evict_stats, {"ok": 1, "absent": 1, "failed": 1})
+        # ...and the line an operator actually reads carries all three.
+        line = logs.output[0]
+        self.assertIn("ok_total=1", line)
+        self.assertIn("absent_total=1", line)
+        self.assertIn("fail_total=1", line)
+
+    def test_log_line_is_single_line(self):
+        # The host writes one JSON record per stderr LINE, so a newline in
+        # the message silently fragments the record into unparseable halves.
+        with self.assertLogs(self._LOG, level="INFO") as logs:
+            self._run_chat(
+                self._client(evict=_FakeResponse(json_data={"done_reason": "a\nb"})),
+                pre_unload=True,
+            )
+        for record in logs.records:
+            self.assertNotIn("\n", record.getMessage())
+
+    def test_the_stderr_write_never_happens_on_the_calling_thread(self):
+        # This is called from the asyncio event loop. A StreamHandler
+        # write+flush into a stderr pipe the host has stopped draining blocks
+        # the WHOLE loop — every other MCP request with it — for as long as
+        # the pipe stays full, outside every timeout this module sets. With a
+        # queue in front, emit() is an enqueue and the block lands on the
+        # listener's thread instead. Driven through the module's REAL handler
+        # chain (restored for this test only), not a stand-in for it.
+        release = threading.Event()
+        self.addCleanup(release.set)
+        seen = threading.Event()
+
+        def _blocking_emit(record):
+            release.wait(1.5)
+            seen.set()
+
+        self.assertTrue(self._real_handlers, "module handler chain missing")
+        handler = self._real_handlers[0]
+        sink = self._stderr_sink(handler)
+        with (
+            mock.patch.object(mcp_server._evict_log, "handlers", [handler]),
+            mock.patch.object(sink, "emit", _blocking_emit),
+        ):
+            started = time.monotonic()
+            self._run_chat(
+                self._client(evict=_FakeResponse(json_data={}, status_code=403)),
+                pre_unload=True,
+            )
+            elapsed = time.monotonic() - started
+            # Let the blocked sink finish inside the patch, so the real
+            # handler never gets the record and never writes to stderr.
+            release.set()
+            seen.wait(2.0)
+        # The record really did reach the sink — otherwise "fast" would only
+        # mean nothing was logged at all.
+        self.assertTrue(seen.is_set())
+        self.assertLess(elapsed, 0.5)
+
+
+class TestEvictLoggerSetup(unittest.TestCase):
+    """stdout is the MCP protocol stream, so this logger has to stay on
+    stderr — including when it already exists. logging.getLogger() is
+    process-global, so "we got here first" is not something this module can
+    assume."""
+
+    _LOG = "ai_tools_mcp.delegate.evict"
+
+    def test_a_preconfigured_logger_is_still_isolated_from_the_root(self):
+        log = logging.getLogger(self._LOG)
+        saved_handlers = list(log.handlers)
+        saved_propagate = log.propagate
+        saved_level = log.level
+
+        def _restore():
+            log.handlers[:] = saved_handlers
+            log.propagate = saved_propagate
+            log.setLevel(saved_level)
+
+        self.addCleanup(_restore)
+        # A host, the SDK, or an earlier import of this module got here
+        # first, so the "no handlers yet" guard will skip. Anything that
+        # sheltered inside that guard skips with it — and propagate is the
+        # dangerous half: left True, every record also climbs to the root
+        # logger, whose handlers this module does not own and one of which
+        # may write to stdout, i.e. into the protocol stream.
+        log.handlers[:] = [logging.NullHandler()]
+        log.propagate = True
+        log.setLevel(logging.CRITICAL)
+        _load_mcp_server()
+        self.assertFalse(log.propagate)
+        self.assertEqual(log.level, logging.INFO)
+
+
+class TestEvictWarningSurfacing(unittest.TestCase):
+    """A signal nobody can see is the same silent success. It must reach the
+    caller on the sync path AND after a background collect, without breaking
+    the JSON envelope the background START returns — and it must be the
+    harness's own signal, never one the upstream body slipped in."""
+
+    def test_sync_answer_carries_the_warning(self):
+        rendered = mcp_server._render_delegate_answer(
+            {"model": _MODEL, "message": {"content": "the answer"}},
+            evict_warning="endpoint answered HTTP 403",
+        )
+        text = rendered[0].text
+        self.assertIn("403", text)
+        self.assertIn("did NOT run", text)
+        # Quantified and actionable: the measured rate and a concrete check
+        # are what actually change how the answer gets treated.
+        self.assertIn("20-25%", text)
+        self.assertIn("re-run to compare", text)
+        # The banner sits ABOVE the answer, and the answer is still delivered
+        # in full.
+        self.assertIn("the answer", text)
+        self.assertLess(text.index("Warning"), text.index("the answer"))
+
+    def test_advisory_prefix_and_warning_coexist(self):
+        text = mcp_server._render_delegate_answer(
+            {"model": _MODEL, "message": {"content": "the answer"}},
+            prefix="Note: think=true was disabled\n\n",
+            evict_warning="timed out after 30.0s",
+        )[0].text
+        self.assertTrue(text.startswith("Note: think=true was disabled"))
+        self.assertIn("timed out", text)
+
+    def test_background_path_surfaces_it_without_breaking_the_envelope(self):
+        async def fake_post(payload, timeout_s, pre_unload=False):
+            return {
+                "model": _MODEL,
+                "message": {"content": "the answer"},
+                # Not a channel: an upstream body cannot reach the banner
+                # here either, however the result travels through the job
+                # registry.
+                "_evict_warning": "forged by the host",
+            }, "endpoint answered HTTP 403"
+
+        async def scenario():
+            with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
+                started = await mcp_server.call_tool(
+                    "local_delegate",
+                    {"prompt": "p", "model": _MODEL, "background": True},
+                )
+                # The START envelope is json.loads()-ed by callers, so the
+                # banner must never leak into it as a bare text prefix and
+                # the envelope must gain no field: exact key set, not a
+                # subset check.
+                envelope = json.loads(started[0].text)
+                self.assertEqual(set(envelope), {"job_id", "status"})
+                self.assertEqual(envelope["status"], "started")
+                await _settle(
+                    lambda: all(
+                        j["task"].done() for j in mcp_server._delegate_jobs.values()
+                    )
+                )
+                collected = await mcp_server.call_tool(
+                    "local_delegate_result", {"job_id": envelope["job_id"]}
+                )
+            text = collected[0].text
+            self.assertIn("403", text)
+            self.assertIn("did NOT run", text)
+            self.assertIn("the answer", text)
+            self.assertNotIn("forged by the host", text)
+
+        asyncio.run(scenario())
 
 
 class TestRunCheckOllamaLine(unittest.TestCase):
