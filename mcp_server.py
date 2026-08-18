@@ -1597,7 +1597,10 @@ _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "gemma4:12b-nvfp4",
     # 2026-08-17: the qwen3.6 tags were removed from the endpoint. There are no
     # per-context-window tag variants any more -- both remaining large tags
-    # advertise context_length 262144, but local_delegate sends no options.num_ctx,
+    # advertise context_length 262144 (verified via /api/show on ollama-mbp
+    # 2026-08-18: gemma4.context_length=262144, qwen3_5.context_length=262144;
+    # this is the model's advertised window, NOT a quality benchmark -- qwen3.8
+    # remains unbenchmarked here), but local_delegate sends no options.num_ctx,
     # so a call runs at the serving host's OLLAMA_CONTEXT_LENGTH (64k on JVMBPro,
     # 32k on jvmacmini). gemma4:31b is the reviewer/long-context tier (kept warm on the
     # MBP); qwen3.8:27b is the surviving qwen-family tag, still subject to the
