@@ -13,12 +13,15 @@ no `-32k`, no `-64k`, no `-256k`.
 
 **And there is no `num_ctx` knob on `local_delegate` either.** Verified against
 `mcp_server.py` (2026-08-18, Greptile + gemma4 review finding, confirmed by grep): the
-tool's request carries `model`, `messages`, `think`, `keep_alive` and nothing else — no
-`options` block, so `options.num_ctx` is never sent. **Every `local_delegate` call runs at
+tool's request carries `model`, `messages`, `think`, `stream: false` and (conditionally)
+`keep_alive`, and nothing else — no `options` block, so `options.num_ctx` is never sent. **Every `local_delegate` call runs at
 the serving host's default window** (`OLLAMA_CONTEXT_LENGTH` on that Ollama server — the
 tool description states it: 64k on JVMBPro, 32k on jvmacmini). The window is chosen by
-the *operator on the host*, not by the caller per request. (`review.ps1` is different: it
-calls Ollama directly and does set `options.num_ctx`.)
+the *operator on the host*, not by the caller per request. Two OTHER tools do set
+`options.num_ctx` themselves, and neither is `local_delegate`: `scripts/pr_review_local.sh`
+in this repo pins a **16384 floor** (`PR_AGENT_NUM_CTX`) with no diff-based sizing; and
+`review.ps1` — which lives in `~\.ollama-qodo\`, NOT in this repository — auto-sizes to the
+diff (capped 262144, `LargeCutoffKB=150`).
 
 Both endpoints were probed directly on 2026-08-17. **They do not serve the same
 things**, and that is the routing fact that matters:
@@ -53,11 +56,16 @@ wrong twice. Query `/api/tags` (creds in Credential Manager) rather than believi
 ## The one fact that changes the math
 
 With flash attention + q8_0 KV quantization (how every host here runs), the KV cache
-**grows with tokens actually used, not with the window size**. A 5k-token task on a
-host configured for 262144 costs the same RAM as on one configured for 32768. The
-window is a *cap*, not a preallocation. So there is no per-call memory reason to prefer
-a smaller-window host — pick the host by whether the prompt FITS its window and whether
-it is awake.
+**grows with tokens actually used, not with the window size** — a 5k-token task on a
+host configured for 262144 costs about the same RAM as on one configured for 32768. So
+for a *small* prompt there is no per-call memory reason to prefer a smaller-window host.
+
+But the configured window is still a **memory constraint at the host level**, not a free
+setting: it bounds the *peak* KV cache the host must be able to reach, and Ollama's
+`OLLAMA_NUM_PARALLEL` multiplies that. This repo's own history recorded the old `-256k`
+tag needing several GB of KV cache. So: pick the host by whether the prompt FITS its
+window and whether it is awake; and if you are the one raising `OLLAMA_CONTEXT_LENGTH`
+on a host, size it to that host's memory, not to the model's advertised maximum.
 
 ## Sizing rule of thumb
 
@@ -70,8 +78,9 @@ expected answer + thinking tokens (if `think:true`, add 1–4k).
   context, long diffs, big log analysis. Will NOT fit the mini's 32k.
 - **> ~60k** → does not fit `local_delegate` at all today (no per-request window; the
   MBP host default is 64k). Either raise `OLLAMA_CONTEXT_LENGTH` on the MBP's Ollama —
-  the model advertises 262144 — or route the job through `review.ps1`, which sets
-  `options.num_ctx` itself (auto-sized to the diff, capped 262144, `LargeCutoffKB=150`).
+  the model advertises 262144 — or route the job through `~\.ollama-qodo\review.ps1`
+  (outside this repo), which sets `options.num_ctx` itself, auto-sized to the diff.
+  `scripts/pr_review_local.sh` here does NOT help: it pins `num_ctx` at 16384.
   Do not tell a caller to "raise num_ctx" on `local_delegate`; the parameter does not exist.
 
 ## think flag
@@ -117,8 +126,16 @@ See the `local-delegate-routing` skill for which model to force per task type.
 
 ## When a call fails on length
 
-If Ollama returns a context-length error or the output is silently truncated, the
-prompt exceeded the serving host's window. `local_delegate` cannot raise it per call:
-move the job to the larger-window host (MBP 64k over the mini's 32k), raise
-`OLLAMA_CONTEXT_LENGTH` on that host, or use `review.ps1` — and never trim the user's
-input to force a fit without saying so.
+Two different failures look alike from the outside, and moving to a bigger host fixes
+only one of them:
+
+- **Context-window overflow** — Ollama returns a context-length error, or the prompt is
+  silently truncated at the *input* side. `local_delegate` cannot raise the window per
+  call: move the job to the larger-window host (MBP 64k over the mini's 32k), raise
+  `OLLAMA_CONTEXT_LENGTH` on that host, or use `~\.ollama-qodo\review.ps1`.
+- **Generation-limit truncation** — the *output* stops early with `done_reason: length`
+  (check `done_reason` / `eval_count` in the response). That is `num_predict`, not the
+  window; a bigger host changes nothing. Ask for a shorter answer, split the task, or
+  reduce `think` — `local_delegate` exposes no `num_predict` either.
+
+Never trim the user's input to force a fit without saying so.
