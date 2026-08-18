@@ -1986,8 +1986,79 @@ async def _model_capabilities(endpoint: str, model: str) -> frozenset[str] | Non
     return result
 
 
+# An eviction is a control-plane call, not inference: it either drops a
+# resident runner or no-ops. Bounded well under the delegate timeout so a
+# wedged Ollama cannot stall the caller's real request behind it.
+_OLLAMA_EVICT_TIMEOUT_S = 30.0
+
+# Whatever the eviction costs, the chat still gets a usable slice: a caller
+# timeout consumed entirely by a pathological eviction would turn a working
+# call into an instant timeout, which is worse than the contamination.
+_OLLAMA_MIN_CHAT_TIMEOUT_S = 5.0
+
+
+async def _evict_ollama_runner(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    model: str,
+    headers: dict[str, str],
+    timeout_s: float,
+) -> None:
+    """Best-effort: drop `model`'s resident runner before a protected call.
+
+    `keep_alive` is a POST-*response* TTL, so `keep_alive:"0"` does not
+    protect the request that carries it: a protected call landing on an
+    already-resident, already-dirty qwen runner is exposed to exactly the
+    cross-task contamination that default exists to prevent. Measured on
+    JVMBPro 2026-08-08 (Ollama 0.32.6, q8_0 KV, OLLAMA_KEEP_ALIVE=-1) —
+    see the benchmark note in _KEEP_ALIVE_ZERO_MODEL_PREFIXES' comment.
+    Evicting first is what actually puts the call on a fresh runner.
+
+    Empty prompt + keep_alive 0 is Ollama's documented unload idiom, and on
+    an ABSENT model it is a measured 22 ms no-op that returns
+    done_reason:"unload" without loading anything. So in the steady state —
+    where the qwen keep_alive default already unloads after every call —
+    this costs a round trip and no reload. A reload (~2.5 s warm page cache)
+    is paid only when another client had warmed the model, which is exactly
+    the exposed case.
+
+    Concurrency: with Ollama's num_parallel=1 generation is serialized and a
+    busy runner is refcounted, so an eviction from one background delegate
+    job should not abort another's in-flight generation — but that
+    interaction was NOT measured here, and overlapping background qwen jobs
+    may cost each other a reload.
+
+    Bounded by `timeout_s` in WALL CLOCK, via asyncio.wait_for. httpx's
+    float timeout is per-phase — connect, write, read and pool each get that
+    value — so passing it alone would let a pathological eviction overshoot
+    and erode the caller's total budget that the pre_unload path reserves
+    against (CodeRabbit MINOR on 4a46cc2). The httpx timeout is kept as the
+    inner per-phase bound; wait_for is the outer total.
+
+    Never raises. A failed OR timed-out eviction leaves exactly today's
+    behaviour; it must not turn into a failure of the caller's real request.
+    """
+    try:
+        await asyncio.wait_for(
+            client.post(
+                f"{endpoint}/api/generate",
+                json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
+                headers=headers,
+                timeout=timeout_s,
+            ),
+            timeout=timeout_s,
+        )
+    except (
+        httpx.RequestError,
+        httpx.HTTPStatusError,
+        ValueError,
+        asyncio.TimeoutError,
+    ):
+        return
+
+
 async def _post_ollama_chat(
-    payload: dict[str, Any], timeout_s: float
+    payload: dict[str, Any], timeout_s: float, pre_unload: bool = False
 ) -> dict[str, Any]:
     """POST /api/chat to the first chain endpoint serving payload['model'].
 
@@ -2010,6 +2081,26 @@ async def _post_ollama_chat(
             "error": f"no credentials for {redact_secrets(endpoint)}",
         }
     client = await _get_http_client()
+    # Here, not at the call site: this is the one place that has resolved
+    # the endpoint, so the eviction and the chat provably hit the SAME host
+    # (no second resolution that could drift), and both the sync and the
+    # background delegate paths route through it.
+    if pre_unload:
+        # timeout_s is the documented ceiling for the WHOLE delegate call, so
+        # the chat's minimum slice is reserved up front rather than restored
+        # afterwards. Restoring a floor after the fact hands back budget the
+        # eviction already spent, which lets the total reach ~2x the caller's
+        # ceiling on small timeouts (CodeRabbit MAJOR, reproduced at
+        # timeout_s=1). Reserving first makes the sum bounded by construction.
+        chat_reserve = min(_OLLAMA_MIN_CHAT_TIMEOUT_S, timeout_s)
+        evict_budget = min(_OLLAMA_EVICT_TIMEOUT_S, timeout_s - chat_reserve)
+        # A budget too small to afford an eviction skips it and runs
+        # unprotected rather than overrunning. Moot in practice: no qwen tag
+        # completes a generation in the seconds that implies.
+        if evict_budget > 0:
+            started = time.monotonic()
+            await _evict_ollama_runner(client, endpoint, model, headers, evict_budget)
+            timeout_s = max(chat_reserve, timeout_s - (time.monotonic() - started))
     try:
         response = await client.post(
             f"{endpoint}/api/chat", json=payload, headers=headers, timeout=timeout_s
@@ -2100,7 +2191,7 @@ def _render_delegate_answer(
 _delegate_jobs: dict[str, dict[str, Any]] = {}
 
 
-def _start_delegate_job(payload: dict[str, Any]) -> str:
+def _start_delegate_job(payload: dict[str, Any], pre_unload: bool = False) -> str:
     """Launch a background delegate call; return its job id.
 
     Raises ValueError when _DELEGATE_JOB_CAP jobs are already running —
@@ -2141,7 +2232,7 @@ def _start_delegate_job(payload: dict[str, Any]) -> str:
         )
     job_id = uuid.uuid4().hex
     coro = asyncio.wait_for(
-        _post_ollama_chat(payload, _DELEGATE_BG_CEILING_S),
+        _post_ollama_chat(payload, _DELEGATE_BG_CEILING_S, pre_unload=pre_unload),
         timeout=_DELEGATE_BG_CEILING_S,
     )
     _delegate_jobs[job_id] = {
@@ -2503,7 +2594,15 @@ async def list_tools() -> list[Tool]:
                     "timeout_s": {
                         "type": "integer",
                         "default": 300,
-                        "description": "Sync timeout in seconds (1-600).",
+                        "description": (
+                            "Sync timeout in seconds (1-600). The qwen "
+                            "contamination pre-unload is wall-clock bounded and "
+                            "deducted from this budget; at 5s or less it is "
+                            "skipped rather than allowed to eat it, so such a "
+                            "call runs unprotected. Note httpx applies the "
+                            "remainder per network phase, so this is a phase "
+                            "bound rather than a hard total."
+                        ),
                     },
                 },
                 "required": ["prompt"],
@@ -3108,8 +3207,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # After final model resolution (implicit calls may have re-resolved
         # `model` above): qwen tags default to keep_alive "0" — the proven
         # repeat-call contamination mitigation. Explicit caller values win.
+        #
+        # The pre-unload follows the EFFECTIVE zero TTL, not how it was
+        # chosen. Gating it on "we applied the default" left the repo's own
+        # documented route unprotected: commands/local-delegate.md tells
+        # callers to pass keep_alive="0" for long-context qwen work, so the
+        # most likely qwen caller opted itself out of the very protection
+        # this exists to provide (Codex P1 + Gemini, PR #65, both confirmed
+        # against that file). An explicit NON-zero value still opts out —
+        # deliberate warm-pinning stays possible.
         if keep_alive is None and _keep_alive_zero_default_applies(model):
             keep_alive = "0"
+        pre_unload = keep_alive == "0" and _keep_alive_zero_default_applies(model)
 
         messages: list[dict[str, str]] = []
         if system:
@@ -3126,7 +3235,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if background:
             try:
-                job_id = _start_delegate_job(payload)
+                job_id = _start_delegate_job(payload, pre_unload=pre_unload)
             except ValueError as exc:
                 return [TextContent(type="text", text=f"Error: {exc}")]
             # Carried as a JSON field, NOT prepended: this envelope is
@@ -3141,7 +3250,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             ]
 
-        data = await _post_ollama_chat(payload, float(timeout_s))
+        data = await _post_ollama_chat(payload, float(timeout_s), pre_unload=pre_unload)
         return _render_delegate_answer(data, prefix=advisory)
 
     if name == "local_delegate_result":
