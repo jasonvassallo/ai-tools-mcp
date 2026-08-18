@@ -87,8 +87,9 @@ for the model to reply with, and Ollama then truncates the *input* silently.
   summary, boilerplate, a focused review.
 - **~28k–60k** → `gemma4:31b-nvfp4` on the MBP, whose host default is 64k. Multi-file
   context, long diffs, big log analysis. Will NOT fit the mini's 32k.
-- **> ~60k** → does not fit `local_delegate` at all today (no per-request window; the
-  MBP host default is 64k). Either raise `OLLAMA_CONTEXT_LENGTH` on the MBP's Ollama —
+- **> ~60k** → does not fit `local_delegate` safely at the current host defaults (no
+  per-request window; the MBP host default is 64k) — the tool itself is not the limit, the
+  host's `OLLAMA_CONTEXT_LENGTH` is. Either raise `OLLAMA_CONTEXT_LENGTH` on the MBP's Ollama —
   the model advertises 262144 — or route the job through `~\.ollama-qodo\review.ps1`
   (outside this repo), which sets `options.num_ctx` itself, auto-sized to the diff.
   `scripts/pr_review_local.sh` here does NOT help: it pins `num_ctx` at 16384.
