@@ -2579,13 +2579,19 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                         "description": (
                             "Enable the model's thinking mode. Off by default "
-                            "for speed; enable for reasoning-heavy asks. Every "
-                            "built-in allowlist tag reports the 'thinking' "
-                            "capability; if an overridden tag does not, the "
-                            "server disables the flag and prefixes an advisory "
-                            "instead of letting Ollama reject the call. Note "
-                            "qwen thinking can consume the whole output budget "
-                            "on large inputs and return no answer at all."
+                            "for speed. KEEP IT OFF for the gemma4 tags "
+                            "(including the gemma4:31b-nvfp4 reviewer): with "
+                            "thinking on they put the generation in "
+                            "message.thinking, which this tool discards, so the "
+                            "call returns 'Error: Ollama returned no content'. "
+                            "Enable it only on a model whose content you have "
+                            "confirmed survives it. Every built-in allowlist tag "
+                            "reports the 'thinking' capability; if an overridden "
+                            "tag does not, the server disables the flag and "
+                            "prefixes an advisory instead of letting Ollama "
+                            "reject the call. Qwen thinking can likewise consume "
+                            "the whole output budget on large inputs and return "
+                            "no answer at all."
                         ),
                     },
                     "background": {

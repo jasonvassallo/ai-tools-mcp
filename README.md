@@ -78,7 +78,7 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Purpose: privacy / quota offload / second opinion / background jobs
 - Latency: seconds-to-minutes, synchronous by default, or pass `background=true` to get a `job_id` and poll `local_delegate_result`
 - Privacy: **input stays on your machines** — on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API; nothing written to disk; jobs are in-memory and single-collect
-- `think`: off by default (faster); set `true` only for reasoning-heavy asks
+- `think`: off by default (faster). Keep it off for the gemma4 tags — with thinking on they put the generation in `message.thinking`, which the tool discards, so the call returns "Error: Ollama returned no content"; enable it only on a model whose content you have confirmed survives it
 - `keep_alive`: omitted, qwen tags default to `'0'` (unload after the call — mitigates a measured cross-task contamination bug where a resident qwen runner returns other prompts' answers on repeat calls; pass e.g. `'5m'` to deliberately keep one warm) while other models inherit the server's `OLLAMA_KEEP_ALIVE`
 
 Together these complement Claude's built-in `WebSearch`: use `WebSearch` for
