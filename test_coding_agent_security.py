@@ -26,7 +26,7 @@ import unittest.mock
 from pathlib import Path
 
 from coding_agent import walk as walkmod
-from coding_agent.basetree import BaseTree
+from coding_agent.basetree import BaseTree, make_ignore, read_base_tree
 from coding_agent.walk import (
     DiffResult,
     Entry,
@@ -1316,6 +1316,275 @@ class UnreadablePathsReachTheHuman(unittest.TestCase):
         d = _diff(_base(), snap)
         self.assertEqual(_starting(d.text, "--- "), [])
         self.assertEqual(_starting(d.text, "+++ "), [])
+        for line in d.text.splitlines():
+            self.assertTrue(line == "" or line.startswith("coding_agent:"), repr(line))
+
+
+def _apply_check(repo: Path, patch_text: str) -> tuple[int, str]:
+    """`git apply --check --numstat` of a patch against a REAL repository.
+
+    The point of this feature is that the emitted text is a patch a human may
+    act on, so "is this a valid, applicable deletion?" has exactly one honest
+    answer: ask git. Returns (rc, numstat stdout).
+    """
+    patch = repo.parent / "emitted.patch"
+    patch.write_text(patch_text, encoding="utf-8", errors="surrogateescape")
+    proc = subprocess.run(
+        ["git", "apply", "--check", "--numstat", str(patch)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=False,  # a REFUSED patch is a valid answer, not an error
+    )
+    return proc.returncode, proc.stdout
+
+
+class UnreadablePathsAreNeverRenderedAsDeletions(unittest.TestCase):
+    """MF-1, final review 2026-08-19. THE regression this class exists for.
+
+    `unified_diff` compares `base ∪ snapshot` and rendered base-present /
+    snapshot-absent as `deleted file mode`. That was sound until the pass-6
+    read caps landed: a path is now also absent when the walk REFUSED to read
+    it. The result was a diff that made affirmatively false statements about
+    files nobody touched, and — for text content — an APPLICABLE patch:
+
+        9 MiB untouched tracked file -> 1,887,436-line removal hunk,
+        `git apply --check` rc = 0, and the model's real one-line edit pushed
+        out of the returned window by the size cap.
+
+    Adversarially, 33 sparse files created in 0.00s and 164 KB of real disk
+    drained the 256 MiB snapshot budget and converted 37 of 40 tracked files
+    into deletions that did not happen — the gate being blinded, which is the
+    single failure this whole design exists to prevent (§6.5: over-showing is
+    noise, UNDER-showing is the danger).
+
+    Both directions are pinned here. Suppressing the deletion is only half a
+    fix if a GENUINE deletion stops rendering too.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(
+            ["git", "-C", str(self.repo), "init", "-q", "-b", "main"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.email", "t@e.com"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "T"], check=True
+        )
+
+    def _commit_and_copy(self) -> tuple[BaseTree, Path]:
+        """Commit the repo, then hand back a `.git`-less COPY to walk.
+
+        Separate directories, as in production: git only ever runs against the
+        repo, and only the copy is ever walked or modified.
+        """
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-q", "-m", "base"], check=True
+        )
+        work = self.root / "work"
+        shutil.copytree(
+            self.repo, work, symlinks=True, ignore=shutil.ignore_patterns(".git")
+        )
+        return read_base_tree(str(self.repo), "HEAD"), work
+
+    def _diff_of(self, base: BaseTree, work: Path, max_bytes: int = 512 * 1024):
+        snap = snapshot_tree(str(work), make_ignore(base))
+        spill = self.root / "spill"
+        spill.mkdir(exist_ok=True)
+        return snap, unified_diff(base, snap, max_bytes=max_bytes, spill_dir=str(spill))
+
+    # -- the non-adversarial trigger: any tracked file over _MAX_FILE_BYTES --
+
+    def test_an_oversize_untouched_tracked_file_is_not_reported_as_deleted(self):
+        (self.repo / "small.py").write_text("x = 1\n")
+        (self.repo / "big.txt").write_text("line\n" * (9 * 1024 * 1024 // 5))
+        base, work = self._commit_and_copy()
+        (work / "small.py").write_text("x = 2\n")
+
+        snap, d = self._diff_of(base, work)
+
+        # The walk really did refuse it — otherwise this test proves nothing.
+        self.assertEqual(
+            [(u.path, u.reason) for u in snap.unreadable], [("big.txt", "OVERSIZE")]
+        )
+        self.assertNotIn("big.txt", snap.entries)
+        # ...and the diff does not call that a deletion.
+        self.assertNotIn("deleted file mode", d.text)
+        self.assertNotIn("--- a/big.txt", d.text)
+        # The path is still CONSPICUOUS — twice, and marked as not-a-deletion.
+        self.assertIn("NOT COMPARED", d.text)
+        self.assertIn("NOT deleted", d.text)
+        # The HEAD block's own marker, asserted on that line specifically: it
+        # is what separates "a committed file I cannot compare" from "the
+        # model made something I cannot read", and a reader who sees a tracked
+        # path listed as unreadable and finds no section below has to be told
+        # which reading is true.
+        head = [
+            ln for ln in d.text.splitlines() if ln.startswith('coding_agent:   "big')
+        ]
+        self.assertEqual(len(head), 1, d.text)
+        self.assertIn("tracked in the base tree", head[0])
+        # And the model's real edit is back in the returned window: before the
+        # fix, 1.9 million removal hunks displaced it entirely.
+        self.assertIn("+x = 2", d.text)
+        self.assertFalse(d.truncated)
+
+    def test_the_emitted_patch_cannot_delete_an_unreadable_file(self):
+        """`git apply --check` is the only honest answer to "would this
+        really delete it?" — and before the fix the answer was yes, rc=0."""
+        (self.repo / "small.py").write_text("x = 1\n")
+        (self.repo / "big.txt").write_text("line\n" * (9 * 1024 * 1024 // 5))
+        base, work = self._commit_and_copy()
+        (work / "small.py").write_text("x = 2\n")
+
+        _, d = self._diff_of(base, work)
+        rc, numstat = _apply_check(self.repo, d.text)
+
+        self.assertEqual(rc, 0, numstat)
+        self.assertNotIn("big.txt", numstat)
+        self.assertIn("small.py", numstat)  # the real edit still applies
+
+    def test_a_genuinely_deleted_file_still_renders_as_deleted(self):
+        """The other direction. Trading one under-show for another would be a
+        worse bug than the one being fixed: a real deletion that renders as
+        nothing is exactly the gate-blinding this suppression could cause."""
+        (self.repo / "keep.py").write_text("x = 1\n")
+        (self.repo / "gone.py").write_text("y = 2\n")
+        base, work = self._commit_and_copy()
+        (work / "gone.py").unlink()
+
+        snap, d = self._diff_of(base, work)
+
+        self.assertEqual(snap.unreadable, ())  # nothing was refused
+        self.assertIn("deleted file mode 100644", d.text)
+        self.assertIn("gone.py", d.changed_files)
+        rc, numstat = _apply_check(self.repo, d.text)
+        self.assertEqual(rc, 0, numstat)
+        self.assertIn("gone.py", numstat)  # the deletion is real and applies
+
+    def test_an_unreadable_directory_does_not_delete_its_whole_subtree(self):
+        """The same defect one level up, and the reason the suppression is a
+        PREFIX test. `Unreadable.path` carries a trailing slash for a
+        directory; one `chmod 000` on a directory hid every base path under it
+        and rendered all of them as deletions."""
+        (self.repo / "top.py").write_text("a = 1\n")
+        (self.repo / "sub").mkdir()
+        (self.repo / "sub" / "one.py").write_text("b = 1\n")
+        (self.repo / "sub" / "two.py").write_text("c = 1\n")
+        base, work = self._commit_and_copy()
+        os.chmod(work / "sub", 0o000)
+        self.addCleanup(os.chmod, work / "sub", 0o755)
+
+        snap, d = self._diff_of(base, work)
+
+        self.assertEqual([u.path for u in snap.unreadable], ["sub/"])
+        self.assertNotIn("deleted file mode", d.text)
+        self.assertEqual(d.text.count("NOT COMPARED"), 2)  # one.py and two.py
+        self.assertIn("sub/one.py", d.text)
+        self.assertIn("sub/two.py", d.text)
+        self.assertEqual(d.changed_files, [])
+
+    # -- the adversarial trigger: drain the whole-snapshot budget --
+
+    def test_draining_the_read_budget_fabricates_no_deletions(self):
+        """33 sparse files, 0.00s to create, 164 KB of real disk. Before the
+        fix this turned 37 of 40 tracked files into deletions that did not
+        happen while removing the model's actual edit from the diff."""
+        for i in range(40):
+            (self.repo / f"mod{i:02d}.py").write_text(f"v = {i}\n")
+        base, work = self._commit_and_copy()
+        (work / "mod07.py").write_text("v = 7  # THE REAL EDIT\n")
+        for i in range(33):  # sort first: '!' precedes every letter
+            with open(work / f"!{i:03d}.dat", "wb") as fh:
+                fh.truncate((8 << 20) - 1)
+
+        snap, d = self._diff_of(base, work)
+
+        # The attack really landed — the budget really was drained.
+        drained = [u for u in snap.unreadable if u.reason == "BUDGET"]
+        self.assertGreater(len(drained), 30, [u.path for u in snap.unreadable])
+        self.assertNotIn("mod07.py", snap.entries)
+        # ...and produced ZERO false deletions.
+        self.assertNotIn("deleted file mode", d.text)
+        rc, numstat = _apply_check(self.repo, d.text)
+        self.assertEqual(rc, 0, numstat)
+        for i in range(40):
+            self.assertNotIn(f"mod{i:02d}.py", numstat)
+        # The path whose edit cannot be shown is named, and named honestly.
+        self.assertIn("mod07.py", d.text)
+        self.assertNotIn("mod07.py", d.changed_files)
+
+    def test_an_exhausted_budget_is_its_own_loud_signal(self):
+        """A drained budget and a changed file are different statements, and
+        only the first tells the
+        reviewer that an UNKNOWN number of changes are missing. One OVERSIZE
+        file costs one named file; an exhausted budget costs everything the
+        walk had not reached yet."""
+        snap = TreeSnapshot(
+            {"real.py": Entry("real.py", "file", b"x = 1\n")},
+            (Unreadable("a.dat", "BUDGET"), Unreadable("b.py", "BUDGET")),
+        )
+        d = _diff(_base(), snap)
+        self.assertIn("read budget was EXHAUSTED", d.text)
+        self.assertIn("THIS DIFF IS INCOMPLETE", d.text)
+        self.assertIn("2 path(s) hit it", d.text)
+        # First, so the size cap cannot cut it off.
+        self.assertTrue(d.text.startswith("coding_agent: WARNING: the whole"))
+
+    def test_an_oversize_file_alone_does_not_claim_the_budget_ran_out(self):
+        """The distinct signal is worthless if it fires on the ordinary case."""
+        snap = TreeSnapshot(
+            {"real.py": Entry("real.py", "file", b"x = 1\n")},
+            (Unreadable("big.bin", "OVERSIZE"),),
+        )
+        d = _diff(_base(), snap)
+        self.assertNotIn("EXHAUSTED", d.text)
+        self.assertIn("1 path(s) could not be read", d.text)
+
+    # -- the structured half: what a programmatic gate sees --
+
+    def test_an_uncomparable_path_is_not_asserted_to_have_changed(self):
+        """`changed_files` is a POSITIVE assertion, consumed by callers that
+        never read the prose. A path nobody could read did not necessarily
+        change, and listing it makes the field untrustworthy in the other
+        direction — 69 entries of which one was real, in the demonstrated
+        drain. Completeness is carried by `unreadable`, which is non-empty
+        exactly when this fires, so a gate that fails closed still can."""
+        snap = TreeSnapshot(
+            {"real.py": Entry("real.py", "file", b"x = 2\n")},
+            (Unreadable("hidden.py", "EACCES"),),
+        )
+        base = _base(**{"real.py": b"x = 1\n", "hidden.py": b"secret\n"})
+        d = _diff(base, snap)
+        self.assertEqual(d.changed_files, ["real.py"])
+        self.assertEqual(len(d.unreadable), 1)  # the gate's fail-closed signal
+        self.assertIn("hidden.py", d.text)  # still visible to the human
+
+    def test_an_unreadable_path_absent_from_the_base_is_still_reported(self):
+        """A file the model CREATED and made unreadable has no base side, so
+        it can never be mistaken for a deletion — but it must still reach the
+        human, and it must not be marked as tracked."""
+        snap = TreeSnapshot({}, (Unreadable("new_backdoor.py", "EACCES"),))
+        d = _diff(_base(), snap)
+        self.assertIn("new_backdoor.py", d.text)
+        self.assertNotIn("tracked in the base tree", d.text)
+        self.assertNotIn("NOT COMPARED", d.text)
+
+    def test_the_not_compared_marker_cannot_forge_diff_structure(self):
+        """Same injection surface as every other path this module renders: the
+        marker embeds a base path, and a base path can hold a newline."""
+        evil = "ok.py\ndiff --git a/etc/shadow b/etc/shadow\ndeleted file mode 100644"
+        base = _base(**{evil: b"x\n"})
+        snap = TreeSnapshot({}, (Unreadable(evil, "EACCES"),))
+        d = _diff(base, snap)
+        self.assertEqual(_starting(d.text, "diff --git "), [])
+        self.assertEqual(_starting(d.text, "deleted file mode"), [])
         for line in d.text.splitlines():
             self.assertTrue(line == "" or line.startswith("coding_agent:"), repr(line))
 
