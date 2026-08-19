@@ -121,6 +121,13 @@ try:
 except ImportError:  # pragma: no cover - absent on POSIX; mocked in tests
     msvcrt = None  # type: ignore[assignment]
 
+# POSIX-only; absent on Windows. Used once, at server start, to lift the
+# open-file soft limit (see _raise_nofile_limit).
+try:
+    import resource
+except ImportError:  # pragma: no cover - absent on Windows; mocked in tests
+    resource = None  # type: ignore[assignment]
+
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
@@ -2910,6 +2917,163 @@ async def _queue_poll(job_id: str) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------
+# coding_agent: registration/dispatch state only. The loop, the sandbox, the
+# byte walk and the review diff all live in the coding_agent package; nothing
+# below decides anything about how a run behaves.
+# --------------------------------------------------------------------------
+
+# DELIBERATELY NOT _delegate_jobs / _DELEGATE_JOB_CAP. Those are
+# local_delegate's four shared inference slots; coding_agent is single-slot
+# (the lock lives in coding_agent.loop, and a second concurrent call is
+# rejected rather than queued), so sharing the dict would let one family
+# starve the other for no reason. In-memory only, same as _delegate_jobs:
+# jobs die with the server process, and so does the session polling them.
+_coding_jobs: dict[str, dict[str, Any]] = {}
+_CODING_JOB_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+# Single-slot means at most one job is ever RUNNING, but a caller that starts
+# runs and never polls would still retain one AgentResult per run forever —
+# each carrying up to a 512 KB diff plus a transcript. Bound that tail.
+_CODING_DONE_RETAINED = 4
+
+_CODING_AGENT_IMAGE_ENV_VAR = "AI_TOOLS_CODING_AGENT_IMAGE"
+_CODING_AGENT_DEFAULT_IMAGE = "ai-tools-coding-agent:latest"
+# gemma4:31b-nvfp4 is this box's review-role tag and the intended default
+# here; resolved against the allowlist so an AI_TOOLS_OLLAMA_MODELS override
+# that drops it cannot leave the tool defaulting to a model it then rejects.
+_CODING_AGENT_PREFERRED_MODEL = "gemma4:31b-nvfp4"
+_CODING_AGENT_DEFAULT_TURNS = 25
+_CODING_AGENT_MAX_TURNS = 60
+_CODING_AGENT_DEFAULT_SECONDS = 600
+_CODING_AGENT_MAX_SECONDS = 1800
+
+
+def _coding_agent_default_model() -> str:
+    """Default model tag for coding_agent, always allowlisted.
+
+    Deliberately NOT `subprocess.run(["local-model", "review"])`: that is a
+    blocking call on the event loop inside an async handler, it makes the
+    tool's default depend on a binary outside this repo, and it can return a
+    tag the very next line rejects.
+    """
+    if _CODING_AGENT_PREFERRED_MODEL in OLLAMA_DELEGATE_MODELS:
+        return _CODING_AGENT_PREFERRED_MODEL
+    return OLLAMA_DELEGATE_DEFAULT_MODEL
+
+
+def _coding_agent_image() -> str:
+    """Sandbox image tag; AI_TOOLS_CODING_AGENT_IMAGE overrides it.
+
+    Read per call so a Desktop config change takes effect without an import.
+    A value that looks like a flag, or carries whitespace, is ignored rather
+    than honoured: the tag sits in `docker run`'s argv after the flags, so a
+    leading `-` would smuggle a docker option into the sandbox launch.
+    """
+    raw = os.environ.get(_CODING_AGENT_IMAGE_ENV_VAR, "").strip()
+    if not raw or raw.startswith("-") or any(c.isspace() for c in raw):
+        return _CODING_AGENT_DEFAULT_IMAGE
+    return raw
+
+
+def _surrogate_safe(text: str) -> str:
+    r"""Render lone surrogates as the bytes they stand for.
+
+    coding_agent decodes filenames and file bytes with `surrogateescape` ON
+    PURPOSE — scrubbing in the diff layer would falsify what the human
+    reviews. But a lone surrogate has no UTF-8 encoding, so it must not reach
+    the MCP response as one: `json.dumps` turns it into a `\udce9` escape,
+    which is not well-formed JSON (RFC 8259 forbids unpaired surrogates) and
+    raises UnicodeEncodeError the moment the parsed value is re-encoded.
+    Rewriting it as a visible `\xe9` keeps the path IN the response — a file
+    that silently vanishes from the review is the failure this prevents.
+    """
+    try:
+        raw = text.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        # Surrogates outside the U+DC80-U+DCFF range surrogateescape owns —
+        # a model can emit one in a tool argument, and it reaches the
+        # transcript the same way.
+        raw = text.encode("utf-8", "backslashreplace")
+    return raw.decode("utf-8", "backslashreplace")
+
+
+def _json_safe(value: Any) -> Any:
+    """`value` with every string surrogate-scrubbed, structure preserved."""
+    if isinstance(value, str):
+        return _surrogate_safe(value)
+    if isinstance(value, dict):
+        return {_json_safe(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
+def _start_coding_job(coro: Any) -> str:
+    """Launch a background coding_agent run; return its 32-hex job id."""
+    done_ids = sorted(
+        (jid for jid, job in _coding_jobs.items() if job["task"].done()),
+        key=lambda jid: _coding_jobs[jid]["started"],
+    )
+    excess = len(done_ids) - _CODING_DONE_RETAINED
+    if excess > 0:  # NOT a bare negative slice — that would evict the newest
+        for jid in done_ids[:excess]:
+            task = _coding_jobs.pop(jid)["task"]
+            try:
+                # Marks the exception retrieved so asyncio never logs
+                # "exception was never retrieved" for an evicted job.
+                task.exception()
+            except asyncio.CancelledError:
+                pass
+    job_id = uuid.uuid4().hex
+    _coding_jobs[job_id] = {
+        "task": asyncio.get_running_loop().create_task(coro),
+        "started": time.monotonic(),
+    }
+    return job_id
+
+
+def _collect_coding_job(job_id: str | None) -> dict[str, Any]:
+    """Poll/collect a background coding_agent run. Single-collect: the entry
+    is deleted on retrieval. Returns a status envelope while running (or on
+    failure), else the AgentResult's fields, surrogate-scrubbed."""
+    if not isinstance(job_id, str) or not _CODING_JOB_ID_RE.fullmatch(job_id):
+        raise ValueError("job_id must be the 32-hex id returned by coding_agent.")
+    job = _coding_jobs.get(job_id)
+    if job is None:
+        raise ValueError(
+            f"Unknown job_id {job_id!r} — results are single-collect and jobs "
+            "do not survive an MCP server restart."
+        )
+    task = job["task"]
+    if not task.done():
+        return {
+            "status": "running",
+            "elapsed_s": int(time.monotonic() - job["started"]),
+        }
+    del _coding_jobs[job_id]
+    try:
+        result = task.result()
+    except asyncio.CancelledError:
+        # run_coding_agent re-raises CancelledError once its OWN cleanup has
+        # finished — deliberately, so a cancelled run cannot look clean while
+        # a container is still up. CancelledError is a BaseException, so an
+        # `except Exception` here would not catch it: it would escape this
+        # handler and asyncio would mark the MCP request's task cancelled.
+        return {
+            "status": "cancelled",
+            "error": (
+                "the run was cancelled; coding_agent tore the sandbox down "
+                "before propagating"
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001 - any run failure is reportable
+        return {
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {redact_secrets(str(exc))}",
+        }
+    return _json_safe(dict(result.__dict__))
+
+
 # Create MCP server
 server = Server("ai-tools-mcp")
 
@@ -3287,6 +3451,121 @@ async def list_tools() -> list[Tool]:
                             "'q'+32-hex (durable queue) or bare 32-hex "
                             "(in-memory)."
                         ),
+                    },
+                },
+                "required": ["job_id"],
+            },
+        ),
+        Tool(
+            name="coding_agent",
+            description=(
+                "Hand a BOUNDED, MECHANICAL coding task to a LOCAL model that "
+                "works autonomously — reads and writes files, runs shell "
+                "commands and tests — inside a --network=none Docker sandbox "
+                "over a THROWAWAY git worktree of `repo`. NOTHING IS APPLIED "
+                "and `repo` is never written to: you get a transcript and a "
+                "unified diff, and YOU are the gate that decides what lands. "
+                "Use it for verifiable work with a concrete success criterion "
+                "(make this failing test pass, rename X to Y across the tree, "
+                "mechanical refactors) — not for design, debugging by "
+                "judgement, or anything security-sensitive. Local models are "
+                "MEASURED-UNRELIABLE as defect gates: they miss real bugs and "
+                "flag confident-sounding non-bugs, so read the diff yourself, "
+                "line by line — your review matters MOST exactly where the "
+                "model was least able to check itself. The sandbox runs a "
+                "SEPARATE ~1 GB image whose toolchain is a COPY of the host's "
+                "and WILL drift from this project's (language versions, "
+                "dependencies, linters); there is no network, so nothing can "
+                "be installed at runtime and a green test run in the sandbox "
+                "is evidence, not proof, for the host. One run at a time per "
+                "host — a second concurrent call is rejected, not queued. "
+                "background=true by default; poll coding_agent_result."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": (
+                            "What to do, plus how the model can TELL it "
+                            "worked (the command that must go green)."
+                        ),
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": (
+                            "Absolute path to a git repo on this host. It is "
+                            "read, never modified — the run happens in a "
+                            "throwaway worktree that is destroyed afterwards."
+                        ),
+                    },
+                    "base_ref": {
+                        "type": "string",
+                        "default": "HEAD",
+                        "description": "Git ref the throwaway worktree starts from.",
+                    },
+                    "model": {
+                        "type": "string",
+                        "enum": list(OLLAMA_DELEGATE_MODELS),
+                        "default": _coding_agent_default_model(),
+                        "description": (
+                            "Server-side allowlist, shared with "
+                            "local_delegate. The default is the larger "
+                            "review-role tag — the small tag is a poor fit "
+                            "for multi-turn tool use."
+                        ),
+                    },
+                    "max_turns": {
+                        "type": "integer",
+                        "default": _CODING_AGENT_DEFAULT_TURNS,
+                        "minimum": 1,
+                        "maximum": _CODING_AGENT_MAX_TURNS,
+                        "description": (
+                            "Hard cap on model turns. The model cannot "
+                            "extend its own budget."
+                        ),
+                    },
+                    "max_seconds": {
+                        "type": "integer",
+                        "default": _CODING_AGENT_DEFAULT_SECONDS,
+                        "minimum": 1,
+                        "maximum": _CODING_AGENT_MAX_SECONDS,
+                        "description": "Hard wall-clock cap on the run.",
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "true: return a job_id immediately; poll "
+                            "coding_agent_result. false: wait for the run "
+                            "(can be many minutes)."
+                        ),
+                    },
+                },
+                "required": ["task", "repo"],
+            },
+        ),
+        Tool(
+            name="coding_agent_result",
+            description=(
+                "Poll/collect a background coding_agent run by job_id. "
+                'Returns {"status": "running", "elapsed_s": N} while it '
+                "works; then the same object coding_agent returns "
+                "synchronously (stop_reason, turns, elapsed_seconds, diff, "
+                "diff_truncated, diff_full_path, changed_files, unreadable, "
+                "last_command, transcript, model, cleanup_problems), or "
+                '{"status": "failed"|"cancelled", "error": ...}. Check '
+                "`unreadable` and `cleanup_problems` as well as the diff — an "
+                "unreadable path is a file the review could NOT see. Results "
+                "are single-collect: once retrieved the job is gone, and jobs "
+                "do not survive an MCP server restart."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The 32-hex job id returned by coding_agent.",
                     },
                 },
                 "required": ["job_id"],
@@ -3949,6 +4228,157 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(outcome))]
         return _render_delegate_answer(outcome, evict_warning=evict_warning)
 
+    if name == "coding_agent":
+        # Argument validation ONLY, in cheapest-first order: every purely
+        # syntactic check runs before the filesystem is touched, so a bad
+        # model tag reports itself as a bad model tag rather than being
+        # masked by a repo path that happens not to exist.
+        task_text = arguments.get("task")
+        if not isinstance(task_text, str) or not task_text.strip():
+            return [
+                TextContent(
+                    type="text",
+                    text="Error: task is required and must be a non-empty string.",
+                )
+            ]
+        model_arg = arguments.get("model")
+        if model_arg is not None and model_arg not in OLLAMA_DELEGATE_MODELS:
+            allowed = ", ".join(OLLAMA_DELEGATE_MODELS)
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        f"Error: model {model_arg!r} is not allowlisted; "
+                        f"allowed: {allowed}"
+                    ),
+                )
+            ]
+        model = model_arg if model_arg is not None else _coding_agent_default_model()
+        base_ref = arguments.get("base_ref", "HEAD")
+        if (
+            not isinstance(base_ref, str)
+            or not base_ref.strip()
+            or base_ref.startswith("-")
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "Error: base_ref must be a non-empty git ref that does "
+                        "not start with '-'."
+                    ),
+                )
+            ]
+        max_turns = arguments.get("max_turns", _CODING_AGENT_DEFAULT_TURNS)
+        if (
+            isinstance(max_turns, bool)
+            or not isinstance(max_turns, int)
+            or not 1 <= max_turns <= _CODING_AGENT_MAX_TURNS
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "Error: max_turns must be an integer between 1 and "
+                        f"{_CODING_AGENT_MAX_TURNS}."
+                    ),
+                )
+            ]
+        max_seconds = arguments.get("max_seconds", _CODING_AGENT_DEFAULT_SECONDS)
+        if (
+            isinstance(max_seconds, bool)
+            or not isinstance(max_seconds, int)
+            or not 1 <= max_seconds <= _CODING_AGENT_MAX_SECONDS
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "Error: max_seconds must be an integer between 1 and "
+                        f"{_CODING_AGENT_MAX_SECONDS}."
+                    ),
+                )
+            ]
+        background = arguments.get("background", True)
+        if not isinstance(background, bool):
+            return [
+                TextContent(
+                    type="text", text="Error: background must be a JSON boolean."
+                )
+            ]
+        repo = arguments.get("repo")
+        # `.git` is a DIRECTORY in a normal clone and a FILE in a linked
+        # worktree — both are legitimate targets.
+        if (
+            not isinstance(repo, str)
+            or not os.path.isabs(repo)
+            or not os.path.exists(os.path.join(repo, ".git"))
+        ):
+            return [
+                TextContent(
+                    type="text",
+                    text=(
+                        "Error: repo must be an absolute path to a git "
+                        "repository on this host."
+                    ),
+                )
+            ]
+
+        from coding_agent import run_coding_agent  # local: keeps import cheap
+
+        coro = run_coding_agent(
+            task=task_text,
+            repo=repo,
+            base_ref=base_ref,
+            model=model,
+            max_turns=max_turns,
+            max_seconds=float(max_seconds),
+            image=_coding_agent_image(),
+            chat=_post_ollama_chat,
+        )
+        if background:
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {"job_id": _start_coding_job(coro), "status": "started"}
+                    ),
+                )
+            ]
+        # No `except BaseException`: a cancellation here is OUR request being
+        # cancelled, and run_coding_agent only re-raises it once it has torn
+        # the sandbox down — swallowing it would strand the caller and hide a
+        # container. `except Exception` deliberately does not catch it.
+        try:
+            result = await coro
+        except Exception as exc:  # noqa: BLE001 - reported, not raised at MCP
+            return [
+                TextContent(
+                    type="text",
+                    text=json.dumps(
+                        {
+                            "status": "failed",
+                            "error": (
+                                f"{type(exc).__name__}: {redact_secrets(str(exc))}"
+                            ),
+                        }
+                    ),
+                )
+            ]
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(_json_safe(dict(result.__dict__)), default=str),
+            )
+        ]
+
+    if name == "coding_agent_result":
+        try:
+            outcome = _collect_coding_job(arguments.get("job_id"))
+        except ValueError as exc:
+            return [TextContent(type="text", text=f"Error: {exc}")]
+        return [TextContent(type="text", text=json.dumps(outcome, default=str))]
+
     if name == "list_sessions":
         sessions = list_sessions()
         if not sessions:
@@ -4065,8 +4495,49 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     raise ValueError(f"Unknown tool: {name}")
 
 
+_NOFILE_FALLBACK_TARGET = 8192
+
+
+def _raise_nofile_limit() -> tuple[int, int] | None:
+    """Lift the open-file soft limit toward the hard limit at server start.
+
+    launchd hands this process a soft RLIMIT_NOFILE of 256 — verified with
+    `launchctl limit maxfiles` (256 / unlimited). An interactive shell
+    reports a much larger `ulimit -n`, but that is the SHELL's raised value,
+    not the one Claude Desktop's launchd-spawned server gets.
+
+    256 is tight for this process: the httpx pool, every subprocess pipe,
+    and now coding_agent's tree walk, which holds one directory descriptor
+    per level of nesting. The walk degrades safely on EMFILE, but degrading
+    means a shallower review than the human is promised, so raise the limit
+    instead. Never fatal — returns the new (soft, hard), or None if the
+    limit could not be changed.
+    """
+    if resource is None:  # Windows
+        return None
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return None
+    if soft == resource.RLIM_INFINITY:
+        return None
+    # `hard` first (RLIM_INFINITY is a sentinel, not a comparable maximum —
+    # it is -1 on Linux and 2**63-1 on macOS, so it is never range-checked);
+    # some kernels refuse an infinite soft limit, hence the fallback rung.
+    for target in (hard, _NOFILE_FALLBACK_TARGET):
+        if target != resource.RLIM_INFINITY and target <= soft:
+            continue
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (OSError, ValueError):
+            continue
+        return (target, hard)
+    return None
+
+
 async def main():
     """Run the MCP server."""
+    _raise_nofile_limit()
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream, write_stream, server.create_initialization_options()
