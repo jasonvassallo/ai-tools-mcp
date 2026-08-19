@@ -205,10 +205,37 @@ def create_worktree(repo: str, base_ref: str) -> str:
 def _docker_run_argv(
     worktree: str, image: str, *, cpus: str, memory: str, pids: int
 ) -> list[str]:
-    """Spec §6.2 step 2, verbatim. `--init` runs tini as pid 1 so processes
-    the model backgrounds are reaped; `--read-only` needs a writable $HOME
-    and not just /tmp, or the first in-sandbox test run dies on EROFS and
-    looks like a model failure."""
+    """Spec §6.2 step 2. `--init` runs tini as pid 1 so processes the model
+    backgrounds are reaped; `--read-only` needs a writable $HOME and not just
+    /tmp, or the first in-sandbox test run dies on EROFS and looks like a
+    model failure.
+
+    AMENDS §6.2 (final review, SF-6/NF-7): `--cap-drop=ALL` and
+    `--security-opt=no-new-privileges` are additions to the spec's literal
+    argv, not part of it. Measured in a live container built from the shipped
+    argv WITHOUT them:
+
+        NoNewPrivs: 0      CapBnd: 00000000a80425fb   (Docker's full default)
+
+    and the image carries 11 setuid-root binaries the untrusted model can
+    reach (`/usr/bin/{su,mount,umount,passwd,newgrp,chsh,chfn,gpasswd,expiry,
+    chage}`, `/usr/sbin/unix_chkpwd`). `--user` already gives an unprivileged
+    `CapEff`, but an intact BOUNDING set is exactly what lets a setuid-root
+    binary hand them back. With both flags:
+
+        NoNewPrivs: 1      CapBnd: 0000000000000000
+
+    Escalation from there needs a separate CVE in one of those binaries, and
+    container-root on Docker Desktop/macOS is still confined to the Linux VM,
+    so this is defence in depth rather than a fix for a live hole. It was
+    added because it costs nothing: python, git, uv, ruff, mypy, node, npm and
+    shellcheck were exercised in a real container under both variants — a
+    failing pytest, an edit, a passing pytest, a `uv run` subprocess, tmpfs
+    and $HOME writes — with identical results.
+
+    `test_coding_agent_integration.py` pins this argv literally; the two flags
+    were added there in the same change.
+    """
     return [
         "docker",
         "run",
@@ -216,6 +243,9 @@ def _docker_run_argv(
         "--rm",
         "--init",
         "--network=none",
+        # Not in §6.2's literal argv — see the docstring above.
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
         *SANDBOX_USER_FLAG,
         "--read-only",
         "--tmpfs",

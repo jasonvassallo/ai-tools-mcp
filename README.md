@@ -87,7 +87,7 @@ The following identifiers are meant to stay stable unless intentionally changed:
 
 ### `coding_agent` / `coding_agent_result`
 
-- Provider: **local Ollama model**, run autonomously (reads/writes files, runs shell commands and tests) inside a `--network=none`, `--read-only` Docker container over a **throwaway git worktree** of the repo you point it at
+- Provider: **local Ollama model**, run autonomously (reads/writes files, runs shell commands and tests) inside a `--network=none`, `--read-only`, `--cap-drop=ALL --security-opt=no-new-privileges` Docker container running as your own uid, over a **throwaway git worktree** of the repo you point it at
 - Purpose: hand off a bounded, mechanical coding task — a failing test to make pass, a rename to apply across the tree, a mechanical refactor — to a model that can iterate against a real test run without a human babysitting every turn
 - **Nothing the model does is ever applied.** `repo` is read, never written; the worktree is destroyed when the run ends. You get back a transcript and a unified diff, and Claude (you) is the gate that decides what — if anything — lands. Treat the diff review as mandatory, not optional
 - Latency: seconds to tens of minutes, bounded by `max_turns` (default 25, cap 60) and `max_seconds` (default 600, cap 1800) — the model cannot extend its own budget; `background=true` by default, poll `coding_agent_result`. `max_seconds` is a budget rather than a stopwatch: no new turn starts past it, and the model call and every command are clamped by what is left of it, but an in-flight call keeps a 5 s floor, so a run can overshoot it by up to a couple of minutes before teardown

@@ -462,7 +462,16 @@ class _Shim:
 
 class DockerArgvIsExactlyTheSpec(unittest.TestCase):
     """§6.2 step 2 is a security surface, not a style choice: every one of
-    these flags is load-bearing, so the argv is pinned literally."""
+    these flags is load-bearing, so the argv is pinned literally.
+
+    AMENDED 2026-08-19 (final review SF-6/NF-7): `--cap-drop=ALL` and
+    `--security-opt=no-new-privileges` are ADDITIONS to §6.2's literal argv.
+    Measured in a live container without them, `NoNewPrivs: 0` and
+    `CapBnd: 00000000a80425fb` — Docker's full default bounding set — while
+    the image carries 11 setuid-root binaries the untrusted model can reach.
+    See `sandbox._docker_run_argv`'s docstring for the full measurement and
+    the toolchain equivalence check.
+    """
 
     def test_docker_run_argv(self) -> None:
         shim = _Shim("echo deadbeefcafe\n")
@@ -477,6 +486,7 @@ class DockerArgvIsExactlyTheSpec(unittest.TestCase):
             argv,
             [
                 "run", "-d", "--rm", "--init", "--network=none",
+                "--cap-drop=ALL", "--security-opt=no-new-privileges",
                 "--user", f"{os.getuid()}:{os.getgid()}",
                 "--read-only", "--tmpfs", "/tmp", "--tmpfs", "/home/agent",
                 "-e", "HOME=/home/agent", "-e", "TMPDIR=/tmp",
