@@ -46,6 +46,23 @@ class SnapshotBasics(unittest.TestCase):
             h1, tree_hash(snapshot_tree(str(self.root), lambda p: False))
         )
 
+    def test_a_readable_tree_reports_nothing_unreadable(self):
+        """`unreadable` is the gate's "these paths exist and I could not read
+        them" channel. On an ordinary tree it must be EMPTY, or the signal is
+        noise and a reviewer learns to skip it."""
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(snap.unreadable, ())
+        self.assertEqual(sorted(snap.entries), ["a.py", "sub/b.txt"])
+
+    def test_special_files_are_skipped_without_being_called_unreadable(self):
+        """A FIFO/socket/device is DELIBERATELY not in the diff (spec §6.5) —
+        it is not a regular file and there is nothing to show. Reporting it as
+        unreadable would say "a change is hidden here" when none is."""
+        os.mkfifo(self.root / "trap.fifo")
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertNotIn("trap.fifo", snap.entries)
+        self.assertEqual(snap.unreadable, ())
+
 
 def _open_fd_count() -> int:
     """Number of descriptors this process holds open (macOS/Linux /dev/fd)."""
@@ -164,7 +181,12 @@ class RootResolution(unittest.TestCase):
         link = tmp / "link"
         os.symlink(str(real), link)
         self.assertIn("a.py", snapshot_tree(str(real), lambda p: False).entries)
-        self.assertEqual(snapshot_tree(str(link), lambda p: False).entries, {})
+        snap = snapshot_tree(str(link), lambda p: False)
+        self.assertEqual(snap.entries, {})
+        # "Loud" is now literal: the root names ITSELF as unreadable, so the
+        # gate can tell a refused root from a genuinely empty worktree instead
+        # of inferring it from a wall of deletions.
+        self.assertEqual([u.path for u in snap.unreadable], ["."])
 
 
 def _mkrepo(root: Path) -> None:

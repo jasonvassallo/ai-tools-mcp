@@ -10,8 +10,10 @@ Run:  uv run --with pytest --with pathspec pytest test_coding_agent_security.py 
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
+import resource
 import shutil
 import stat
 import subprocess
@@ -23,7 +25,8 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from coding_agent.walk import snapshot_tree, tree_hash
+from coding_agent import walk as walkmod
+from coding_agent.walk import TreeSnapshot, Unreadable, snapshot_tree, tree_hash
 
 
 class SymlinkExfiltration(unittest.TestCase):
@@ -376,6 +379,56 @@ class WalkRaceCannotDereference(unittest.TestCase):
         """)
         self._race(attacker, max_walks=1500, budget_s=8.0)
 
+    def test_separate_process_ancestor_swapper_never_leaks_host_bytes(self):
+        """MID-TREE ANCESTOR vector, added by the pass-6 adversarial review.
+
+        The two vectors above swap a LEAF. This one swaps a NON-EMPTY directory
+        that the walk is going to descend THROUGH, using `rename` to move the
+        real directory aside — which works where the `rmdir` of the directory
+        vector cannot, because `rmdir` refuses a non-empty directory. Measured
+        against the pass-5 walk it is the FASTEST of the three, leaking
+        `aaa_mid/HOST_SECRET` on walk #10 (vs #26 and #168); against the fixed
+        walk it produced 50,442 confirmed symlink plants and zero leaks.
+
+        fd-pinning is what defeats it, and nothing else in this suite pins that
+        property against a non-empty directory.
+        """
+        victim = self.root / "aaa_mid"
+        victim.mkdir()
+        (victim / "inner").mkdir()
+        (victim / "inner" / "keep.txt").write_bytes(b"keep\n")
+        (victim / "leaf.txt").write_bytes(b"leaf\n")
+        for i in range(60):
+            (self.root / f"pad{i:03d}.txt").write_bytes(b"x" * 32)
+
+        attacker = textwrap.dedent(f"""
+            import os
+            victim = {str(victim)!r}
+            secret_dir = {str(self.secret_dir)!r}
+            aside = victim + ".aside"
+            HOLD = 2000
+            while True:
+                # ATTACK: move the real (NON-EMPTY) directory aside and plant a
+                # symlink to the host directory at the name the walk is about
+                # to descend through.
+                try:
+                    os.rename(victim, aside)
+                    os.symlink(secret_dir, victim)
+                except OSError:
+                    pass
+                for _ in range(HOLD):
+                    pass
+                # RESTORE.
+                try:
+                    os.unlink(victim)
+                    os.rename(aside, victim)
+                except OSError:
+                    pass
+                for _ in range(HOLD):
+                    pass
+        """)
+        self._race(attacker, max_walks=1500, budget_s=8.0)
+
 
 class DeepTreeCannotHideAChange(unittest.TestCase):
     """Found while fixing the pass-5 race, not previously recorded.
@@ -389,8 +442,16 @@ class DeepTreeCannotHideAChange(unittest.TestCase):
 
     The fd-based walk addresses each child through its parent's descriptor, so
     no single path is ever assembled and PATH_MAX never applies. Descriptor use
-    is the tree's depth (measured: depth 60 -> 61 descriptors), against a
-    1,048,576 soft limit on this host.
+    is the tree's depth (measured: depth 60 -> 61 descriptors).
+
+    CORRECTED 2026-08-19: an earlier version of this docstring cited a
+    1,048,576 soft RLIMIT_NOFILE "on this host". That figure was measured in an
+    interactive shell and is wrong for the deployment process — launchd hands
+    the MCP server **256** and nothing raises it. So this fix MOVED the silent
+    boundary from ~50 levels (PATH_MAX) to ~252 (descriptors) rather than
+    removing it, and this test inherits the AMBIENT limit, so it cannot see
+    that boundary at all. `DescriptorBudgetCannotHideASubtree` pins the limit
+    itself and covers the descriptor case; this class covers PATH_MAX only.
     """
 
     def setUp(self):
@@ -424,6 +485,556 @@ class DeepTreeCannotHideAChange(unittest.TestCase):
         snap = snapshot_tree(str(self.root), lambda p: False)
         self.assertIn(expected, snap.entries, "a deep subtree vanished from the diff")
         self.assertEqual(snap.entries[expected].data, b"A CHANGE THE GATE MUST SEE\n")
+
+
+class UnreadablePathsAreVisibleToTheGate(unittest.TestCase):
+    """Pass 6 (2026-08-19): `chmod 000 backdoor.py` — ONE command, no race, no
+    live process, no timing — made the file VANISH from the snapshot with no
+    exception and no signal. `chmod` is persistent STATE, so destroying the
+    container does not undo it: the file is still missing when the FINAL diff
+    the human reviews is built. A model can write a backdoor, chmod it 000, and
+    the reviewer never learns the file exists.
+
+    It was a REGRESSION introduced by the pass-5 race fix. The pre-fix walk's
+    unguarded `open()` raised PermissionError LOUDLY on this fixture; guarding
+    the open traded a noisy failure for a silent under-show — the direction
+    §6.5 names as the dangerous one.
+
+    The fix is not to raise again (a racing writer must not take the gate
+    offline, §5.2) but to record the path in `TreeSnapshot.unreadable`, so the
+    gate can say "this path exists and could not be read" instead of quietly
+    showing fewer files. Every test below pins VISIBILITY, not availability.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp) / "work"
+        self.root.mkdir()
+        self._locked: list[Path] = []
+
+    def tearDown(self):
+        for p in reversed(self._locked):
+            try:
+                os.chmod(p, 0o755)
+            except OSError:
+                pass
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _lock(self, p: Path) -> None:
+        """chmod 000, and assert the MECHANISM: an existing object, owned by
+        the walking user, with every permission bit off. Not a vanished path,
+        not a symlink, not somebody else's file."""
+        os.chmod(p, 0o000)
+        self._locked.append(p)
+        st = os.lstat(p)
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o000)
+        self.assertEqual(st.st_uid, os.geteuid())
+        self.assertFalse(stat.S_ISLNK(st.st_mode))
+
+    @staticmethod
+    def _pairs(snap) -> list[tuple[str, str]]:
+        return [(u.path, u.reason) for u in snap.unreadable]
+
+    def test_a_mode_000_file_is_recorded_not_silently_dropped(self):
+        (self.root / "innocent.py").write_text("print('hello')\n")
+        victim = self.root / "backdoor.py"
+        victim.write_text("BACKDOOR = True\n")
+        self._lock(victim)
+        self.assertTrue(stat.S_ISREG(os.lstat(victim).st_mode))
+
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(snap.entries["innocent.py"].data, b"print('hello')\n")
+        self.assertNotIn("backdoor.py", snap.entries)
+        self.assertEqual(self._pairs(snap), [("backdoor.py", "EACCES")])
+
+    def test_a_mode_000_directory_says_a_whole_subtree_is_hidden(self):
+        (self.root / "innocent.py").write_text("ok\n")
+        (self.root / "src" / "deep").mkdir(parents=True)
+        (self.root / "src" / "deep" / "payload.py").write_text("PAYLOAD\n")
+        self._lock(self.root / "src")
+
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertNotIn("src/deep/payload.py", snap.entries)
+        # TRAILING SLASH: this is a whole subtree of unknown size, not one file.
+        self.assertEqual(self._pairs(snap), [("src/", "EACCES")])
+
+    def test_a_file_created_already_unreadable_moves_the_no_progress_hash(self):
+        """`entries` alone cannot see this. A file that was NEVER readable never
+        appears in `entries`, so a hash over `entries` is byte-identical before
+        and after the model creates it — the §7 detector would score the turn as
+        no progress and the chmod-000 hide would be invisible to it as well as
+        to the diff. The two walks below have IDENTICAL `entries`, so only
+        `unreadable` can move the hash.
+        """
+        (self.root / "innocent.py").write_text("ok\n")
+        first = snapshot_tree(str(self.root), lambda p: False)
+        before = tree_hash(first)
+
+        victim = self.root / "backdoor.py"
+        victim.write_text("BACKDOOR = True\n")
+        self._lock(victim)
+        second = snapshot_tree(str(self.root), lambda p: False)
+
+        self.assertEqual(sorted(first.entries), sorted(second.entries))
+        self.assertNotEqual(before, tree_hash(second), "the hash ignored a change")
+
+    def test_a_permanently_unreadable_path_does_not_flap_the_hash(self):
+        """The other half of the ruling. A path that is permanently unreadable
+        contributes the SAME (path, reason) every turn, so the hash is a
+        constant — it must not report progress on every turn forever, which
+        would defeat §7's detector on any tree containing one 000 file.
+        """
+        (self.root / "innocent.py").write_text("ok\n")
+        locked = self.root / "locked.py"
+        locked.write_text("locked\n")
+        self._lock(locked)
+        h1 = tree_hash(snapshot_tree(str(self.root), lambda p: False))
+        h2 = tree_hash(snapshot_tree(str(self.root), lambda p: False))
+        h3 = tree_hash(snapshot_tree(str(self.root), lambda p: False))
+        self.assertEqual(h1, h2)
+        self.assertEqual(h2, h3)
+
+    def test_an_unreadable_root_reports_itself_instead_of_looking_empty(self):
+        """An empty snapshot makes every tracked path surface as a deletion.
+        That is loud, but it does not say WHY. The root records itself as `.`
+        so the gate can tell "the worktree is empty" from "the worktree could
+        not be opened"."""
+        (self.root / "a.py").write_text("x\n")
+        self._lock(self.root)
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(snap.entries, {})
+        self.assertEqual(self._pairs(snap), [(".", "EACCES")])
+
+    def test_unreadable_is_sorted_and_deterministic(self):
+        for name in ("zeta.py", "alpha.py", "middle.py"):
+            (self.root / name).write_text("x\n")
+            self._lock(self.root / name)
+        (self.root / "sub").mkdir()
+        self._lock(self.root / "sub")
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(
+            self._pairs(snap),
+            [
+                ("alpha.py", "EACCES"),
+                ("middle.py", "EACCES"),
+                ("sub/", "EACCES"),
+                ("zeta.py", "EACCES"),
+            ],
+        )
+        again = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(snap.unreadable, again.unreadable)
+
+    def test_the_hash_ignores_transient_reasons_and_keeps_permanent_ones(self):
+        """MEASURED ruling, not a taste call. Hashing EVERY unreadable reason
+        makes the §7 no-progress detector useless in the presence of an HONEST
+        racing writer — a test run creating and deleting temp files. Over 1512
+        walks against a separate churning process:
+
+            flaps with entries only ......  0.6%
+            flaps with ALL reasons hashed . 87.1%
+            flaps with stable reasons only  0.6%
+
+        A permanent reason is a property of the TREE and must move the hash (it
+        is the only way a created-already-000 file is visible to §7). A
+        transient one is a property of someone else's timing and must not.
+        """
+        empty = TreeSnapshot({})
+        for transient in ("RACED", "ENOENT", "ELOOP", "ESTALE"):
+            with self.subTest(reason=transient):
+                self.assertEqual(
+                    tree_hash(empty),
+                    tree_hash(TreeSnapshot({}, (Unreadable("a.py", transient),))),
+                )
+        for permanent in ("EACCES", "EPERM", "EMFILE", "OVERSIZE", "BUDGET", "XDEV"):
+            with self.subTest(reason=permanent):
+                self.assertNotEqual(
+                    tree_hash(empty),
+                    tree_hash(TreeSnapshot({}, (Unreadable("a.py", permanent),))),
+                )
+
+    def test_a_path_that_keeps_vanishing_is_still_REPORTED(self):
+        """The hash ignores it; the gate must not. `unreadable` is what the
+        reviewer reads, and "this path was there when I listed the directory
+        and gone when I looked at it" is worth saying — the final diff is built
+        after the container is destroyed, so a transient there is anomalous.
+        """
+        (self.root / "a.py").write_text("x\n")
+        (self.root / "ghost.py").write_text("y\n")
+        real_lstat = os.lstat
+
+        def flaky(path, *args, **kwargs):
+            if os.path.basename(os.fspath(path)) == "ghost.py":
+                raise FileNotFoundError(errno.ENOENT, "vanished", "ghost.py")
+            return real_lstat(path, *args, **kwargs)
+
+        with unittest.mock.patch("os.lstat", flaky):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(sorted(snap.entries), ["a.py"])
+        self.assertEqual(self._pairs(snap), [("ghost.py", "ENOENT")])
+
+    def test_a_directory_the_walk_gives_up_on_is_reported_AS_A_DIRECTORY(self):
+        """Found by review of the pass-6 fix itself. The exhausted-retries
+        fall-through records the bare `rel`, because it is reached with no
+        classification in hand — so a directory the walk lost the race for
+        three times was reported as `victim_dir`, not `victim_dir/`. Visible,
+        but the SCOPE was understated: a reviewer reads "one file could not be
+        read" where an entire subtree of unknown size is hidden. Understating
+        what is hidden is the same failure direction as hiding it.
+
+        ELOOP is the real mechanism here, not a synthetic error: it is exactly
+        what O_NOFOLLOW raises when a symlink has been swapped in over the
+        directory since it was classified.
+        """
+        victim = self.root / "victim_dir"
+        victim.mkdir()
+        (victim / "payload.py").write_text("PAYLOAD\n")
+        (self.root / "a.py").write_text("x\n")
+        real_open = os.open
+        state = {"refused": 0}
+
+        def refuse_the_dir(path, flags, *args, **kwargs):
+            if kwargs.get("dir_fd") is not None and path == "victim_dir":
+                state["refused"] += 1
+                raise OSError(errno.ELOOP, "symlink swapped in", "victim_dir")
+            return real_open(path, flags, *args, **kwargs)
+
+        with unittest.mock.patch("os.open", refuse_the_dir):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+        # MECHANISM: it really was refused, and refused on every attempt.
+        self.assertEqual(state["refused"], walkmod._RECLASSIFY_ATTEMPTS)
+        self.assertIn("a.py", snap.entries)
+        self.assertNotIn("victim_dir/payload.py", snap.entries)
+        self.assertEqual(self._pairs(snap), [("victim_dir/", "ELOOP")])
+
+    def test_a_directory_too_large_to_LIST_is_recorded_not_a_crash(self):
+        """`os.listdir` builds the whole name list before returning it, so a
+        directory with enough children exhausts host memory — and MemoryError
+        is not an OSError, so it used to escape `snapshot_tree` entirely and
+        take the review gate offline. That is the §5.2 failure ("a racing
+        writer must not take the gate offline") arriving through the memory
+        axis instead of the timing one, for a condition the sandbox creates
+        with `touch`. The byte budgets do not bound it: they cap CONTENT, and
+        this is a cost per NAME.
+        """
+        (self.root / "a.py").write_text("x\n")
+        (self.root / "huge").mkdir()
+        (self.root / "huge" / "f.txt").write_text("y\n")
+        real_listdir = os.listdir
+        calls = {"n": 0}
+
+        def hungry(arg):
+            calls["n"] += 1
+            if calls["n"] >= 2:  # the root lists fine; the child does not
+                raise MemoryError("cannot allocate the name list")
+            return real_listdir(arg)
+
+        before = len(os.listdir("/dev/fd"))
+        with unittest.mock.patch("os.listdir", hungry):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(snap.entries["a.py"].data, b"x\n")
+        self.assertEqual(self._pairs(snap), [("huge/", "ENOMEM")])
+        self.assertEqual(len(os.listdir("/dev/fd")), before, "descriptor leaked")
+
+    def test_a_root_too_large_to_LIST_is_recorded_not_a_crash(self):
+        (self.root / "a.py").write_text("x\n")
+        before = len(os.listdir("/dev/fd"))
+        with unittest.mock.patch("os.listdir", side_effect=MemoryError("no room")):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(snap.entries, {})
+        self.assertEqual(self._pairs(snap), [(".", "ENOMEM")])
+        self.assertEqual(len(os.listdir("/dev/fd")), before, "descriptor leaked")
+
+    def test_an_ignored_unreadable_path_is_not_reported(self):
+        """`unreadable` must not become a second channel that leaks ignored
+        paths into the gate's view. `lstat` succeeds on a 000 file — only the
+        OPEN fails — so the ignore decision is made exactly as it is for a
+        readable file, with the same query string."""
+        victim = self.root / "secrets.env"
+        victim.write_text("x\n")
+        self._lock(victim)
+        (self.root / "shown.py").write_text("y\n")
+        snap = snapshot_tree(str(self.root), lambda p: p.endswith(".env"))
+        self.assertIn("shown.py", snap.entries)
+        self.assertEqual(self._pairs(snap), [])
+
+
+def _sparse(path: Path, size: int) -> None:
+    """Create a file with `size` APPARENT bytes and no allocated blocks."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        os.ftruncate(fd, size)
+    finally:
+        os.close(fd)
+
+
+def _max_rss_bytes() -> int:
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return usage if sys.platform == "darwin" else usage * 1024
+
+
+class HostMemoryCannotBeExhaustedByTheSandbox(unittest.TestCase):
+    """Pass 6: `dd if=/dev/zero of=/work/big.bin bs=1 count=0 seek=8589934592`
+    costs the container ZERO bytes of disk and drove the host walk to 3006 MB
+    RSS in 0.3s (measured in a child process under a 2500 MB kill ceiling;
+    nothing in walk.py would have stopped it). `seek=1099511627776` — 1 TiB —
+    is exactly as cheap for the attacker, and the old `_read_all` accumulated
+    1 MiB chunks in a list before `b"".join`, so peak was roughly 2x apparent
+    size.
+
+    §5.1's diff size cap CANNOT help: it truncates the RENDERED diff, and by
+    then the bytes are already resident in `TreeSnapshot.entries`. The cap has
+    to be at the read.
+
+    An over-cap file is never TRUNCATED into something that looks like real
+    content — that would hand the reviewer a misleading diff of a file it did
+    not fully read. It is recorded in `unreadable` instead.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp) / "work"
+        self.root.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_sparse_file_above_the_cap_is_recorded_not_read(self):
+        (self.root / "real.py").write_text("print(1)\n")
+        big = self.root / "big.bin"
+        _sparse(big, 8 * (1 << 30))
+        st = os.lstat(big)
+        # MECHANISM: 8 GiB APPARENT, zero blocks ALLOCATED. If this fixture
+        # ever stops being sparse the test is measuring disk, not the cap.
+        self.assertEqual(st.st_size, 8 * (1 << 30))
+        self.assertEqual(st.st_blocks, 0)
+        self.assertGreater(st.st_size, walkmod._MAX_FILE_BYTES)
+
+        before = _max_rss_bytes()
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        grew = _max_rss_bytes() - before
+
+        self.assertEqual(snap.entries["real.py"].data, b"print(1)\n")
+        self.assertNotIn("big.bin", snap.entries)
+        self.assertEqual(
+            [(u.path, u.reason) for u in snap.unreadable], [("big.bin", "OVERSIZE")]
+        )
+        self.assertLess(grew, 256 << 20, f"the walk grew RSS by {grew} bytes")
+
+    def test_a_file_that_grows_past_the_cap_mid_read_is_not_truncated(self):
+        """The pre-check is `fstat().st_size` on the OPEN descriptor, which a
+        writer can beat by appending afterwards and which a synthetic
+        filesystem can simply lie about. The read loop is therefore bounded
+        too, and hitting that bound is an OVERSIZE record — never a short read
+        recorded as if it were the whole file."""
+        victim = self.root / "grows.bin"
+        victim.write_bytes(b"x" * 64)
+        cap = 4096
+        real_read = os.read
+        state = {"grown": False}
+
+        def growing_read(fd: int, n: int) -> bytes:
+            if not state["grown"]:
+                state["grown"] = True
+                with open(victim, "ab") as fh:
+                    fh.write(b"y" * (cap * 4))
+            return real_read(fd, n)
+
+        with unittest.mock.patch.object(walkmod, "_MAX_FILE_BYTES", cap):
+            with unittest.mock.patch("os.read", growing_read):
+                snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertTrue(state["grown"], "the interposition never fired")
+        self.assertNotIn("grows.bin", snap.entries)
+        self.assertEqual(
+            [(u.path, u.reason) for u in snap.unreadable], [("grows.bin", "OVERSIZE")]
+        )
+
+    def test_many_under_cap_files_cannot_exhaust_memory_in_aggregate(self):
+        """A PER-FILE cap alone is not enough. `entries` holds every file at
+        once, so N files of (cap - 1) bytes cost N x cap of host RAM, and N
+        sparse files are as cheap to create as one. The shipped constants are
+        patched DOWN here so the test costs megabytes instead of gigabytes; the
+        mechanism — a running total that stops reading and RECORDS what it did
+        not read — is the shipped one.
+        """
+        names = [f"f{i:02d}.bin" for i in range(16)]
+        for name in names:
+            _sparse(self.root / name, 1 << 19)  # 512 KiB apparent, 0 allocated
+        self.assertEqual(sum(os.lstat(self.root / n).st_blocks for n in names), 0)
+
+        file_cap = 1 << 20  # every file is UNDER this
+        total_cap = 4 << 20  # but 16 x 512 KiB = 8 MiB is over this
+        with unittest.mock.patch.object(walkmod, "_MAX_FILE_BYTES", file_cap):
+            with unittest.mock.patch.object(walkmod, "_MAX_TOTAL_BYTES", total_cap):
+                snap = snapshot_tree(str(self.root), lambda p: False)
+
+        read = sum(len(e.data) for e in snap.entries.values())
+        self.assertGreater(read, 0, "the budget starved the whole walk")
+        self.assertLessEqual(read, total_cap, "the total budget was not enforced")
+        self.assertTrue(any(u.reason == "BUDGET" for u in snap.unreadable))
+        # NOTHING VANISHES: every file is either shown or named.
+        named = {u.path for u in snap.unreadable}
+        for name in names:
+            self.assertTrue(
+                name in snap.entries or name in named, f"{name} vanished silently"
+            )
+
+    def test_the_shipped_caps_are_bounded_and_ordered(self):
+        self.assertLessEqual(walkmod._MAX_FILE_BYTES, walkmod._MAX_TOTAL_BYTES)
+        self.assertLessEqual(walkmod._MAX_TOTAL_BYTES, 1 << 30)
+
+
+class DescriptorBudgetCannotHideASubtree(unittest.TestCase):
+    """Pass 6 corrected a 4000x measurement error. `progress.md` and
+    `task-2-fix-report.md` both recorded the host's soft RLIMIT_NOFILE as
+    1,048,576, which was measured in an INTERACTIVE SHELL. The process that
+    actually runs this code is the ai-tools-mcp server under launchd, and
+    `launchctl limit maxfiles` gives it **256**; nothing in the server raises
+    it. "Silent subtree drop past RLIMIT_NOFILE" therefore costs ~250 mkdirs,
+    not a million — cheap enough to matter.
+
+    This test PINS the limit rather than inheriting the ambient one. The older
+    `DeepTreeCannotHideAChange` inherits it, so it stays green in a shell while
+    saying nothing about the deployed configuration.
+
+    The requirement is the same as for a mode-000 path: the walk may fail to
+    read a subtree, but it may not do so SILENTLY.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp) / "work"
+        self.root.mkdir()
+        self.depth = 150
+        parent = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for _ in range(self.depth):
+                os.mkdir("d", dir_fd=parent)
+                child = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent)
+                os.close(parent)
+                parent = child
+                fd = os.open("f.txt", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=parent)
+                os.close(fd)
+        finally:
+            os.close(parent)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _walk_under_fd_limit(self, spare: int):
+        """Walk with RLIMIT_NOFILE pinned to (currently open + `spare`).
+
+        The limit is restored BEFORE any assertion runs, so a failing assertion
+        cannot be reported through a descriptor the test just took away.
+        """
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        budget = len(os.listdir("/dev/fd")) + spare
+        resource.setrlimit(resource.RLIMIT_NOFILE, (budget, hard))
+        try:
+            return snapshot_tree(str(self.root), lambda p: False)
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    @staticmethod
+    def _deepest(snap) -> int:
+        return max((p.count("/") for p in snap.entries), default=0)
+
+    def test_a_subtree_lost_to_the_descriptor_limit_is_recorded(self):
+        snap = self._walk_under_fd_limit(spare=40)
+        deepest = self._deepest(snap)
+        self.assertLess(
+            deepest, self.depth, "the fixture did not exhaust the descriptor budget"
+        )
+        reasons = {u.reason for u in snap.unreadable}
+        self.assertTrue(
+            reasons & {"EMFILE", "ENFILE"},
+            f"a subtree vanished with no record; unreadable={snap.unreadable!r}",
+        )
+        # And every record names a DIRECTORY, so the gate reads it as a subtree.
+        cut = [u.path for u in snap.unreadable if u.reason in ("EMFILE", "ENFILE")]
+        self.assertTrue(all(p.endswith("/") for p in cut), cut)
+
+    def test_the_cut_off_tracks_the_descriptor_limit_and_nothing_else(self):
+        """MECHANISM. If the truncation depth did not move with the limit, this
+        test would be pinning some other boundary (PATH_MAX, a hard-coded depth
+        cap, an ENAMETOOLONG) while claiming to pin fd exhaustion."""
+        shallow = self._deepest(self._walk_under_fd_limit(spare=25))
+        deeper = self._deepest(self._walk_under_fd_limit(spare=75))
+        self.assertGreater(deeper, shallow + 20, f"{shallow=} {deeper=}")
+        self.assertLess(deeper, self.depth)
+
+
+class RepoDirectoryOpacityIsIdentityBased(unittest.TestCase):
+    """Pass 6: `snapshot_tree` guarded the repo directory with a
+    case-SENSITIVE text compare, and the deployment volume is case-INSENSITIVE
+    APFS. A case-only rename of the real one dodged the guard entirely.
+
+    Direct impact is over-showing, which §6.5 calls harmless — but it CHAINS:
+    the model can flood the diff with pack and object bytes, and §5.1 truncates
+    the diff past a byte limit, so over-showing plus a truncation cap becomes
+    under-showing BY DISPLACEMENT — the real change scrolls off the end. It is
+    also a delivery vector for the sparse-file DoS under a name reviewers are
+    trained to skip.
+
+    The guard is now identity-based (`st_ino`/`st_dev`, compared against the
+    SAME lstat that classifies each child, so no new TOCTOU window opens). That
+    is correct on both kinds of volume: a case-only rename is the same inode
+    and stays opaque, while on a case-SENSITIVE volume an upper-case name is a
+    different inode and is shown — which is what a real checkout would do.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp) / "work"
+        self.root.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_case_renamed_repo_directory_stays_opaque(self):
+        (self.root / "app.py").write_text("print(1)\n")
+        meta = self.root / ".git"
+        meta.mkdir()
+        (meta / "config").write_text("[core]\n\tfsmonitor = /tmp/pwn\n")
+        (meta / "objects").mkdir()
+        (meta / "objects" / "pack.idx").write_bytes(b"PACKBYTES" * 64)
+        os.rename(meta, self.root / ".GIT")
+        if not meta.exists():
+            self.skipTest("case-sensitive volume: the upper-case name is a new object")
+        self.assertIn(".GIT", os.listdir(self.root))
+
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertIn("app.py", snap.entries)
+        leaked = [p for p in snap.entries if p.lower().startswith(".git")]
+        self.assertEqual(leaked, [], "a case-renamed repo directory reached the diff")
+
+    def test_a_worktree_metadata_FILE_is_still_opaque(self):
+        """In a WORKTREE — which is what this tool walks — the metadata entry
+        is a regular FILE containing a pointer, not a directory. Identity
+        matching must cover that shape too."""
+        (self.root / "app.py").write_text("print(1)\n")
+        (self.root / ".git").write_text("gitdir: /elsewhere/worktrees/wt\n")
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertIn("app.py", snap.entries)
+        self.assertNotIn(".git", snap.entries)
+
+    def test_a_hardlink_to_the_metadata_file_does_not_hide_a_chosen_name(self):
+        """Identity matching, taken alone, is itself an under-showing bug. A
+        worktree's metadata entry is an ordinary FILE, so the sandbox can
+        `ln` it to any name — and every one of those names would then share
+        its inode and vanish from the diff silently, at a name the SANDBOX
+        picks. The guard therefore requires the name (in any casing) as well
+        as the identity.
+        """
+        (self.root / ".git").write_text("gitdir: /elsewhere/worktrees/wt\n")
+        decoy = self.root / "notes.txt"
+        os.link(self.root / ".git", decoy)
+        # MECHANISM: the decoy really is the SAME inode, so a pure identity
+        # test would have skipped it.
+        self.assertEqual(os.lstat(decoy).st_ino, os.lstat(self.root / ".git").st_ino)
+
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertNotIn(".git", snap.entries)
+        self.assertIn("notes.txt", snap.entries, "a sandbox-chosen name vanished")
 
 
 if __name__ == "__main__":
