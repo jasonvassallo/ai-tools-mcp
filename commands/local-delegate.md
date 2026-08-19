@@ -14,8 +14,10 @@ Guidance:
   more — every call runs at the serving host's window).
 - Leave keep_alive alone for the gemma4 tags: they are kept WARM on their hosts by design, and
   keep_alive="0" would unload the 31B after every review and force a cold reload next time.
-  Only qwen tags default to keep_alive="0" (repeat-call contamination mitigation), and the
-  server applies that automatically — you don't need to pass it.
+  keep_alive can be omitted on qwen tags — they default to "0", and any "0" (defaulted or
+  explicit) also evicts the runner before the call, which is the contamination protection; the
+  server applies that automatically — you don't need to pass it. Only pass a non-zero keep_alive
+  when you deliberately want a qwen tag kept warm (that skips the protection).
 - Keep think=false for the gemma4 tags. With thinking on they spend the generation in
   `message.thinking`, and this tool deliberately discards that field and returns
   "Error: Ollama returned no content" — so a think=true review against gemma4:31b yields

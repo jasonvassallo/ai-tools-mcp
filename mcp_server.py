@@ -41,7 +41,9 @@ MCP server providing five families of tools:
   off by default) via an ordered endpoint chain:
   localhost first, then the user's own Cloudflare-Access-gated
   remote. Input text never leaves the user's machines; background
-  jobs are in-memory and single-collect.
+  jobs prefer the durable queue service (queue_server.py, encrypted
+  at rest, results persist until a TTL) when one is reachable,
+  falling back to the legacy in-memory single-collect store.
 - ``list_sessions`` / ``save_session`` / ``load_session`` /
   ``update_session`` / ``delete_session``: local conversation-session
   persistence backed by ``~/.claude/sessions/``.
@@ -73,11 +75,14 @@ Google-backed tools will fail when invoked.
 """
 
 import asyncio
+import atexit
 import errno
 import functools
 import getpass
 import json
+import logging
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -87,8 +92,9 @@ import urllib.parse
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import google.auth
 import google.auth.transport.requests
@@ -1733,9 +1739,15 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # options change. Root-caused 2026-07-31 (48-call repeat protocol, both qwen
 # families): long-lived runner state under OLLAMA_KEEP_ALIVE=-1 — it
 # reproduces across q8_0 AND f16 KV cache, MoE AND dense qwen, Ollama 0.31.1
-# AND 0.32.5. keep_alive:0 per request eliminates it (0/96 measured); gemma
-# is immune under the identical config (0/141 lifetime). Hence the
-# qwen-conditional keep_alive default below.
+# AND 0.32.5. Unloading BETWEEN calls eliminates it (0/96 measured on a
+# protocol where every call began on a fresh runner); gemma is immune under
+# the identical config (0/141 lifetime). Hence the qwen-conditional
+# keep_alive default below. keep_alive:"0" on a request does NOT protect
+# that request itself — it is a post-response TTL, and a call landing on an
+# already-dirty resident runner contaminates at the control rate (measured
+# 2026-08-08: 16.1%/25.0% vs 25.8%/25.0% control across both qwen families,
+# 63 paired probes) — which is why _evict_ollama_runner drops the runner
+# BEFORE every protected call.
 #
 # The measurement above is against qwen3.6:35b-a3b, which no longer exists on
 # the endpoint (retired 2026-08-17). The surviving qwen tag, qwen3.8:27b-nvfp4,
@@ -2165,6 +2177,108 @@ _OLLAMA_EVICT_TIMEOUT_S = 30.0
 # call into an instant timeout, which is worse than the contamination.
 _OLLAMA_MIN_CHAT_TIMEOUT_S = 5.0
 
+# stdout is the MCP protocol stream, so this goes to stderr, which the
+# host captures per-server (Claude Code writes one JSON record per stderr
+# LINE into mcp-logs-ai-tools-mcp/*.jsonl — verified), hence the
+# single-line key=value format.
+_evict_log = logging.getLogger("ai_tools_mcp.delegate.evict")
+# Level and propagation are set UNCONDITIONALLY, outside the handler guard
+# below, because logging.getLogger() is process-global: anything that
+# touched this name first — a host, the SDK, an earlier import of this
+# module in the same process — leaves the guard skipped, and with it
+# everything the guard would have configured. propagate is the dangerous
+# half: left True, every record also climbs to the root logger, whose
+# handlers this module does not own and one of which may well write to
+# stdout, i.e. straight into the MCP protocol stream.
+_evict_log.setLevel(logging.INFO)
+_evict_log.propagate = False
+if not _evict_log.handlers:
+    # The stderr write happens on the listener's thread, never on the
+    # caller's: QueueHandler.emit() is an enqueue. The caller here is the
+    # asyncio event loop, and a StreamHandler write+flush into a stderr pipe
+    # the host has stopped draining blocks the WHOLE loop — every other MCP
+    # request included — for as long as the pipe stays full, outside every
+    # timeout this module sets. QueueHandler is the stdlib answer to exactly
+    # that.
+    _evict_sink = logging.StreamHandler(sys.stderr)
+    _evict_sink.setFormatter(
+        logging.Formatter("%(asctime)s ai-tools-mcp %(levelname)s %(message)s")
+    )
+    _evict_listener = QueueListener(queue.SimpleQueue(), _evict_sink)
+    _evict_listener.start()  # daemon thread, so it never holds up exit
+    # ...but a daemon thread is killed mid-queue at exit, so drain on the
+    # way out rather than losing the last records.
+    atexit.register(_evict_listener.stop)
+    _evict_handler = QueueHandler(_evict_listener.queue)
+    # The conventional slot (logging.config.dictConfig sets the same one).
+    # It is how a reader — and the test that proves the write is off the
+    # event loop — gets from the logger to the handler that really writes.
+    _evict_handler.listener = _evict_listener
+    _evict_log.addHandler(_evict_handler)
+
+_evict_stats = {"ok": 0, "absent": 0, "failed": 0}
+
+
+class _EvictOutcome(NamedTuple):
+    """What one eviction attempt achieved.
+
+    `reason` == "" means the runner was provably dropped; anything else is a
+    short, server-authored description of why the protection did not run.
+    `benign` marks the reasons that are an expected operating condition
+    rather than a broken mitigation, so the operator's log does not cry wolf
+    about them.
+    """
+
+    reason: str = ""
+    benign: bool = False
+
+
+def _record_eviction_outcome(
+    outcome: _EvictOutcome, *, model: str, endpoint: str, elapsed_ms: int
+) -> None:
+    """Count and log one eviction attempt.
+
+    Written at eviction time, not at return time: if the chat then fails,
+    _post_ollama_chat returns an error envelope that renders as a bare
+    error, and a background job that is never collected is evicted by
+    _DELEGATE_DONE_RETAINED and never rendered at all. In both cases this
+    line is the only surviving record.
+
+    `ollama-preunload` is a stable grep anchor — tests assert the literal
+    token, so a rename fails loudly rather than silently orphaning the
+    operator's search. Kept to ONE line: a newline would fragment the
+    host's per-line JSON record, hence %r on the one remote-influenced
+    field. Emitting is non-blocking by construction (see the QueueHandler
+    above); this runs on the event loop.
+    """
+    where = (
+        "localhost" if _is_localhost_endpoint(endpoint) else redact_secrets(endpoint)
+    )
+    if not outcome.reason:
+        _evict_stats["ok"] += 1
+        result, level = "OK", logging.INFO
+    elif outcome.benign:
+        # Not a failure of anything: there was no runner to drop. WARNING
+        # here would fire on every call to a tag this host never pulled.
+        _evict_stats["absent"] += 1
+        result, level = "NO-RUNNER", logging.INFO
+    else:
+        _evict_stats["failed"] += 1
+        result, level = "FAILED", logging.WARNING
+    _evict_log.log(
+        level,
+        "ollama-preunload result=%s reason=%r model=%s endpoint=%s "
+        "elapsed_ms=%d ok_total=%d absent_total=%d fail_total=%d",
+        result,
+        outcome.reason,
+        redact_secrets(model),
+        where,
+        elapsed_ms,
+        _evict_stats["ok"],
+        _evict_stats["absent"],
+        _evict_stats["failed"],
+    )
+
 
 async def _evict_ollama_runner(
     client: httpx.AsyncClient,
@@ -2172,7 +2286,7 @@ async def _evict_ollama_runner(
     model: str,
     headers: dict[str, str],
     timeout_s: float,
-) -> None:
+) -> _EvictOutcome:
     """Best-effort: drop `model`'s resident runner before a protected call.
 
     `keep_alive` is a POST-*response* TTL, so `keep_alive:"0"` does not
@@ -2184,18 +2298,27 @@ async def _evict_ollama_runner(
     Evicting first is what actually puts the call on a fresh runner.
 
     Empty prompt + keep_alive 0 is Ollama's documented unload idiom, and on
-    an ABSENT model it is a measured 22 ms no-op that returns
-    done_reason:"unload" without loading anything. So in the steady state —
-    where the qwen keep_alive default already unloads after every call —
-    this costs a round trip and no reload. A reload (~2.5 s warm page cache)
-    is paid only when another client had warmed the model, which is exactly
-    the exposed case.
+    a PULLED-but-not-resident tag it is a measured 22 ms no-op that returns
+    done_reason:"unload" without loading anything. An UN-PULLED tag is a
+    different answer entirely: HTTP 404 {"error":"model ... not found"},
+    measured twice on Ollama 0.32.7 — which is why 404 is classified below
+    as "nothing was resident" rather than as a broken mitigation. So in the
+    steady state — where the qwen keep_alive default already unloads after
+    every call — this costs a round trip and no reload. A reload (~2.5 s
+    warm page cache) is paid only when another client had warmed the model,
+    which is exactly the exposed case.
 
-    Concurrency: with Ollama's num_parallel=1 generation is serialized and a
-    busy runner is refcounted, so an eviction from one background delegate
-    job should not abort another's in-flight generation — but that
-    interaction was NOT measured here, and overlapping background qwen jobs
-    may cost each other a reload.
+    Concurrency (measured 2026-08-10, Ollama 0.32.7): an eviction does NOT
+    abort another call's in-flight generation — that completes normally —
+    but the eviction is not queued behind the busy runner either: it lands
+    immediately, rewriting the runner's expiry, and it destroys any warm pin
+    another caller held on the SAME tag (a different tag is untouched).
+    Overlapping protected jobs are NOT protected against each other: job B's
+    eviction can fire before job A has even loaded the runner, so B's chat
+    then lands on A's dirty runner. Not a regression — before the eviction
+    existed, overlapping qwen jobs shared a dirty runner with no mitigation
+    at all — and a cut-off eviction now at least surfaces as a non-empty
+    outcome reason instead of silence.
 
     Bounded by `timeout_s` in WALL CLOCK, via asyncio.wait_for. httpx's
     float timeout is per-phase — connect, write, read and pool each get that
@@ -2206,29 +2329,89 @@ async def _evict_ollama_runner(
 
     Never raises. A failed OR timed-out eviction leaves exactly today's
     behaviour; it must not turn into a failure of the caller's real request.
+
+    Returns an _EvictOutcome whose `reason` is "" when the runner was
+    provably dropped, else a SHORT description of why the protection did not
+    run. Silence used to mean "success" here: the call checked neither
+    status nor body, so a 403 from a stale Access token, a 404, a 5xx, or a
+    200 that merely declined to unload all looked identical to a real
+    eviction — a permanently broken mitigation would have been undetectable
+    (demonstrated live: a host answering 403 on /api/generate and 200 on
+    /api/chat returned a clean, unprotected answer). A real eviction answers
+    200 with done_reason "unload", so that is the success condition. The
+    reason string is server-authored and carries no header values, no
+    response body and no exception text — only a status code, an exception
+    CLASS name, and a length-capped done_reason.
     """
-    try:
-        await asyncio.wait_for(
-            client.post(
-                f"{endpoint}/api/generate",
-                json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
-                headers=headers,
-                timeout=timeout_s,
-            ),
+
+    async def _attempt() -> Any:
+        # raise_for_status() and .json() live INSIDE the wait_for bound with
+        # the POST they belong to, so the budget covers the whole attempt
+        # rather than stopping at the last await.
+        response = await client.post(
+            f"{endpoint}/api/generate",
+            json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
+            headers=headers,
             timeout=timeout_s,
         )
-    except (
-        httpx.RequestError,
-        httpx.HTTPStatusError,
-        ValueError,
-        asyncio.TimeoutError,
-    ):
-        return
+        response.raise_for_status()
+        return response.json()
+
+    try:
+        body = await asyncio.wait_for(_attempt(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        return _EvictOutcome(f"timed out after {timeout_s:.1f}s")
+    except httpx.HTTPStatusError as exc:
+        # Read the status defensively: httpx builds these with a response,
+        # but nothing here guarantees the instance this arm catches has one,
+        # and an AttributeError would escape a helper whose entire contract
+        # is that it never raises.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status == 404:
+            # An un-pulled tag, measured on Ollama 0.32.7. Nothing was
+            # resident, so nothing could be contaminated, and the chat that
+            # follows fails on its own 404 with the `ollama pull` hint. Say
+            # what it is instead of dressing it up as a broken mitigation —
+            # but still report it, because a proxy that 404s /api/generate
+            # while serving /api/chat leaves a real answer unprotected.
+            return _EvictOutcome(
+                "model not pulled on this endpoint (HTTP 404)", benign=True
+            )
+        if status is None:
+            return _EvictOutcome("endpoint rejected the request (no HTTP status)")
+        return _EvictOutcome(f"endpoint answered HTTP {status}")
+    except httpx.RequestError as exc:
+        return _EvictOutcome(f"request failed ({type(exc).__name__})")
+    except ValueError:
+        return _EvictOutcome("endpoint returned a non-JSON body")
+    if not isinstance(body, dict):
+        # No Ollama version answers /api/generate with a JSON array or
+        # scalar, but a proxy in front of one can; .get() on it would raise
+        # straight out of the never-raises helper.
+        return _EvictOutcome("endpoint returned a non-object JSON body")
+    done_reason = body.get("done_reason")
+    if done_reason != "unload":
+        # done_reason is the ONLY remote-controlled fragment that reaches
+        # the log or the answer, so it gets the same value-aware scrub
+        # _post_ollama_chat's HTTPStatusError arm uses: this file documents
+        # at _http_error_payload that redact_secrets has no CF-token
+        # pattern, but we hold the exact header values. Scrubbed BEFORE the
+        # 40-char truncation so a secret straddling the cutoff cannot leave
+        # an un-scrubbed fragment. Status codes, exception class names and
+        # the timeout float are server-authored and need no scrub.
+        shown = str(done_reason)
+        for secret in headers.values():
+            if secret:
+                shown = shown.replace(secret, "[REDACTED_CF_ACCESS]")
+        return _EvictOutcome(
+            f"runner not unloaded (done_reason={redact_secrets(shown)[:40]!r})"
+        )
+    return _EvictOutcome()
 
 
 async def _post_ollama_chat(
     payload: dict[str, Any], timeout_s: float, pre_unload: bool = False
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str]:
     """POST /api/chat to the first chain endpoint serving payload['model'].
 
     Same structured-error contract as _post_agent_research: selection,
@@ -2237,19 +2420,33 @@ async def _post_ollama_chat(
     service-token headers (absent creds → skipped at selection; the None
     check here is defense in depth). No retries: an endpoint is either
     serving or not.
+
+    Returns (body, evict_warning). The warning travels BESIDE the body, not
+    inside it: the body is the upstream host's own JSON, so anything read
+    back out of it is attacker-authored by construction — a host that put
+    an "_evict_warning" key in its /api/chat response could otherwise forge
+    the harness-authored banner _render_delegate_answer prints, on any call,
+    protected or not. This second element is the only eviction signal a
+    renderer may believe, and nothing upstream can reach it. It is also why
+    the body is never mutated on the way through: an in-place annotation
+    would be visible to every later reader of that dict.
     """
     model = str(payload.get("model", ""))
     try:
         endpoint = await _select_ollama_endpoint(model)
     except ValueError as exc:
-        return {"status": "failed", "error": redact_secrets(str(exc))}
+        return {"status": "failed", "error": redact_secrets(str(exc))}, ""
     headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
     if headers is None:
         return {
             "status": "failed",
             "error": f"no credentials for {redact_secrets(endpoint)}",
-        }
+        }, ""
     client = await _get_http_client()
+    # Non-empty only when a protected call ran UNPROTECTED. Returned to the
+    # caller below so a silently-failing mitigation is visible instead of
+    # indistinguishable from a working one.
+    evict_warning = ""
     # Here, not at the call site: this is the one place that has resolved
     # the endpoint, so the eviction and the chat provably hit the SAME host
     # (no second resolution that could drift), and both the sync and the
@@ -2268,14 +2465,35 @@ async def _post_ollama_chat(
         # completes a generation in the seconds that implies.
         if evict_budget > 0:
             started = time.monotonic()
-            await _evict_ollama_runner(client, endpoint, model, headers, evict_budget)
-            timeout_s = max(chat_reserve, timeout_s - (time.monotonic() - started))
+            outcome = await _evict_ollama_runner(
+                client, endpoint, model, headers, evict_budget
+            )
+            spent = time.monotonic() - started
+            # Recorded HERE rather than at return: the banner is missable in
+            # two real cases (the chat fails, so the answer is a bare error;
+            # or a background job is never collected and never rendered at
+            # all). This stderr line is the only record that survives all
+            # four outcome paths.
+            _record_eviction_outcome(
+                outcome,
+                model=model,
+                endpoint=endpoint,
+                elapsed_ms=int(spent * 1000),
+            )
+            evict_warning = outcome.reason
+            timeout_s = max(chat_reserve, timeout_s - spent)
+        else:
+            skipped = _EvictOutcome("skipped: timeout_s too small to afford it")
+            _record_eviction_outcome(
+                skipped, model=model, endpoint=endpoint, elapsed_ms=0
+            )
+            evict_warning = skipped.reason
     try:
         response = await client.post(
             f"{endpoint}/api/chat", json=payload, headers=headers, timeout=timeout_s
         )
         response.raise_for_status()
-        return response.json()
+        return response.json(), evict_warning
     except httpx.HTTPStatusError as exc:
         # Value-aware scrub: an Access-gated host's error body can echo
         # request headers; redact_secrets has no CF-token pattern, but we
@@ -2287,7 +2505,7 @@ async def _post_ollama_chat(
             failure["error"] += (
                 f" — model may not be pulled on this host; try: ollama pull {model}"
             )
-        return failure
+        return failure, evict_warning
     except httpx.ConnectError:
         # Answered the probe moments ago but refused the POST — drop the
         # cached resolution so the next call re-probes the chain. The
@@ -2305,21 +2523,21 @@ async def _post_ollama_chat(
                 "LaunchAgent up? "
                 "(launchctl kickstart -k gui/$UID/com.jasonvassallo.ollama)"
             ),
-        }
+        }, evict_warning
     except httpx.RequestError as exc:
         return {
             "status": "failed",
             "error": f"request error: {redact_secrets(str(exc))}",
-        }
+        }, evict_warning
     except ValueError as exc:
         return {
             "status": "failed",
             "error": f"invalid JSON from Ollama: {redact_secrets(str(exc))}",
-        }
+        }, evict_warning
 
 
 def _render_delegate_answer(
-    data: dict[str, Any], prefix: str = ""
+    data: dict[str, Any], prefix: str = "", evict_warning: str = ""
 ) -> list[TextContent]:
     """Render an Ollama /api/chat response (or failure envelope) as MCP text.
 
@@ -2332,6 +2550,15 @@ def _render_delegate_answer(
     server-authored, never model output, so it is emitted verbatim ahead of
     the answer — and deliberately not prepended to error returns, which have
     their own shape callers may match on.
+
+    `evict_warning` is the same kind of thing: server-authored, handed in by
+    the caller from _post_ollama_chat's out-of-band return. It is NOT read
+    out of `data`. `data` is the upstream host's own JSON, so a key looked
+    up in it is a key the host can set — and a warning banner an upstream
+    host can author is worse than no banner at all, because it is the one
+    piece of this output a reader is meant to trust as the harness's own
+    voice. One surfacing point covers both delegate paths: the sync call
+    renders here, and a background job's collected result renders here too.
     """
     if data.get("status") == "failed":
         return [
@@ -2345,10 +2572,25 @@ def _render_delegate_answer(
     if not isinstance(content, str) or not content.strip():
         return [TextContent(type="text", text="Error: Ollama returned no content")]
     model = redact_secrets(str(data.get("model", "")))
+    banner = ""
+    if evict_warning:
+        # Quantified and actionable on purpose: a bare "protection failed"
+        # does not change how the reading model treats the answer, whereas
+        # the measured rate plus two concrete checks does.
+        banner = (
+            "> Warning: the qwen contamination pre-unload did NOT run "
+            f"({redact_secrets(evict_warning)}).\n"
+            "> This answer may be a different prompt's output — measured at "
+            "~20-25% on repeat calls against a stale qwen runner.\n"
+            "> Check it actually answers the prompt, and re-run to compare.\n\n"
+        )
     return [
         TextContent(
             type="text",
-            text=f"{prefix}## Local Delegate ({model})\n\n{redact_secrets(content)}",
+            text=(
+                f"{prefix}{banner}## Local Delegate ({model})\n\n"
+                f"{redact_secrets(content)}"
+            ),
         )
     ]
 
@@ -2411,11 +2653,22 @@ def _start_delegate_job(payload: dict[str, Any], pre_unload: bool = False) -> st
     return job_id
 
 
-def _collect_delegate_job(job_id: str | None) -> dict[str, Any]:
+def _collect_delegate_job(job_id: str | None) -> tuple[dict[str, Any], str]:
     """Poll/collect a background job. Completed jobs are single-collect:
-    the registry entry is deleted on retrieval so memory stays clean."""
+    the registry entry is deleted on retrieval so memory stays clean.
+
+    Returns (outcome, evict_warning), passing through the pair
+    _post_ollama_chat returned inside the task. The warning has to ride
+    alongside rather than inside the outcome for the same reason it does
+    there: the outcome of a completed job IS the upstream host's JSON body.
+    Envelopes this function authors itself carry no warning — no eviction
+    result is known for a job that is still running or was cancelled.
+    """
     if not isinstance(job_id, str) or not _DELEGATE_JOB_ID_RE.fullmatch(job_id):
-        raise ValueError("job_id must be the 32-hex id returned by local_delegate.")
+        raise ValueError(
+            "job_id must be an id returned by local_delegate — either the "
+            "32-hex in-memory form or the 'q'-prefixed durable-queue form."
+        )
     job = _delegate_jobs.get(job_id)
     if job is None:
         raise ValueError(
@@ -2427,7 +2680,7 @@ def _collect_delegate_job(job_id: str | None) -> dict[str, Any]:
         return {
             "status": "running",
             "elapsed_s": int(time.monotonic() - job["started"]),
-        }
+        }, ""
     del _delegate_jobs[job_id]
     try:
         return task.result()
@@ -2440,7 +2693,220 @@ def _collect_delegate_job(job_id: str | None) -> dict[str, Any]:
                 f"background job exceeded the {int(_DELEGATE_BG_CEILING_S)}s "
                 "ceiling and was cancelled"
             ),
-        }
+        }, ""
+
+
+# ─── Durable delegate queue client (v1.6) ─────────────────────────────
+#
+# queue_server.py (deployed on JVMBPro as a LaunchAgent, see
+# deploy/jvmbpro-delegate-queue/) provides a durable submit/poll queue in
+# front of the local Ollama: jobs are persisted encrypted-at-rest in
+# SQLite, survive restarts on both ends, and results remain collectable
+# until a 72 h TTL. background=true delegate calls prefer it; when no
+# queue endpoint is reachable the legacy in-memory single-collect path is
+# used unchanged, flagged with a "warning" field. Queue job ids carry a
+# "q" prefix, which is how local_delegate_result routes a poll.
+_QUEUE_URLS_ENV_VAR = "AI_TOOLS_QUEUE_URLS"
+_QUEUE_DEFAULT_CHAIN: tuple[str, ...] = (
+    "http://localhost:11438",
+    "https://queue-mbp.djvassallo.com",
+)
+_QUEUE_HEALTH_TIMEOUT_S = 2.0
+_QUEUE_REQUEST_TIMEOUT_S = 10.0
+_QUEUE_JOB_ID_RE = re.compile(r"^q[0-9a-f]{32}$")
+
+
+def _resolve_queue_chain() -> list[str]:
+    """Ordered queue endpoint chain (env CSV override, else defaults).
+
+    Every entry passes _validate_ollama_endpoint — the same fail-closed
+    rules as the Ollama chain: loopback may be http, any other host must
+    be https (the Access-gated tunnel), and URL userinfo is rejected.
+    """
+    raw = os.environ.get(_QUEUE_URLS_ENV_VAR, "").strip()
+    if raw:
+        entries = [e.strip() for e in raw.split(",") if e.strip()]
+    else:
+        entries = list(_QUEUE_DEFAULT_CHAIN)
+    chain: list[str] = []
+    for entry in entries:
+        validated = _validate_ollama_endpoint(entry)
+        if validated not in chain:
+            chain.append(validated)
+    return chain
+
+
+async def _select_queue_endpoint() -> tuple[str, dict[str, str]] | None:
+    """First healthy queue endpoint → (endpoint, auth headers), else None.
+
+    Reuses _ollama_auth_headers deliberately: the SAME Cloudflare Access
+    service token gates the queue hostname, and its fail-closed contract
+    carries over — a remote endpoint whose credentials are unavailable is
+    skipped entirely, never called bare. The short /healthz probe bounds
+    the cost of the queue-first attempt when nothing is listening.
+    """
+    client = await _get_http_client()
+    for endpoint in await asyncio.to_thread(_resolve_queue_chain):
+        headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+        if headers is None:
+            continue
+        try:
+            # Server-sourced auth + operator-configured endpoint — same
+            # rationale as _probe_endpoint_tags.
+            response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+                f"{endpoint}/healthz",
+                headers=headers,
+                timeout=_QUEUE_HEALTH_TIMEOUT_S,
+            )
+            response.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.RequestError):
+            continue
+        return endpoint, headers
+    return None
+
+
+async def _queue_submit(payload: dict[str, Any]) -> str | None:
+    """Submit a chat payload to the durable queue → job id, or None.
+
+    None means "the durable queue definitely did NOT take this job" —
+    no healthy endpoint, connect failure (request never reached the
+    service), or the service answered with an error status — and the
+    caller may safely fall back to the in-memory store.
+
+    Raises ValueError on an AMBIGUOUS outcome: the request may have
+    reached the service (read timeout / dropped connection mid-exchange)
+    or provably did (HTTP 200 whose body we could not extract a job id
+    from). Falling back would risk executing the same payload twice —
+    once by the queue's worker, once in-memory — so the caller must NOT
+    fall back; it surfaces the error and the user decides whether to
+    resubmit.
+    """
+    selected = await _select_queue_endpoint()
+    if selected is None:
+        return None
+    endpoint, headers = selected
+    client = await _get_http_client()
+    try:
+        # Same server-sourced-auth / operator-configured-endpoint
+        # rationale as _post_ollama_chat.
+        response = await client.post(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+            f"{endpoint}/v1/jobs",
+            json=payload,
+            headers=headers,
+            timeout=_QUEUE_REQUEST_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # The request never reached the service; safe to fall back.
+        return None
+    except httpx.HTTPStatusError:
+        # The service answered and refused (400/413/429/5xx): the job
+        # was not enqueued; safe to fall back.
+        return None
+    except (httpx.RequestError, ValueError) as exc:
+        raise ValueError(
+            "Durable queue submit outcome is unknown "
+            f"({type(exc).__name__} after the request was sent): the job "
+            "may already be enqueued server-side. Not falling back to the "
+            "in-memory store — that could execute the prompt twice. "
+            "Re-run the call to retry."
+        ) from exc
+    job_id = data.get("job_id") if isinstance(data, dict) else None
+    if not isinstance(job_id, str) or not _QUEUE_JOB_ID_RE.fullmatch(job_id):
+        # HTTP 200 means the queue accepted the job even though the
+        # body is unusable — falling back would duplicate execution.
+        raise ValueError(
+            "Durable queue accepted the job (HTTP 200) but returned no "
+            "usable job_id. Not falling back to the in-memory store — "
+            "that could execute the prompt twice. The job will run and "
+            "expire server-side; re-run the call to retry."
+        )
+    return job_id
+
+
+async def _queue_poll(job_id: str) -> dict[str, Any]:
+    """Poll a durable queue job, mapped onto the delegate envelope contract.
+
+    Returns {"status": "running", "elapsed_s": ...} while the job is
+    queued/running, the stored Ollama chat response once done (renderable
+    by _render_delegate_answer), or a {"status": "failed", ...} envelope.
+    Raises ValueError — a clean, retryable tool error — when no queue
+    endpoint is reachable: the job is durable server-side, so "try again
+    later" is the honest answer, not a terminal failure.
+
+    Each queue endpoint has its own independent store, so a 404 from one
+    endpoint only proves the job is unknown THERE — the walk continues
+    down the chain rather than declaring the job purged. Only when every
+    reachable endpoint says 404 does the error report the honest set of
+    possibilities (wrong/unreachable endpoint, or the 72 h purge).
+    """
+    client = await _get_http_client()
+    response: Any = None
+    headers: dict[str, str] = {}
+    tried_404: list[str] = []
+    last_request_error: httpx.RequestError | None = None
+    for endpoint in await asyncio.to_thread(_resolve_queue_chain):
+        endpoint_headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+        if endpoint_headers is None:
+            continue
+        try:
+            # Same server-sourced-auth / operator-configured-endpoint
+            # rationale as _probe_endpoint_tags.
+            candidate = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+                f"{endpoint}/v1/jobs/{job_id}/result",
+                headers=endpoint_headers,
+                timeout=_QUEUE_REQUEST_TIMEOUT_S,
+            )
+        except httpx.RequestError as exc:
+            last_request_error = exc
+            continue
+        if candidate.status_code == 404:
+            tried_404.append(endpoint)
+            continue
+        response = candidate
+        headers = endpoint_headers
+        break
+    if response is None:
+        if tried_404:
+            where = ", ".join(redact_secrets(e) for e in tried_404)
+            raise ValueError(
+                f"Queue job_id {job_id!r} is unknown to the reachable queue "
+                f"endpoint(s) ({where}). Either the endpoint that accepted "
+                "it is currently unreachable, or the job finished and was "
+                "purged (72 hours after completion)."
+            )
+        if last_request_error is not None:
+            raise ValueError(
+                f"Queue request error: "
+                f"{redact_secrets(str(last_request_error))}. The job is "
+                "durable server-side — retry local_delegate_result later."
+            ) from last_request_error
+        raise ValueError(
+            "No queue endpoint reachable to poll this durable job. The job "
+            "is persisted server-side — retry local_delegate_result later."
+        )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc, scrub=tuple(headers.values()))
+    try:
+        data = response.json()
+    except ValueError:
+        return {"status": "failed", "error": "invalid JSON from queue service"}
+    if not isinstance(data, dict):
+        return {"status": "failed", "error": "invalid response from queue service"}
+    if "result" in data:
+        result = data["result"]
+        if not isinstance(result, dict):
+            return {"status": "failed", "error": "invalid result from queue service"}
+        return result
+    elapsed = data.get("elapsed_s", 0)
+    return {
+        "status": "running",
+        "elapsed_s": elapsed if isinstance(elapsed, int) else 0,
+        "queue": "durable",
+    }
 
 
 # Create MCP server
@@ -2678,7 +3144,9 @@ async def list_tools() -> list[Tool]:
                 "work (summaries, boilerplate, drafts, bulk transforms) that "
                 "doesn't need frontier quality; an independent second opinion "
                 "on code or text; or long background jobs (pass "
-                "background=true, poll local_delegate_result). No web access "
+                "background=true, poll local_delegate_result — durable via "
+                "the queue service when reachable, in-memory fallback "
+                "otherwise). No web access "
                 "— for research use the research tools instead. The model is "
                 "strong at code and structured transforms but far below "
                 "frontier models on hard reasoning: keep tasks well-scoped."
@@ -2753,7 +3221,15 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                         "description": (
                             "true: return a job_id immediately; poll "
-                            "local_delegate_result. false: wait for the answer."
+                            "local_delegate_result. Prefers the durable "
+                            "queue service when reachable ('q'-prefixed "
+                            "job_id, envelope carries queue='durable'): the "
+                            "job survives restarts and its result persists "
+                            "until a 72h TTL. Otherwise falls back to the "
+                            "in-memory store (32-hex job_id, single-collect, "
+                            "dies with the server) and the envelope carries "
+                            "a warning saying so. false: wait for the "
+                            "answer."
                         ),
                     },
                     "keep_alive": {
@@ -2762,10 +3238,14 @@ async def list_tools() -> list[Tool]:
                             "Optional: how long Ollama keeps the model loaded "
                             "after the call ('0' = unload immediately — use "
                             "after a big one-off job). Omitted: qwen tags "
-                            "default to '0' (repeat-call contamination "
-                            "mitigation; pass e.g. '5m' to deliberately keep "
-                            "one warm); other models inherit the server's "
-                            "OLLAMA_KEEP_ALIVE. Pattern: 0 or <1-9999><s|m|h>."
+                            "default to '0'. A '0' on a qwen tag (defaulted "
+                            "OR explicit) also EVICTS the runner before the "
+                            "call — the contamination mitigation; the TTL "
+                            "alone cannot protect the request carrying it. A "
+                            "non-zero value keeps the model warm and skips "
+                            "that protection. Other models inherit the "
+                            "server's OLLAMA_KEEP_ALIVE. Pattern: 0 or "
+                            "<1-9999><s|m|h>."
                         ),
                     },
                     "timeout_s": {
@@ -2790,15 +3270,22 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Poll/collect a background local_delegate job by job_id. "
                 "Returns running status with elapsed seconds, or the answer. "
-                "Results are single-collect: once retrieved the job is gone. "
-                "Jobs live in server memory only and do not survive restarts."
+                "'q'-prefixed ids are durable queue jobs: they survive "
+                "restarts and the result can be re-fetched any number of "
+                "times until the queue purges it (72h after completion). "
+                "Legacy 32-hex ids are in-memory jobs: single-collect (once "
+                "retrieved the job is gone) and lost on server restart."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "job_id": {
                         "type": "string",
-                        "description": "The 32-hex job id returned by local_delegate.",
+                        "description": (
+                            "The job id returned by local_delegate: "
+                            "'q'+32-hex (durable queue) or bare 32-hex "
+                            "(in-memory)."
+                        ),
                     },
                 },
                 "required": ["job_id"],
@@ -3351,8 +3838,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # callers to pass keep_alive="0" for long-context qwen work, so the
         # most likely qwen caller opted itself out of the very protection
         # this exists to provide (Codex P1 + Gemini, PR #65, both confirmed
-        # against that file). An explicit NON-zero value still opts out —
-        # deliberate warm-pinning stays possible.
+        # against that file). An explicit NON-zero value still opts out:
+        # YOUR value is sent unchanged and YOUR call is not pre-evicted.
+        # That is a statement about this request only, not a residency
+        # guarantee — any other caller's "0" on the same tag still unloads
+        # it (true since PR #60's post-response default; the eviction just
+        # moves the same collision earlier).
         if keep_alive is None and _keep_alive_zero_default_applies(model):
             keep_alive = "0"
         pre_unload = keep_alive == "0" and _keep_alive_zero_default_applies(model)
@@ -3371,6 +3862,41 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             payload["keep_alive"] = keep_alive
 
         if background:
+            # Queue-first (v1.6): a reachable durable queue wins — the job
+            # survives MCP server restarts and its result persists until
+            # the queue's TTL instead of being single-collect. An
+            # AMBIGUOUS submit (ValueError) is surfaced as an error
+            # instead of falling back: the queue may already hold the
+            # job, and running it in-memory too would execute the prompt
+            # twice.
+            try:
+                queue_job_id = await _queue_submit(payload)
+            except ValueError as exc:
+                return [
+                    TextContent(type="text", text=f"Error: {redact_secrets(str(exc))}")
+                ]
+            if queue_job_id is not None:
+                if model_arg is None:
+                    # The implicit model was resolved against the OLLAMA
+                    # chain (locality-first), but the queue's worker
+                    # executes against ITS OWN configured upstream, which
+                    # may not serve the resolved tag. Say so rather than
+                    # letting a later "upstream HTTP 404" surprise.
+                    advisory += (
+                        f"Note: model {model} was resolved against this "
+                        "machine's Ollama chain, but the durable queue "
+                        "executes jobs against its own upstream — if that "
+                        "upstream does not serve this tag the job will "
+                        "fail; pass model= explicitly to be sure.\n\n"
+                    )
+                envelope = {
+                    "job_id": queue_job_id,
+                    "status": "started",
+                    "queue": "durable",
+                }
+                if advisory:
+                    envelope["warning"] = advisory.strip()
+                return [TextContent(type="text", text=json.dumps(envelope))]
             try:
                 job_id = _start_delegate_job(payload, pre_unload=pre_unload)
             except ValueError as exc:
@@ -3378,8 +3904,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # Carried as a JSON field, NOT prepended: this envelope is
             # json.loads()-ed by callers, so a bare prefix would break parsing.
             envelope = {"job_id": job_id, "status": "started"}
-            if advisory:
-                envelope["warning"] = advisory.strip()
+            fallback_note = (
+                "No durable queue endpoint reachable — job started in the "
+                "in-memory store instead: it will not survive an MCP server "
+                "restart and its result is single-collect."
+            )
+            envelope["warning"] = (
+                f"{advisory.strip()} {fallback_note}" if advisory else fallback_note
+            )
             return [
                 TextContent(
                     type="text",
@@ -3387,17 +3919,34 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             ]
 
-        data = await _post_ollama_chat(payload, float(timeout_s), pre_unload=pre_unload)
-        return _render_delegate_answer(data, prefix=advisory)
+        data, evict_warning = await _post_ollama_chat(
+            payload, float(timeout_s), pre_unload=pre_unload
+        )
+        return _render_delegate_answer(
+            data, prefix=advisory, evict_warning=evict_warning
+        )
 
     if name == "local_delegate_result":
+        job_id = arguments.get("job_id")
+        if isinstance(job_id, str) and _QUEUE_JOB_ID_RE.fullmatch(job_id):
+            # "q"-prefixed ids belong to the durable queue service; the
+            # legacy 32-hex in-memory path below is untouched.
+            try:
+                outcome = await _queue_poll(job_id)
+            except ValueError as exc:
+                return [
+                    TextContent(type="text", text=f"Error: {redact_secrets(str(exc))}")
+                ]
+            if outcome.get("status") == "running":
+                return [TextContent(type="text", text=json.dumps(outcome))]
+            return _render_delegate_answer(outcome)
         try:
-            outcome = _collect_delegate_job(arguments.get("job_id"))
+            outcome, evict_warning = _collect_delegate_job(job_id)
         except ValueError as exc:
             return [TextContent(type="text", text=f"Error: {exc}")]
         if outcome.get("status") == "running":
             return [TextContent(type="text", text=json.dumps(outcome))]
-        return _render_delegate_answer(outcome)
+        return _render_delegate_answer(outcome, evict_warning=evict_warning)
 
     if name == "list_sessions":
         sessions = list_sessions()
