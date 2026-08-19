@@ -534,6 +534,29 @@ by the first user. Mitigation, in scope for v1: a `coding-agent-image`
 build script in `scripts/` that pins the toolchain, and a `--check` mode that
 reports which expected tools the current image is missing.
 
+**Drift notes measured after the fact** (added 2026-08-19 by the final
+review; each is a property of the shipped image and argv, not of this design,
+and each surfaces as a confusing mid-run failure if it is not written down):
+
+- **The image is ~1 GB, not ~196 MB.** `docker image inspect .Size` reports
+  ~196 MB on Docker Desktop's containerd store, which is COMPRESSED content;
+  `docker images` reports 996 MB unpacked, and a single apt layer alone is
+  438 MB. Since this section's whole point is being honest about the cost of
+  duplication, the compressed figure understates exactly the thing it exists
+  to state.
+- **`/tmp` and `$HOME` are `noexec`.** Both are `--tmpfs` mounts and both come
+  up `noexec` (verified in a live container: an executable written there
+  fails to run, sized 3.9 GB). `/work` IS exec-able, so the intended workflow
+  is unaffected — but anything that writes-then-executes under `$TMPDIR` or
+  `$HOME` (some installers, some test harnesses that shell out to a generated
+  script) will fail in a way nobody attributes to a mount option.
+- **`git` cannot operate on `/work` at all.** A linked worktree's `.git` is a
+  FILE naming `<repo>/.git/worktrees/<name>`, and only the worktree is
+  mounted, so every git command there dies `fatal: not a git repository`.
+  Security-positive — the model cannot reach the repo's object store, config
+  or hooks — but it is not what the image's `safe.directory` config suggests,
+  and a task that asks the model to "commit your work" cannot succeed.
+
 ## 9. Error handling
 
 - Docker absent / daemon down → tool errors immediately with a one-line

@@ -96,10 +96,18 @@ def _repo_local_excludes(repo: str) -> list[tuple[str, str]]:
     """`$GIT_DIR/info/exclude` of the REAL repo — host-owned, not committed.
 
     Lowest precedence of everything considered here, so it is returned to be
-    placed first. `rev-parse --git-path` answers RELATIVE to the repository,
-    so the answer is joined onto `repo`; resolving it against this process's
-    cwd would read some OTHER repository's exclude file, letting a stranger's
-    patterns hide paths from the gate.
+    placed first. The answer is joined onto `repo` because resolving it
+    against this process's cwd would read some OTHER repository's exclude
+    file, letting a stranger's patterns hide paths from the gate.
+
+    `os.path.join` is correct for BOTH shapes `rev-parse --git-path` returns,
+    and that is worth stating because only one of them is obvious. In an
+    ordinary checkout the answer is RELATIVE (`.git/info/exclude`) and the
+    join does what it looks like. In a LINKED WORKTREE — which the MCP
+    surface accepts as `repo`, and which this project is developed in — it is
+    ABSOLUTE (`/…/ai-tools-mcp/.git/info/exclude`, verified), and
+    `os.path.join` discards its left operand. Both land on the right file; a
+    reader who assumes only the relative case will be surprised by the second.
     """
     try:
         rel = _git(repo, "rev-parse", "--git-path", "info/exclude")
