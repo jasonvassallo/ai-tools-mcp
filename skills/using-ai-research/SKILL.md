@@ -1,6 +1,6 @@
 ---
 name: using-ai-research
-description: Choose the right research tool for a question — built-in WebSearch for quick lookups, quick_research (Gemini Flash, Google Search grounding) for fast citation-backed answers, deep_research (same backend, deeper prompt) for inline multi-source synthesis, Perplexity agent_research (Search-as-Code) for bulk/enumerable research, Gemini Deep Research for long-form reports, or local_delegate (Ollama) for sensitive/private input or local text work. Use whenever the user asks a research question, requests citations, needs to investigate a topic across multiple sources, has sensitive/private input that must stay on-device, or wants to perform cheap local text work (summarize, reformat, boilerplate).
+description: Choose the right research tool for a question — built-in WebSearch for quick lookups, quick_research (Gemini Flash, Google Search grounding) for fast citation-backed answers, deep_research (same backend, deeper prompt) for inline multi-source synthesis, Perplexity agent_research (Search-as-Code, the only Perplexity-billed surface — explicit user opt-in required, never selected implicitly) for bulk/enumerable research, Gemini Deep Research for long-form reports, or local_delegate (Ollama) for sensitive/private input or local text work. Use whenever the user asks a research question, requests citations, needs to investigate a topic across multiple sources, has sensitive/private input that must stay on-device, or wants to perform cheap local text work (summarize, reformat, boilerplate).
 ---
 
 # Choosing a Research Tool
@@ -34,11 +34,16 @@ Does the answer need multi-source synthesis or cross-referencing?
 Is the task bulk/enumerable — "for each of these N CVEs/packages/vendors,
   find X" — or does it need computation over search results or a
   structured dataset (CSV/JSON-shaped answer)?
-  → Use agent_research (Perplexity Agent API, Search-as-Code). A hosted
-    sandbox agent writes code that searches per item, so every item gets
-    resolved instead of a sampled few. Takes minutes: call synchronously
-    for small fan-outs, or pass background=true and poll
-    agent_research_result (~every 30s) for large ones.
+  → agent_research (Perplexity Agent API, Search-as-Code) is the right
+    shape for this, but it is the only Perplexity-billed surface in this
+    server and must NEVER be selected implicitly. Tell the user this task
+    fits agent_research and why, and get their explicit go-ahead before
+    calling it — do not invoke it just because the task shape matches.
+    Once confirmed: a hosted sandbox agent writes code that searches per
+    item, so every item gets resolved instead of a sampled few. Takes
+    minutes: call synchronously for small fan-outs, or pass
+    background=true and poll agent_research_result (~every 30s) for
+    large ones.
 
 Is the report itself the deliverable — a multi-page citation-dense document
   the user will read or share, not just background for the conversation?
@@ -53,7 +58,7 @@ Is the report itself the deliverable — a multi-page citation-dense document
 | `WebSearch` | Built-in | <1s | Factual lookup, single answer |
 | `quick_research` | Gemini Flash (grounded) | ~2–5s | Well-scoped Q, citations needed, single source OK |
 | `deep_research` | Gemini Flash (grounded) | ~5–15s | Multi-source synthesis, cross-referencing |
-| `agent_research` | Perplexity Agent API | 1–10 min | Bulk/enumerable tasks, computation, structured output |
+| `agent_research` | Perplexity Agent API | 1–10 min | Bulk/enumerable tasks, computation, structured output — **explicit user opt-in required, never implicit** |
 | `gemini_deep_research_*` | Google Gemini | 5–60 min | Long-form report is the deliverable |
 | `local_delegate` | Local Ollama | seconds–minutes | Input must stay on-device, cheap mechanical work, or a local second opinion |
 
@@ -62,6 +67,7 @@ Is the report itself the deliverable — a multi-page citation-dense document
 - **Don't** use `deep_research` when `quick_research` suffices — same metered backend, but the larger answer budget and synthesis prompt cost more per call. Reach for it only when you actually need the multi-source synthesis.
 - **Don't** use `quick_research` (or `deep_research`) when `WebSearch` suffices — grounded requests are metered; don't spend them on cached factoids.
 - **Don't** use `agent_research` for a single research question — the per-container fee and orchestration latency are pure overhead there; `deep_research` is faster and cheaper. Reach for it only when the task enumerates items or needs computation.
+- **Don't** call `agent_research` (or `agent_research_result`) just because a task's shape matches "bulk/enumerable" — it is the only Perplexity-billed surface this server exposes and must never be selected implicitly. Surface the recommendation and get explicit user confirmation first.
 - **Don't** start `gemini_deep_research_start` for a question the user expects answered in this turn. They'll wait minutes and may abandon.
 - **Don't** poll `gemini_deep_research_result` more often than ~30 seconds. Status-completed transitions don't happen faster.
 - **Don't** drop citations from any research output — the value is in source attribution. Pass them through verbatim.
