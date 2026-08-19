@@ -12,9 +12,15 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import stat
+import subprocess
+import sys
 import tempfile
+import textwrap
+import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from coding_agent.walk import snapshot_tree, tree_hash
@@ -121,6 +127,274 @@ class SymlinkExfiltration(unittest.TestCase):
         self.assertFalse(
             any(p == ".git" or p.startswith(".git/") for p in snap.entries)
         )
+
+
+_SECRET_MARKER = b"STOLEN_SECRET_BYTES"
+_SECRET_BLOB = b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + _SECRET_MARKER + b"\n"
+
+
+def _swap_on_first_lstat(victim_abs: str, link_target: str):
+    """Return an os.lstat replacement that swaps `victim_abs` for a symlink
+    exactly ONCE, on the first lstat of that name.
+
+    This makes the TOCTOU window DETERMINISTIC instead of raced: the swap lands
+    between the classifying lstat and whatever the walk does with that
+    classification. It matches both call shapes, `os.lstat(fullpath)` (the
+    vulnerable pass-5 walk) and `os.lstat(name, dir_fd=fd)` (the fixed walk),
+    so the same test is a valid counterfactual against either.
+    """
+    real_lstat = os.lstat
+    target_name = os.path.basename(victim_abs)
+    state = {"swapped": False}
+
+    def fake_lstat(path, *args, **kwargs):
+        st = real_lstat(path, *args, **kwargs)
+        if state["swapped"]:
+            return st
+        try:
+            name = os.path.basename(os.fspath(path))
+        except TypeError:
+            return st
+        if name != target_name:
+            return st
+        state["swapped"] = True
+        if stat.S_ISDIR(st.st_mode):
+            os.rmdir(victim_abs)
+            os.symlink(link_target, victim_abs)
+        else:
+            staged = victim_abs + ".staged"
+            os.symlink(link_target, staged)
+            os.rename(staged, victim_abs)
+        return st
+
+    return fake_lstat, state
+
+
+class WalkRaceCannotDereference(unittest.TestCase):
+    """Pass 5 (2026-08-17): `snapshot_tree` classified each path with `os.lstat`
+    and then ACTED on that classification by PATH — `open(full, "rb")` for a
+    file, and `os.listdir` on a stack-queued path for a directory. Neither used
+    O_NOFOLLOW and neither re-verified the object, so a process racing the walk
+    swapped the path for a symlink and made the HOST read a host file.
+
+    Reachable in the real loop: the end-of-loop diff is protected because the
+    container is destroyed first (spec 6.5 rule 3), but the PER-TURN no-progress
+    hash runs while the container is alive, and spec 6.5 rule 1 says that window
+    cannot be closed by killing the container. Verified exploitable: a
+    separate-PROCESS swapper leaked a host private key on walk #13.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.secret_dir = Path(self.tmp) / "outside"
+        self.secret_dir.mkdir()
+        self.secret = self.secret_dir / "HOST_SECRET"
+        self.secret.write_bytes(_SECRET_BLOB)
+        self.root = Path(self.tmp) / "work"
+        self.root.mkdir()
+
+    def _assert_no_secret(self, snap, why):
+        for path, entry in snap.entries.items():
+            self.assertNotIn(
+                _SECRET_MARKER,
+                entry.data,
+                f"{why}: host secret bytes reached the snapshot via {path!r}",
+            )
+
+    def test_file_swapped_for_symlink_after_classification_is_never_read(self):
+        victim = self.root / "victim.txt"
+        victim.write_bytes(b"benign\n")
+        fake, state = _swap_on_first_lstat(str(victim), str(self.secret))
+        with unittest.mock.patch("os.lstat", fake):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertTrue(state["swapped"], "the interposition never fired")
+        self._assert_no_secret(snap, "file vector")
+        entry = snap.entries.get("victim.txt")
+        if entry is not None:
+            self.assertNotEqual(
+                entry.kind,
+                "file",
+                "a symlink planted after classification was read as a file",
+            )
+
+    def test_directory_swapped_for_symlink_after_classification_is_never_listed(self):
+        victim = self.root / "subdir"
+        victim.mkdir()
+        (self.root / "zzz_keep.txt").write_bytes(b"keep\n")
+        fake, state = _swap_on_first_lstat(str(victim), str(self.secret_dir))
+        with unittest.mock.patch("os.lstat", fake):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertTrue(state["swapped"], "the interposition never fired")
+        self._assert_no_secret(snap, "directory vector")
+        self.assertNotIn(
+            "subdir/HOST_SECRET",
+            snap.entries,
+            "the walk descended through a symlink swapped in after lstat",
+        )
+
+    def _race(self, attacker_src: str, max_walks: int, budget_s: float) -> int:
+        """Run `attacker_src` as a SEPARATE PROCESS while walking repeatedly.
+
+        The attacker MUST be a process, never a thread. Two earlier probes used
+        a Python thread and saw no leak across 620 walks: the GIL throttles the
+        swapper into losing a race it wins easily as a process. A thread-based
+        version of this test would be green while pinning nothing.
+        """
+        proc = subprocess.Popen(
+            [sys.executable, "-c", attacker_src],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        walks = 0
+        leaks: list[tuple[int, str, str]] = []
+        deadline = time.monotonic() + budget_s
+        try:
+            while walks < max_walks and time.monotonic() < deadline:
+                walks += 1
+                try:
+                    snap = snapshot_tree(str(self.root), lambda p: False)
+                except OSError as exc:
+                    # A racing writer must never take the gate offline either.
+                    self.fail(f"the walk aborted on walk #{walks}: {exc!r}")
+                for path, entry in snap.entries.items():
+                    if _SECRET_MARKER in entry.data:
+                        leaks.append((walks, path, entry.kind))
+                if leaks:
+                    break
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+        self.assertGreaterEqual(
+            walks, 50, "too few walks for the probe to mean anything"
+        )
+        self.assertEqual(
+            leaks, [], f"host secret reached the snapshot within {walks} walks"
+        )
+        return walks
+
+    def test_separate_process_file_swapper_never_leaks_host_bytes(self):
+        """File vector. The check-to-use window is lstat -> open, microseconds
+        wide, so the attacker flips as fast as it can rather than holding a
+        state: more flips, more chances to land inside the window. Measured
+        against the pass-5 walk this leaks on walk #28.
+        """
+        victim = self.root / "aaa.txt"
+        victim.write_bytes(b"benign\n")
+        benign = self.root / ".benign"
+        benign.write_bytes(b"benign\n")
+        for i in range(60):
+            (self.root / f"pad{i:03d}.txt").write_bytes(b"x" * 32)
+
+        attacker = textwrap.dedent(f"""
+            import os
+            victim = {str(victim)!r}
+            benign = {str(benign)!r}
+            secret = {str(self.secret)!r}
+            staged = victim + ".staged"
+            while True:
+                # ATTACK: a real symlink renamed over the victim. os.symlink
+                # never follows, unlike os.link, which on macOS resolves its
+                # source and would silently make this a HARDLINK probe instead.
+                try:
+                    os.symlink(secret, staged)
+                    os.rename(staged, victim)
+                except OSError:
+                    pass
+                # RESTORE: hardlink of a benign in-tree file, no secret involved.
+                try:
+                    os.link(benign, staged)
+                    os.rename(staged, victim)
+                except OSError:
+                    pass
+        """)
+        self._race(attacker, max_walks=400, budget_s=6.0)
+
+    def test_separate_process_dir_swapper_never_leaks_host_bytes(self):
+        """Directory vector, the wider of the two: the pass-5 walk queued the
+        directory's PATH on a stack and only re-resolved it with `os.listdir`
+        when it was popped — after every sibling file had been read. Here the
+        attacker HOLDS each state briefly, because this window is wide enough
+        that dwell time beats flip rate. Measured against the pass-5 walk this
+        leaks `aaa_dir/HOST_SECRET` on walk #696.
+
+        `aaa_dir` sorts first so it is classified first and popped last.
+        """
+        victim = self.root / "aaa_dir"
+        victim.mkdir()
+        for i in range(60):
+            (self.root / f"pad{i:03d}.txt").write_bytes(b"x" * 32)
+
+        attacker = textwrap.dedent(f"""
+            import os
+            victim = {str(victim)!r}
+            secret_dir = {str(self.secret_dir)!r}
+            HOLD = 2000
+            while True:
+                try:
+                    os.rmdir(victim)
+                    os.symlink(secret_dir, victim)
+                except OSError:
+                    pass
+                for _ in range(HOLD):
+                    pass
+                try:
+                    os.unlink(victim)
+                    os.mkdir(victim)
+                except OSError:
+                    pass
+                for _ in range(HOLD):
+                    pass
+        """)
+        self._race(attacker, max_walks=1500, budget_s=8.0)
+
+
+class DeepTreeCannotHideAChange(unittest.TestCase):
+    """Found while fixing the pass-5 race, not previously recorded.
+
+    The pass-5 walk addressed every entry by absolute PATH, so once a tree grew
+    past the operating system's PATH_MAX (1024 on macOS) `os.listdir` failed
+    with ENAMETOOLONG, the guarded `except OSError: continue` swallowed it, and
+    the ENTIRE subtree vanished from the snapshot with no error — a change the
+    human gate exists to review, silently absent from the diff. Measured: a
+    120-deep tree of 20-character names produced `entries=0`.
+
+    The fd-based walk addresses each child through its parent's descriptor, so
+    no single path is ever assembled and PATH_MAX never applies. Descriptor use
+    is the tree's depth (measured: depth 60 -> 61 descriptors), against a
+    1,048,576 soft limit on this host.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.root = Path(self.tmp) / "work"
+        self.root.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_file_below_path_max_still_reaches_the_snapshot(self):
+        name = "d" * 20
+        depth = 120
+        parent = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for _ in range(depth):
+                os.mkdir(name, dir_fd=parent)
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=parent)
+                os.close(parent)
+                parent = child
+            fd = os.open("buried.txt", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=parent)
+            try:
+                os.write(fd, b"A CHANGE THE GATE MUST SEE\n")
+            finally:
+                os.close(fd)
+        finally:
+            os.close(parent)
+
+        expected = "/".join([name] * depth) + "/buried.txt"
+        self.assertGreater(len(expected), 1024, "the fixture must exceed PATH_MAX")
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertIn(expected, snap.entries, "a deep subtree vanished from the diff")
+        self.assertEqual(snap.entries[expected].data, b"A CHANGE THE GATE MUST SEE\n")
 
 
 if __name__ == "__main__":
