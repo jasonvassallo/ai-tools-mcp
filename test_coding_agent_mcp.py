@@ -675,15 +675,32 @@ class BackgroundJobs(_McpCase):
         self.assertIn("single-collect", second)
         self.assertEqual(mcp_server._coding_jobs, {})
 
-    def test_a_malformed_or_unknown_job_id_is_a_clean_error(self):
-        for bad in (None, "", "not-hex", "abc", 17, "0" * 31, "0" * 33):
+    def test_a_malformed_job_id_is_rejected_by_the_VALIDATOR_not_the_lookup(self):
+        """Asserting "Error:" appeared was decorative: replacing
+        `_CODING_JOB_ID_RE` with `^.*$` left the whole suite green, because a
+        malformed id then fell through to the `Unknown job_id` branch and
+        produced an "Error:" of its own. The test pinned the message, not the
+        guard.
+
+        The guard is worth pinning on its own: the unknown-id branch
+        interpolates the caller's string into the human's context with
+        `{job_id!r}`, so the validator is what keeps an arbitrary-length,
+        arbitrary-charset value out of it. The two errors are now told apart.
+        """
+        for bad in (None, "", "not-hex", "abc", 17, "0" * 31, "0" * 33, "A" * 32):
             with self.subTest(job_id=bad):
-                self.assertIn(
-                    "Error:", self.text("coding_agent_result", {"job_id": bad})
-                )
-        self.assertIn(
-            "Unknown job_id", self.text("coding_agent_result", {"job_id": "a" * 32})
-        )
+                out = self.text("coding_agent_result", {"job_id": bad})
+                self.assertIn("Error:", out)
+                self.assertIn("must be the 32-hex id", out)
+                self.assertNotIn("Unknown job_id", out)
+
+    def test_a_well_formed_but_unknown_job_id_reaches_the_lookup(self):
+        """The other side of the same guard: a value that PASSES validation
+        must get the lookup's answer, not the validator's. Without this, a
+        validator that rejected everything would satisfy the test above."""
+        out = self.text("coding_agent_result", {"job_id": "a" * 32})
+        self.assertIn("Unknown job_id", out)
+        self.assertNotIn("must be the 32-hex id", out)
 
     def test_under_the_retention_bound_nothing_is_evicted(self):
         """The eviction slice must be guarded: an unguarded `done_ids[:excess]`

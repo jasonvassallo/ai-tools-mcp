@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import resource
 import shutil
@@ -1044,6 +1045,347 @@ class RepoDirectoryOpacityIsIdentityBased(unittest.TestCase):
         snap = snapshot_tree(str(self.root), lambda p: False)
         self.assertNotIn(".git", snap.entries)
         self.assertIn("notes.txt", snap.entries, "a sandbox-chosen name vanished")
+
+
+_NO_SPAWN_CHILD = r'''
+"""Child for the §10.1 zero-spawn assertion.
+
+An audit hook cannot be REMOVED once installed, so this cannot run inside the
+pytest process without slowing and perturbing every later test. It also must
+not run in a thread of one: the counter has to see the whole interpreter.
+"""
+import json, os, subprocess, sys, tempfile
+
+SPAWN_EVENTS = (
+    "subprocess.Popen", "os.exec", "os.posix_spawn", "os.posix_spawnp",
+    "os.system", "os.spawn", "os.fork", "os.forkpty", "pty.spawn",
+)
+seen = []
+def hook(event, args):
+    if event.startswith(SPAWN_EVENTS):
+        seen.append(event)
+sys.addaudithook(hook)
+
+sys.path.insert(0, sys.argv[1])
+from coding_agent.basetree import BaseTree
+from coding_agent.walk import Entry, snapshot_tree, tree_hash, unified_diff
+
+root = sys.argv[2]
+base = BaseTree(
+    entries={"app.py": Entry("app.py", "file", b"print(1)\n")},
+    ignore=lambda p: False,
+    tracked=frozenset({"app.py"}),
+)
+snap = snapshot_tree(root, lambda p: False)
+digest = tree_hash(snap)
+diff = unified_diff(base, snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+during = len(seen)
+
+# CONTROL: the hook must be able to COUNT. Without this, "0 spawns" is
+# indistinguishable from "the hook never fired at all".
+subprocess.run([sys.executable, "-c", "pass"], check=True)
+print(json.dumps({
+    "during": during,
+    "after_control": len(seen),
+    "entries": sorted(snap.entries),
+    "diff_len": len(diff.text),
+    "digest": digest[:12],
+}))
+'''
+
+
+class NoHostSubprocessRunsOverTheWalkOrTheDiff(unittest.TestCase):
+    """§10 item 1, literal half. The spec asks for an assertion that the
+    HOST-SIDE read path spawns no `git` — indeed no subprocess at all.
+
+    `sandbox.py`'s git calls are pinned at argv level in
+    `test_coding_agent_sandbox.py`, but that covers the calls this design
+    ACCEPTS. The property the spec actually names is about the path that runs
+    over a directory the model controls: `snapshot_tree` -> `tree_hash` ->
+    `unified_diff`. Those three replaced `git add -A`/`git diff` because
+    adversarial review reached host RCE through a sandbox-authored `.git`, and
+    nothing pinned that they stayed subprocess-free. A refactor that reached
+    for `git check-ignore`, `git hash-object` or `file(1)` for convenience
+    would reinstate the whole class silently.
+
+    A CPython audit hook is the right instrument because it observes the
+    interpreter rather than the source: it counts `subprocess.Popen`,
+    `os.exec*`, `os.posix_spawn*`, `os.system` and `os.fork` however they are
+    reached, including from inside a dependency.
+    """
+
+    def test_the_walk_hash_and_diff_spawn_no_subprocess_over_a_hostile_tree(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        root = tmp / "work"
+        root.mkdir()
+        (root / "app.py").write_text("print(2)\n")
+        # Every input that has ever tempted this code back towards git.
+        meta = root / ".git"
+        meta.mkdir()
+        (meta / "config").write_text(
+            "[core]\n\tfsmonitor = /tmp/pwn.sh\n\thooksPath = /tmp/hooks\n"
+            '[filter "evil"]\n\tclean = /tmp/pwn.sh\n\tsmudge = /tmp/pwn.sh\n'
+        )
+        (root / ".gitattributes").write_text("* filter=evil\n")
+        (root / ".gitignore").write_text("*.log\n")
+        os.symlink("/etc/passwd", root / "outward")
+        os.mkfifo(root / "pipe")
+        nested = root / "sub" / ".git"
+        nested.mkdir(parents=True)
+        (nested / "config").write_text("[core]\n\tfsmonitor = /tmp/pwn.sh\n")
+
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _NO_SPAWN_CHILD,
+                str(Path(__file__).parent),
+                str(root),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+
+        self.assertEqual(got["during"], 0, "the host read path spawned a process")
+        # MECHANISM: the hook demonstrably counts, so the zero above is a
+        # measurement and not a silently inert instrument.
+        self.assertGreater(
+            got["after_control"],
+            0,
+            "the audit hook never fired: the 0 above proves nothing",
+        )
+        # ...and the read really happened over the hostile tree.
+        self.assertIn("app.py", got["entries"])
+        self.assertGreater(got["diff_len"], 0)
+
+
+class DefenceInDepthLayersAreIndividuallyPinned(unittest.TestCase):
+    """Final review 2026-08-19: five layered defences whose layers were only
+    pinned IN PAIRS.
+
+    The mutation survey found that removing `O_NOFOLLOW` from the file read
+    left the whole suite green (the `st_ino`/`st_dev` check absorbs it), that
+    removing the `st_ino`/`st_dev` check left it green too (`O_NOFOLLOW`
+    absorbs it), and that removing BOTH leaked a host secret into the snapshot
+    on walk #238. The same held for the child-directory descent, and for the
+    two independent implementations of `.git` opacity.
+
+    A layer that no test can distinguish from its partner is a layer a future
+    maintainer deletes as redundant, with a green suite as the receipt — and
+    the suite would stay green right up until somebody removed the second one.
+    Each test below therefore turns a mutation that SURVIVED into one that
+    does not, by asserting the MECHANISM (which refusal, from which guard) and
+    not merely the outcome (no leak).
+
+    Everything here is deterministic. The races these guards defend against
+    were demonstrated with separate-process probes during the build; a probe
+    that must win a race to prove anything is a probe that reports safety when
+    it simply lost, so the window is opened by hand instead and the guard is
+    interrogated at the point it fires.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = self.tmp / "work"
+        self.root.mkdir()
+        self.outside = self.tmp / "outside"
+        self.outside.mkdir()
+        self.secret = self.outside / "id_rsa"
+        self.secret.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----\nSTOLEN\n")
+        self.fd = os.open(str(self.root), os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, self.fd)
+        self.root_dev = os.fstat(self.fd).st_dev
+
+    # -- layer 1 of 2 on the FILE read: O_NOFOLLOW --
+
+    def test_a_symlink_swapped_in_after_classification_is_refused_by_O_NOFOLLOW(self):
+        """Mutation W1 (drop `O_NOFOLLOW` from `_FILE_FLAGS`) SURVIVED the
+        whole suite: the identity check refuses the read anyway, so no secret
+        leaks and nothing goes red. The two guards are distinguishable only by
+        WHICH refusal you get — `ELOOP` means the kernel never opened the
+        symlink, `RACED` means it did and the identity check caught it after
+        the fact. Assert the first, and W1 dies.
+        """
+        victim = self.root / "victim"
+        victim.write_bytes(b"honest content\n")
+        classified = os.lstat("victim", dir_fd=self.fd)  # a REGULAR file
+        # The race window, opened by hand: the name now resolves elsewhere.
+        victim.unlink()
+        os.symlink(str(self.secret), victim)
+
+        # MECHANISM, both halves — a probe that measures the wrong object is
+        # this project's most repeated mistake (a "symlink" probe that was
+        # really a hardlink; a race probe throttled by the GIL).
+        self.assertTrue(stat.S_ISLNK(os.lstat("victim", dir_fd=self.fd).st_mode))
+        self.assertEqual(victim.read_bytes(), self.secret.read_bytes())
+        self.assertTrue(stat.S_ISREG(classified.st_mode))
+        # ...and dropping ONLY this guard really does open the host secret.
+        followed = os.open(
+            "victim", walkmod._FILE_FLAGS & ~os.O_NOFOLLOW, dir_fd=self.fd
+        )
+        try:
+            self.assertIn(b"STOLEN", os.read(followed, 4096))
+        finally:
+            os.close(followed)
+
+        got = walkmod._read_regular(
+            self.fd,
+            "victim",
+            "victim",
+            classified,
+            self.root_dev,
+            walkmod._Budget(1 << 20),
+        )
+        self.assertIsInstance(got, walkmod._Refusal)
+        self.assertEqual(
+            got.reason,
+            "ELOOP",
+            "the open followed the symlink; only the identity check refused it",
+        )
+
+    # -- layer 2 of 2 on the FILE read: the st_ino/st_dev identity check --
+
+    def test_a_different_regular_file_renamed_over_the_name_is_refused_by_identity(
+        self,
+    ):
+        """Mutation W3 (`_same_object` -> `return True`) SURVIVED: every probe
+        the suite runs plants a SYMLINK, and `O_NOFOLLOW` refuses those before
+        identity is consulted. This plants a REGULAR FILE instead, which
+        `O_NOFOLLOW` is deliberately blind to — so the identity check is the
+        only thing standing between the walk and content it never classified.
+        """
+        victim = self.root / "victim"
+        victim.write_bytes(b"honest content\n")
+        classified = os.lstat("victim", dir_fd=self.fd)
+        impostor = self.root / ".impostor"
+        impostor.write_bytes(b"BAIT-NOT-THE-CLASSIFIED-FILE\n")
+        os.rename(impostor, victim)  # atomic swap, no symlink anywhere
+
+        # MECHANISM: a different inode, and O_NOFOLLOW cannot possibly object.
+        now = os.lstat("victim", dir_fd=self.fd)
+        self.assertTrue(stat.S_ISREG(now.st_mode))
+        self.assertNotEqual(now.st_ino, classified.st_ino)
+        probe = os.open("victim", walkmod._FILE_FLAGS, dir_fd=self.fd)
+        os.close(probe)  # O_NOFOLLOW opens it happily: identity is the guard
+
+        got = walkmod._read_regular(
+            self.fd,
+            "victim",
+            "victim",
+            classified,
+            self.root_dev,
+            walkmod._Budget(1 << 20),
+        )
+        self.assertIsInstance(got, walkmod._Refusal)
+        self.assertEqual(got.reason, walkmod._RACED)
+        self.assertNotIsInstance(got, Entry)
+
+    # -- layer 1 of 2 on the DIRECTORY descent: O_NOFOLLOW --
+
+    def test_a_symlinked_directory_swapped_in_is_refused_by_O_NOFOLLOW(self):
+        """Mutation W23b (drop `O_NOFOLLOW` at the child-descent `os.open`)
+        SURVIVED: the descent's own identity check absorbs it. Same asymmetry
+        as the file read, same fix — assert which guard refused, not merely
+        "no leak".
+
+        The refusal here is `ENOTDIR`, not `ELOOP`, and that was MEASURED
+        rather than assumed: with `O_NOFOLLOW` set, macOS evaluates
+        `O_DIRECTORY` against the symlink itself, which is not a directory.
+        Linux answers `ELOOP` for the same call. Either way it is a KERNEL
+        refusal at open time, which is exactly what distinguishes it from the
+        identity check's `RACED` after a successful open.
+        """
+        sub = self.root / "sub"
+        sub.mkdir()
+        classified = os.lstat("sub", dir_fd=self.fd)  # a REAL directory
+        sub.rmdir()
+        os.symlink(str(self.outside), sub)
+
+        # MECHANISM, three ways: it really is a symlink, it really reaches the
+        # host directory holding the secret, and dropping ONLY this guard
+        # really does open that directory — so the assertion below is
+        # measuring O_NOFOLLOW and not some unrelated refusal.
+        self.assertTrue(stat.S_ISLNK(os.lstat("sub", dir_fd=self.fd).st_mode))
+        self.assertIn("id_rsa", os.listdir(str(sub)))
+        self.assertTrue(stat.S_ISDIR(classified.st_mode))
+        followed = os.open("sub", walkmod._DIR_FLAGS & ~os.O_NOFOLLOW, dir_fd=self.fd)
+        try:
+            self.assertNotEqual(os.fstat(followed).st_ino, classified.st_ino)
+        finally:
+            os.close(followed)
+
+        got = walkmod._open_child_dir(self.fd, "sub", "sub/", classified, self.root_dev)
+        self.assertIsInstance(got, walkmod._Refusal)
+        self.assertIn(
+            got.reason,
+            {"ENOTDIR", "ELOOP"},
+            "the descent followed the symlink; only the identity check refused it",
+        )
+        self.assertNotEqual(got.reason, walkmod._RACED)
+
+    # -- the two independent implementations of `.git` opacity --
+
+    def test_visit_refuses_to_treat_a_non_metadata_object_as_metadata(self):
+        """Mutation W11c (drop the `st_ino`/`st_dev` half of `_visit`'s `.git`
+        check) SURVIVED, because `snapshot_tree`'s outer prefix-skip hides any
+        top-level `.git` by name before `_visit` is ever consulted. The layer
+        is real all the same: `_visit`'s rule is "opaque because it IS the
+        repository's metadata", and without identity it degrades to "opaque
+        because it is CALLED .git" — a rule the sandbox can satisfy, since a
+        linked worktree's `.git` is an ordinary file it can overwrite.
+
+        Asserted at `_visit`, which owns the decision, precisely because the
+        outer skip masks it one level up. If that skip is ever removed as
+        redundant, this layer becomes load-bearing with no warning.
+        """
+        meta = self.root / ".git"
+        meta.write_text("SANDBOX-AUTHORED, not the repository's metadata\n")
+        stale = (-1, -1)  # the identity the real metadata entry HAD
+
+        got = walkmod._visit(
+            self.fd,
+            ".git",
+            ".git",
+            lambda p: False,
+            self.root_dev,
+            walkmod._Budget(1 << 20),
+            stale,
+        )
+        self.assertIsNotNone(
+            got.entry, "a sandbox-authored file vanished as 'metadata'"
+        )
+        self.assertIn(b"SANDBOX-AUTHORED", got.entry.data)
+
+    def test_the_outer_prefix_skip_keeps_git_opaque_when_identity_no_longer_matches(
+        self,
+    ):
+        """Mutation W18 (drop the outer prefix-skip) SURVIVED, because
+        `_visit`'s own check covers the ordinary case. Its unique job is the
+        case `_visit` cannot cover: the recorded metadata identity is read
+        ONCE, at the top of the walk, and the sandbox can replace the entry
+        afterwards — after which `_visit` sees a name it matches and an
+        identity it does not, and would show the file.
+
+        `_meta_identity` is interposed to produce that post-swap state
+        deterministically rather than by racing a real swap; the test above is
+        the control proving `_visit` really does return an entry in it.
+        """
+        (self.root / "app.py").write_text("print(1)\n")
+        (self.root / ".git").write_text("gitdir: /elsewhere/worktrees/wt\n")
+
+        with unittest.mock.patch.object(
+            walkmod, "_meta_identity", return_value=(-1, -1)
+        ):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+
+        self.assertIn("app.py", snap.entries)
+        self.assertNotIn(".git", snap.entries)
+        self.assertEqual([u.path for u in snap.unreadable], [])
 
 
 # ---------------------------------------------------------------------------

@@ -137,6 +137,66 @@ class NoHostGitEverRunsInTheWorktree(unittest.TestCase):
             ["git", "-C", wt, "config", "core.fsmonitor", str(self.payload)], check=True
         )
 
+    # Every hook name git will resolve out of `core.hooksPath`. Which git
+    # commands fire which of these was MEASURED, not assumed, because the
+    # obvious short list made the test vacuous: `post-commit`/`pre-commit`
+    # need a commit, so a teardown that ran `git -C <worktree> status`
+    # executed nothing and the test passed anyway. The two that matter for a
+    # plausible teardown bug are `post-index-change` (fires on a bare `git
+    # status` whenever the index needs rewriting) and `reference-transaction`
+    # (fires on `git reset --hard`).
+    _HOOK_NAMES = (
+        "applypatch-msg",
+        "pre-applypatch",
+        "post-applypatch",
+        "pre-commit",
+        "pre-merge-commit",
+        "prepare-commit-msg",
+        "commit-msg",
+        "post-commit",
+        "pre-rebase",
+        "post-checkout",
+        "post-merge",
+        "pre-push",
+        "pre-auto-gc",
+        "post-rewrite",
+        "post-index-change",
+        "reference-transaction",
+    )
+
+    def _arm_hooks(self, wt: str) -> None:
+        """§10 item 2's second named vector, `core.hooksPath`.
+
+        Substantively subsumed by `_arm` — the asserted property is "no host
+        git runs here at all", and one executing config key proves that as
+        well as another — but the spec names this one specifically and it is a
+        DIFFERENT execution mechanism inside git (a hook binary resolved from
+        a directory, not a command string invoked for a config value), so a
+        change could plausibly close one route and leave the other.
+
+        The worktree is left with a STALE INDEX on purpose: that is what makes
+        even a read-only-looking `git status` rewrite the index and fire
+        `post-index-change`, so the fixture is armed against the shape a
+        teardown bug actually takes rather than only against `git commit`.
+        """
+        hooks = self.scratch / "hooks"
+        hooks.mkdir(exist_ok=True)
+        for name in self._HOOK_NAMES:
+            hook = hooks / name
+            hook.write_text(f"#!/bin/sh\necho PWNED > {self.marker}\nexit 0\n")
+            hook.chmod(0o755)
+        os.remove(os.path.join(wt, ".git"))
+        subprocess.run(["git", "init", "-q", wt], check=True)
+        subprocess.run(
+            ["git", "-C", wt, "config", "core.hooksPath", str(hooks)], check=True
+        )
+        subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, check=False)
+        # Make the index stale so the next read refreshes (and rewrites) it.
+        with open(os.path.join(wt, "f"), "w") as fh:
+            fh.write("dirtied by the sandbox\n")
+        os.utime(os.path.join(wt, "f"), (0, 0))
+        self.marker.unlink(missing_ok=True)  # arming itself must not count
+
     def test_MECHANISM_the_planted_payload_really_executes_if_git_runs_there(
         self,
     ) -> None:
@@ -160,6 +220,43 @@ class NoHostGitEverRunsInTheWorktree(unittest.TestCase):
         problems = teardown_worktree(str(self.repo), wt)
         self.assertEqual(problems, [])
         self.assertFalse(self.marker.exists(), "host RCE: the payload executed")
+        self.assertFalse(os.path.exists(wt))
+        self.assertNotIn(wt, _registered(self.repo))
+
+    def test_MECHANISM_a_hooksPath_payload_really_executes_if_git_runs_there(
+        self,
+    ) -> None:
+        """The control for the `core.hooksPath` case, for the same reason the
+        `core.fsmonitor` one has one: a payload that could never have fired
+        makes the test below pass for free.
+
+        The command is a bare `git status` — the most innocuous-looking thing
+        a teardown could be tempted to run inside the worktree, and enough to
+        execute a hook against this fixture. An earlier version of this
+        control used `git commit`, which passed while a `git status` mutation
+        of the teardown went undetected.
+        """
+        wt = create_worktree(str(self.repo), "HEAD")
+        self.strays.append(wt)
+        self._arm_hooks(wt)
+        self.assertFalse(self.marker.exists(), "arming itself fired the hook")
+        subprocess.run(["git", "-C", wt, "status"], capture_output=True, check=False)
+        self.assertTrue(
+            self.marker.exists(),
+            "the hook never fired: this fixture proves nothing",
+        )
+        self.assertEqual(self.marker.read_text().strip(), "PWNED")
+        teardown_worktree(str(self.repo), wt)
+
+    def test_teardown_of_a_hooksPath_armed_worktree_executes_nothing(self) -> None:
+        """§10 item 2. Same property as the `core.fsmonitor` case, through
+        git's other execution mechanism."""
+        wt = create_worktree(str(self.repo), "HEAD")
+        self.strays.append(wt)
+        self._arm_hooks(wt)
+        problems = teardown_worktree(str(self.repo), wt)
+        self.assertEqual(problems, [])
+        self.assertFalse(self.marker.exists(), "host RCE: a hook executed")
         self.assertFalse(os.path.exists(wt))
         self.assertNotIn(wt, _registered(self.repo))
 
