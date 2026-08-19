@@ -11,13 +11,14 @@ Run:  uv run --with pytest --with pathspec pytest test_coding_agent_walk.py -q
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 from coding_agent.basetree import make_ignore, read_base_tree
-from coding_agent.walk import snapshot_tree, tree_hash
+from coding_agent.walk import snapshot_tree, tree_hash, unified_diff
 
 
 class SnapshotBasics(unittest.TestCase):
@@ -347,6 +348,110 @@ class IgnoreComposesWithWalk(unittest.TestCase):
         # directory is still ignored, so walking that directory is not a
         # blanket un-ignore.
         self.assertNotIn("ignored-dir/scratch.py", snap.entries)
+
+
+class ExecutableBitIsRecordedByTheWalk(unittest.TestCase):
+    """The walk half of mode visibility. `chmod +x` changes no bytes, so
+    unless the walk carries the bit there is nothing downstream can render.
+
+    Only the OWNER execute bit is read, which is exactly what git records
+    (`ce_mode_from_stat`: `mode & 0100 ? 100755 : 100644`). Tracking group or
+    other would report a mode change for a file git itself calls unchanged.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        (self.root / "plain.txt").write_text("hi\n")
+        (self.root / "tool.sh").write_text("#!/bin/sh\n")
+        os.chmod(self.root / "tool.sh", 0o755)
+        os.symlink("plain.txt", self.root / "link")
+
+    def test_modes_match_what_git_would_store(self):
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(snap.entries["plain.txt"].mode, "100644")
+        self.assertFalse(snap.entries["plain.txt"].executable)
+        self.assertEqual(snap.entries["tool.sh"].mode, "100755")
+        self.assertTrue(snap.entries["tool.sh"].executable)
+        self.assertEqual(snap.entries["link"].mode, "120000")
+
+    def test_a_group_only_execute_bit_is_not_reported_as_executable(self):
+        os.chmod(self.root / "plain.txt", 0o644 | 0o010)
+        snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(snap.entries["plain.txt"].mode, "100644")
+
+    def test_the_no_progress_hash_moves_when_a_file_becomes_executable(self):
+        """§7's stuck-detector must see the same changes the diff does, or a
+        turn that only flips a mode bit reads as no progress."""
+        before = tree_hash(snapshot_tree(str(self.root), lambda p: False))
+        os.chmod(self.root / "plain.txt", 0o755)
+        after = snapshot_tree(str(self.root), lambda p: False)
+        self.assertEqual(after.entries["plain.txt"].data, b"hi\n")  # bytes unchanged
+        self.assertNotEqual(before, tree_hash(after))
+
+
+class ModeIsConsistentAcrossBothSides(unittest.TestCase):
+    """The seam that makes the mode fix safe rather than noisy.
+
+    A walk that reports the execute bit against a base tree that does not
+    would call every committed 100755 file a mode change on turn one. Only a
+    REAL `ls-tree` read compared against a REAL checkout proves the two
+    encodings agree; asserting them against each other proves nothing.
+
+    The repository and the walked directory are SEPARATE, as they are in
+    production: git only ever runs against `self.repo`, and only the copy is
+    ever walked or modified (§6.5 — no host-side git in the worktree, ever).
+    """
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        _mkrepo(self.repo)
+        (self.repo / "plain.txt").write_text("hi\n")
+        (self.repo / "tool.sh").write_text("#!/bin/sh\necho hi\n")
+        os.chmod(self.repo / "tool.sh", 0o755)
+        os.symlink("plain.txt", self.repo / "link")
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True)
+        _commit(self.repo, "base")
+        self.base = read_base_tree(str(self.repo), "HEAD")
+        # What the sandbox is handed: the same content, no repo metadata.
+        # copytree's copy2 preserves the mode bits, which is the point.
+        self.work = Path(tempfile.mkdtemp()) / "work"
+        shutil.copytree(
+            self.repo, self.work, symlinks=True, ignore=shutil.ignore_patterns(".git")
+        )
+
+    def _diff(self):
+        snap = snapshot_tree(str(self.work), make_ignore(self.base))
+        return unified_diff(
+            self.base, snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp()
+        )
+
+    def test_the_base_tree_carries_gits_own_mode(self):
+        self.assertEqual(self.base.entries["tool.sh"].mode, "100755")
+        self.assertEqual(self.base.entries["plain.txt"].mode, "100644")
+        self.assertEqual(self.base.entries["link"].mode, "120000")
+
+    def test_an_untouched_checkout_produces_no_diff_at_all(self):
+        d = self._diff()
+        self.assertEqual(d.changed_files, [])
+        self.assertEqual(d.text, "")
+
+    def test_chmod_plus_x_is_the_only_thing_reported(self):
+        os.chmod(self.work / "plain.txt", 0o755)
+        d = self._diff()
+        self.assertEqual(d.changed_files, ["plain.txt"])
+        self.assertIn("old mode 100644", d.text)
+        self.assertIn("new mode 100755", d.text)
+        self.assertNotIn("@@", d.text)  # no content hunk: the bytes are identical
+        self.assertNotIn("tool.sh", d.text)  # already 100755 on both sides
+
+    def test_an_edit_and_a_mode_change_are_both_reported(self):
+        (self.work / "plain.txt").write_text("hi\nthere\n")
+        os.chmod(self.work / "plain.txt", 0o755)
+        d = self._diff()
+        self.assertEqual(d.changed_files, ["plain.txt"])
+        self.assertIn("old mode 100644", d.text)
+        self.assertIn("new mode 100755", d.text)
+        self.assertIn("+there", d.text)
 
 
 if __name__ == "__main__":
