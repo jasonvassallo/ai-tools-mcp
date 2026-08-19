@@ -2,7 +2,7 @@
   "manifest_version": "0.3",
   "name": "ai-tools-mcp",
   "display_name": "AI Tools MCP",
-  "version": "1.5.7",
+  "version": "1.5.8",
   "description": "Perplexity Sonar (quick), Sonar Pro (deep), and Agent API Search-as-Code (bulk) research, Google Gemini Deep Research (async, long-form reports), local Ollama delegation, and local conversation-session persistence \u2014 exposed as 13 MCP tools.",
   "long_description": "Five families of tools: (1) quick_research uses Perplexity Sonar for fast single-source citation-backed answers, and deep_research uses Sonar Pro for inline multi-source synthesis. (2) agent_research drives Perplexity's Agent API with the sandbox tool (Search as Code): a hosted agent writes and runs code that searches programmatically, covering every item in bulk/enumerable research tasks \u2014 synchronous or background via agent_research_result polling. (3) gemini_deep_research_start/_result run long-form research tasks (5\u201360 minutes) on Google's Deep Research model and poll for results. (4) local_delegate sends a task to a local-first Ollama endpoint chain \u2014 input stays on your own machines: on-device when localhost serves the model, otherwise only your own Cloudflare-Access-gated endpoint, never a third-party API \u2014 synchronously or in the background via local_delegate_result polling. (5) list/save/load/update/delete_session persist conversations to ~/.claude/sessions/ with secret redaction at the boundary.",
   "author": {
@@ -99,11 +99,11 @@
     },
     {
       "name": "local_delegate",
-      "description": "Delegate a task to a local Ollama model (default gemma4:12b-nvfp4) via a local-first endpoint chain \u2014 input stays on your own machines: on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API (synchronous by default, or background=true returns a job_id)."
+      "description": "Delegate a task to a local Ollama model (default gemma4:12b-nvfp4) via a local-first endpoint chain \u2014 input stays on your own machines: on-device when localhost serves the model, otherwise only your own Access-gated endpoint, never a third-party API. Synchronous by default; background=true returns a job_id, preferring the durable queue service ('q'-prefixed id, survives restarts) with an in-memory fallback when no queue is reachable."
     },
     {
       "name": "local_delegate_result",
-      "description": "Poll a background local_delegate job by job_id (single-collect: retrieving the result clears the job)."
+      "description": "Poll a background local_delegate job by job_id. 'q'-prefixed durable-queue jobs persist until a 72h TTL and can be re-fetched; legacy 32-hex in-memory jobs are single-collect (retrieving the result clears the job)."
     },
     {
       "name": "list_sessions",

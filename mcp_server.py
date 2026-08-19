@@ -41,7 +41,9 @@ MCP server providing five families of tools:
   off by default) via an ordered endpoint chain:
   localhost first, then the user's own Cloudflare-Access-gated
   remote. Input text never leaves the user's machines; background
-  jobs are in-memory and single-collect.
+  jobs prefer the durable queue service (queue_server.py, encrypted
+  at rest, results persist until a TTL) when one is reachable,
+  falling back to the legacy in-memory single-collect store.
 - ``list_sessions`` / ``save_session`` / ``load_session`` /
   ``update_session`` / ``delete_session``: local conversation-session
   persistence backed by ``~/.claude/sessions/``.
@@ -2262,7 +2264,10 @@ def _collect_delegate_job(job_id: str | None) -> dict[str, Any]:
     """Poll/collect a background job. Completed jobs are single-collect:
     the registry entry is deleted on retrieval so memory stays clean."""
     if not isinstance(job_id, str) or not _DELEGATE_JOB_ID_RE.fullmatch(job_id):
-        raise ValueError("job_id must be the 32-hex id returned by local_delegate.")
+        raise ValueError(
+            "job_id must be an id returned by local_delegate — either the "
+            "32-hex in-memory form or the 'q'-prefixed durable-queue form."
+        )
     job = _delegate_jobs.get(job_id)
     if job is None:
         raise ValueError(
@@ -2288,6 +2293,219 @@ def _collect_delegate_job(job_id: str | None) -> dict[str, Any]:
                 "ceiling and was cancelled"
             ),
         }
+
+
+# ─── Durable delegate queue client (v1.6) ─────────────────────────────
+#
+# queue_server.py (deployed on JVMBPro as a LaunchAgent, see
+# deploy/jvmbpro-delegate-queue/) provides a durable submit/poll queue in
+# front of the local Ollama: jobs are persisted encrypted-at-rest in
+# SQLite, survive restarts on both ends, and results remain collectable
+# until a 72 h TTL. background=true delegate calls prefer it; when no
+# queue endpoint is reachable the legacy in-memory single-collect path is
+# used unchanged, flagged with a "warning" field. Queue job ids carry a
+# "q" prefix, which is how local_delegate_result routes a poll.
+_QUEUE_URLS_ENV_VAR = "AI_TOOLS_QUEUE_URLS"
+_QUEUE_DEFAULT_CHAIN: tuple[str, ...] = (
+    "http://localhost:11438",
+    "https://queue-mbp.djvassallo.com",
+)
+_QUEUE_HEALTH_TIMEOUT_S = 2.0
+_QUEUE_REQUEST_TIMEOUT_S = 10.0
+_QUEUE_JOB_ID_RE = re.compile(r"^q[0-9a-f]{32}$")
+
+
+def _resolve_queue_chain() -> list[str]:
+    """Ordered queue endpoint chain (env CSV override, else defaults).
+
+    Every entry passes _validate_ollama_endpoint — the same fail-closed
+    rules as the Ollama chain: loopback may be http, any other host must
+    be https (the Access-gated tunnel), and URL userinfo is rejected.
+    """
+    raw = os.environ.get(_QUEUE_URLS_ENV_VAR, "").strip()
+    if raw:
+        entries = [e.strip() for e in raw.split(",") if e.strip()]
+    else:
+        entries = list(_QUEUE_DEFAULT_CHAIN)
+    chain: list[str] = []
+    for entry in entries:
+        validated = _validate_ollama_endpoint(entry)
+        if validated not in chain:
+            chain.append(validated)
+    return chain
+
+
+async def _select_queue_endpoint() -> tuple[str, dict[str, str]] | None:
+    """First healthy queue endpoint → (endpoint, auth headers), else None.
+
+    Reuses _ollama_auth_headers deliberately: the SAME Cloudflare Access
+    service token gates the queue hostname, and its fail-closed contract
+    carries over — a remote endpoint whose credentials are unavailable is
+    skipped entirely, never called bare. The short /healthz probe bounds
+    the cost of the queue-first attempt when nothing is listening.
+    """
+    client = await _get_http_client()
+    for endpoint in await asyncio.to_thread(_resolve_queue_chain):
+        headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+        if headers is None:
+            continue
+        try:
+            # Server-sourced auth + operator-configured endpoint — same
+            # rationale as _probe_endpoint_tags.
+            response = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+                f"{endpoint}/healthz",
+                headers=headers,
+                timeout=_QUEUE_HEALTH_TIMEOUT_S,
+            )
+            response.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.RequestError):
+            continue
+        return endpoint, headers
+    return None
+
+
+async def _queue_submit(payload: dict[str, Any]) -> str | None:
+    """Submit a chat payload to the durable queue → job id, or None.
+
+    None means "the durable queue definitely did NOT take this job" —
+    no healthy endpoint, connect failure (request never reached the
+    service), or the service answered with an error status — and the
+    caller may safely fall back to the in-memory store.
+
+    Raises ValueError on an AMBIGUOUS outcome: the request may have
+    reached the service (read timeout / dropped connection mid-exchange)
+    or provably did (HTTP 200 whose body we could not extract a job id
+    from). Falling back would risk executing the same payload twice —
+    once by the queue's worker, once in-memory — so the caller must NOT
+    fall back; it surfaces the error and the user decides whether to
+    resubmit.
+    """
+    selected = await _select_queue_endpoint()
+    if selected is None:
+        return None
+    endpoint, headers = selected
+    client = await _get_http_client()
+    try:
+        # Same server-sourced-auth / operator-configured-endpoint
+        # rationale as _post_ollama_chat.
+        response = await client.post(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+            f"{endpoint}/v1/jobs",
+            json=payload,
+            headers=headers,
+            timeout=_QUEUE_REQUEST_TIMEOUT_S,
+        )
+        response.raise_for_status()
+        data = response.json()
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # The request never reached the service; safe to fall back.
+        return None
+    except httpx.HTTPStatusError:
+        # The service answered and refused (400/413/429/5xx): the job
+        # was not enqueued; safe to fall back.
+        return None
+    except (httpx.RequestError, ValueError) as exc:
+        raise ValueError(
+            "Durable queue submit outcome is unknown "
+            f"({type(exc).__name__} after the request was sent): the job "
+            "may already be enqueued server-side. Not falling back to the "
+            "in-memory store — that could execute the prompt twice. "
+            "Re-run the call to retry."
+        ) from exc
+    job_id = data.get("job_id") if isinstance(data, dict) else None
+    if not isinstance(job_id, str) or not _QUEUE_JOB_ID_RE.fullmatch(job_id):
+        # HTTP 200 means the queue accepted the job even though the
+        # body is unusable — falling back would duplicate execution.
+        raise ValueError(
+            "Durable queue accepted the job (HTTP 200) but returned no "
+            "usable job_id. Not falling back to the in-memory store — "
+            "that could execute the prompt twice. The job will run and "
+            "expire server-side; re-run the call to retry."
+        )
+    return job_id
+
+
+async def _queue_poll(job_id: str) -> dict[str, Any]:
+    """Poll a durable queue job, mapped onto the delegate envelope contract.
+
+    Returns {"status": "running", "elapsed_s": ...} while the job is
+    queued/running, the stored Ollama chat response once done (renderable
+    by _render_delegate_answer), or a {"status": "failed", ...} envelope.
+    Raises ValueError — a clean, retryable tool error — when no queue
+    endpoint is reachable: the job is durable server-side, so "try again
+    later" is the honest answer, not a terminal failure.
+
+    Each queue endpoint has its own independent store, so a 404 from one
+    endpoint only proves the job is unknown THERE — the walk continues
+    down the chain rather than declaring the job purged. Only when every
+    reachable endpoint says 404 does the error report the honest set of
+    possibilities (wrong/unreachable endpoint, or the 72 h purge).
+    """
+    client = await _get_http_client()
+    response: Any = None
+    headers: dict[str, str] = {}
+    tried_404: list[str] = []
+    last_request_error: httpx.RequestError | None = None
+    for endpoint in await asyncio.to_thread(_resolve_queue_chain):
+        endpoint_headers = await asyncio.to_thread(_ollama_auth_headers, endpoint)
+        if endpoint_headers is None:
+            continue
+        try:
+            # Same server-sourced-auth / operator-configured-endpoint
+            # rationale as _probe_endpoint_tags.
+            candidate = await client.get(  # nosemgrep: python.mcp.mcp-auth-passthrough-taint.mcp-auth-passthrough-taint
+                f"{endpoint}/v1/jobs/{job_id}/result",
+                headers=endpoint_headers,
+                timeout=_QUEUE_REQUEST_TIMEOUT_S,
+            )
+        except httpx.RequestError as exc:
+            last_request_error = exc
+            continue
+        if candidate.status_code == 404:
+            tried_404.append(endpoint)
+            continue
+        response = candidate
+        headers = endpoint_headers
+        break
+    if response is None:
+        if tried_404:
+            where = ", ".join(redact_secrets(e) for e in tried_404)
+            raise ValueError(
+                f"Queue job_id {job_id!r} is unknown to the reachable queue "
+                f"endpoint(s) ({where}). Either the endpoint that accepted "
+                "it is currently unreachable, or the job finished and was "
+                "purged (72 hours after completion)."
+            )
+        if last_request_error is not None:
+            raise ValueError(
+                f"Queue request error: "
+                f"{redact_secrets(str(last_request_error))}. The job is "
+                "durable server-side — retry local_delegate_result later."
+            ) from last_request_error
+        raise ValueError(
+            "No queue endpoint reachable to poll this durable job. The job "
+            "is persisted server-side — retry local_delegate_result later."
+        )
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return _http_error_payload(exc, scrub=tuple(headers.values()))
+    try:
+        data = response.json()
+    except ValueError:
+        return {"status": "failed", "error": "invalid JSON from queue service"}
+    if not isinstance(data, dict):
+        return {"status": "failed", "error": "invalid response from queue service"}
+    if "result" in data:
+        result = data["result"]
+        if not isinstance(result, dict):
+            return {"status": "failed", "error": "invalid result from queue service"}
+        return result
+    elapsed = data.get("elapsed_s", 0)
+    return {
+        "status": "running",
+        "elapsed_s": elapsed if isinstance(elapsed, int) else 0,
+        "queue": "durable",
+    }
 
 
 # Create MCP server
@@ -2524,7 +2742,9 @@ async def list_tools() -> list[Tool]:
                 "work (summaries, boilerplate, drafts, bulk transforms) that "
                 "doesn't need frontier quality; an independent second opinion "
                 "on code or text; or long background jobs (pass "
-                "background=true, poll local_delegate_result). No web access "
+                "background=true, poll local_delegate_result — durable via "
+                "the queue service when reachable, in-memory fallback "
+                "otherwise). No web access "
                 "— for research use the research tools instead. The model is "
                 "strong at code and structured transforms but far below "
                 "frontier models on hard reasoning: keep tasks well-scoped."
@@ -2599,7 +2819,15 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                         "description": (
                             "true: return a job_id immediately; poll "
-                            "local_delegate_result. false: wait for the answer."
+                            "local_delegate_result. Prefers the durable "
+                            "queue service when reachable ('q'-prefixed "
+                            "job_id, envelope carries queue='durable'): the "
+                            "job survives restarts and its result persists "
+                            "until a 72h TTL. Otherwise falls back to the "
+                            "in-memory store (32-hex job_id, single-collect, "
+                            "dies with the server) and the envelope carries "
+                            "a warning saying so. false: wait for the "
+                            "answer."
                         ),
                     },
                     "keep_alive": {
@@ -2636,15 +2864,22 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Poll/collect a background local_delegate job by job_id. "
                 "Returns running status with elapsed seconds, or the answer. "
-                "Results are single-collect: once retrieved the job is gone. "
-                "Jobs live in server memory only and do not survive restarts."
+                "'q'-prefixed ids are durable queue jobs: they survive "
+                "restarts and the result can be re-fetched any number of "
+                "times until the queue purges it (72h after completion). "
+                "Legacy 32-hex ids are in-memory jobs: single-collect (once "
+                "retrieved the job is gone) and lost on server restart."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "job_id": {
                         "type": "string",
-                        "description": "The 32-hex job id returned by local_delegate.",
+                        "description": (
+                            "The job id returned by local_delegate: "
+                            "'q'+32-hex (durable queue) or bare 32-hex "
+                            "(in-memory)."
+                        ),
                     },
                 },
                 "required": ["job_id"],
@@ -3257,6 +3492,41 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             payload["keep_alive"] = keep_alive
 
         if background:
+            # Queue-first (v1.6): a reachable durable queue wins — the job
+            # survives MCP server restarts and its result persists until
+            # the queue's TTL instead of being single-collect. An
+            # AMBIGUOUS submit (ValueError) is surfaced as an error
+            # instead of falling back: the queue may already hold the
+            # job, and running it in-memory too would execute the prompt
+            # twice.
+            try:
+                queue_job_id = await _queue_submit(payload)
+            except ValueError as exc:
+                return [
+                    TextContent(type="text", text=f"Error: {redact_secrets(str(exc))}")
+                ]
+            if queue_job_id is not None:
+                if model_arg is None:
+                    # The implicit model was resolved against the OLLAMA
+                    # chain (locality-first), but the queue's worker
+                    # executes against ITS OWN configured upstream, which
+                    # may not serve the resolved tag. Say so rather than
+                    # letting a later "upstream HTTP 404" surprise.
+                    advisory += (
+                        f"Note: model {model} was resolved against this "
+                        "machine's Ollama chain, but the durable queue "
+                        "executes jobs against its own upstream — if that "
+                        "upstream does not serve this tag the job will "
+                        "fail; pass model= explicitly to be sure.\n\n"
+                    )
+                envelope = {
+                    "job_id": queue_job_id,
+                    "status": "started",
+                    "queue": "durable",
+                }
+                if advisory:
+                    envelope["warning"] = advisory.strip()
+                return [TextContent(type="text", text=json.dumps(envelope))]
             try:
                 job_id = _start_delegate_job(payload, pre_unload=pre_unload)
             except ValueError as exc:
@@ -3264,8 +3534,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             # Carried as a JSON field, NOT prepended: this envelope is
             # json.loads()-ed by callers, so a bare prefix would break parsing.
             envelope = {"job_id": job_id, "status": "started"}
-            if advisory:
-                envelope["warning"] = advisory.strip()
+            fallback_note = (
+                "No durable queue endpoint reachable — job started in the "
+                "in-memory store instead: it will not survive an MCP server "
+                "restart and its result is single-collect."
+            )
+            envelope["warning"] = (
+                f"{advisory.strip()} {fallback_note}" if advisory else fallback_note
+            )
             return [
                 TextContent(
                     type="text",
@@ -3277,8 +3553,21 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         return _render_delegate_answer(data, prefix=advisory)
 
     if name == "local_delegate_result":
+        job_id = arguments.get("job_id")
+        if isinstance(job_id, str) and _QUEUE_JOB_ID_RE.fullmatch(job_id):
+            # "q"-prefixed ids belong to the durable queue service; the
+            # legacy 32-hex in-memory path below is untouched.
+            try:
+                outcome = await _queue_poll(job_id)
+            except ValueError as exc:
+                return [
+                    TextContent(type="text", text=f"Error: {redact_secrets(str(exc))}")
+                ]
+            if outcome.get("status") == "running":
+                return [TextContent(type="text", text=json.dumps(outcome))]
+            return _render_delegate_answer(outcome)
         try:
-            outcome = _collect_delegate_job(arguments.get("job_id"))
+            outcome = _collect_delegate_job(job_id)
         except ValueError as exc:
             return [TextContent(type="text", text=f"Error: {exc}")]
         if outcome.get("status") == "running":

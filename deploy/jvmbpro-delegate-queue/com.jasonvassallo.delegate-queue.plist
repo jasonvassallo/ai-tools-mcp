@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Durable delegate queue service (queue_server.py) for JVMBPro.
+
+	  LaunchAgent, NOT LaunchDaemon, deliberately: the service reads its
+	  AES key via security(1) and calls the user's Ollama LaunchAgent on
+	  loopback — both live in the user GUI session, matching the house
+	  pattern of the sibling com.jasonvassallo.ollama-nothink-proxy
+	  LaunchAgent. (The key item itself lives in the SYSTEM keychain
+	  because the JVMBPro login keychain is GUI-locked over SSH; the
+	  System keychain is readable from a user-session process.)
+
+	  Install: ~/Library/LaunchAgents/com.jasonvassallo.delegate-queue.plist
+	  Bootstrap: launchctl bootstrap gui/501 <path>  (see DEPLOY.md)
+	-->
+	<key>Label</key>
+	<string>com.jasonvassallo.delegate-queue</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/uv</string>
+		<string>run</string>
+		<string>/Users/jasonvassallo/.local/bin/queue_server.py</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>QUEUE_PORT</key>
+		<string>11438</string>
+		<key>QUEUE_UPSTREAM</key>
+		<string>http://127.0.0.1:11434</string>
+		<key>UV_PRERELEASE</key>
+		<string>if-necessary</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<!--
+	  KeepAlive on failure only: a missing/invalid DELEGATE_QUEUE_KEY is a
+	  deliberate fail-closed exit(1); SuccessfulExit=false makes launchd
+	  restart crashes but respect a clean stop. ThrottleInterval bounds
+	  the restart loop while the key is unprovisioned.
+	-->
+	<key>KeepAlive</key>
+	<dict>
+		<key>SuccessfulExit</key>
+		<false/>
+	</dict>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>StandardOutPath</key>
+	<string>/Users/jasonvassallo/Library/Logs/delegate-queue.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/jasonvassallo/Library/Logs/delegate-queue.log</string>
+</dict>
+</plist>
