@@ -3,7 +3,9 @@
 #
 # Runs `uv run mcp_server.py --check` to verify:
 #   - the Perplexity API key is present in the macOS Keychain
-#   - Google Cloud Application Default Credentials are loaded and refreshable
+#     (agent_research only since v1.6)
+#   - Google Cloud Application Default Credentials are loaded and
+#     refreshable (quick/deep_research and the gemini_* tools)
 #
 # Output is emitted as a SessionStart additionalContext block (JSON on stdout)
 # so Claude sees the result and can warn the user up-front if either credential

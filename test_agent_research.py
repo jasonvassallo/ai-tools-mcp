@@ -45,10 +45,6 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     during import. Scoped via mock.patch.dict(sys.modules) so the fakes
     don't leak into other tests' imports (per PR #8 review)."""
 
-    class _FakeOpenAI:
-        def __init__(self, *a, **kw):
-            pass
-
     class _FakeAsyncClient:
         def __init__(self, *a, **kw):
             pass
@@ -129,7 +125,6 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     transport_mod.requests = transport_requests_mod
 
     return {
-        "openai": _make("openai", OpenAI=_FakeOpenAI),
         "mcp": _make("mcp"),
         "mcp.server": _make("mcp.server", Server=_FakeServer),
         "mcp.server.stdio": _make("mcp.server.stdio", stdio_server=_fake_stdio_server),

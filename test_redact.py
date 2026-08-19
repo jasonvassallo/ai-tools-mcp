@@ -56,10 +56,6 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     pytest's discovery order).
     """
 
-    class _FakeOpenAI:
-        def __init__(self, *a, **kw):
-            pass
-
     # httpx is imported at module level by mcp_server.py for the Gemini
     # Deep Research HTTP client. Tests never exercise the network path —
     # the TestGemini* tool-boundary tests mock.patch.object the helper
@@ -154,7 +150,6 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     transport_mod.requests = transport_requests_mod
 
     return {
-        "openai": _make("openai", OpenAI=_FakeOpenAI),
         "mcp": _make("mcp"),
         "mcp.server": _make("mcp.server", Server=_FakeServer),
         "mcp.server.stdio": _make("mcp.server.stdio", stdio_server=_fake_stdio_server),
@@ -801,6 +796,385 @@ class TestGetGeminiInteractionHelper(unittest.TestCase):
         self.assertIn("JSON", data["error"])
 
 
+class TestVertexGenerateContentHelper(unittest.TestCase):
+    """Unit tests for the Vertex grounded-search helper (client mocked, no
+    network) — same failure-envelope contract as the Deep Research helpers,
+    plus URL/payload shape checks: the URL must be built from module
+    constants only, and the request must carry the googleSearch tool.
+    """
+
+    def _run_helper(self, fake_client):
+        async def fake_get_client():
+            return fake_client
+
+        async def fake_headers():
+            return {"Authorization": "Bearer test-token"}
+
+        with (
+            mock.patch.object(mcp_server, "_gemini_headers", side_effect=fake_headers),
+            mock.patch.object(
+                mcp_server, "_get_http_client", side_effect=fake_get_client
+            ),
+            mock.patch.object(mcp_server, "_gemini_billing_project", "proj-1"),
+        ):
+            return asyncio.run(
+                mcp_server._vertex_generate_content(
+                    system_prompt="be brief", query="q", max_tokens=64
+                )
+            )
+
+    def test_url_and_payload_shape(self):
+        captured = {}
+
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"candidates": []}
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                captured["url"] = url
+                captured["json"] = kwargs.get("json")
+                return _FakeResponse()
+
+        self._run_helper(_FakeClient())
+        self.assertEqual(
+            captured["url"],
+            "https://aiplatform.googleapis.com/v1/projects/proj-1"
+            "/locations/global/publishers/google/models"
+            f"/{mcp_server._VERTEX_RESEARCH_MODEL}:generateContent",
+        )
+        self.assertEqual(captured["json"]["tools"], [{"googleSearch": {}}])
+        self.assertEqual(captured["json"]["generationConfig"], {"maxOutputTokens": 64})
+
+    def test_non_object_json_becomes_failure_envelope(self):
+        # A syntactically valid but non-object body (array/string/number/
+        # null) decodes fine and would then blow up on the handler's first
+        # data.get(...), ahead of the renderer's own guards. Normalizing
+        # in the helper keeps every caller on the mapping-or-envelope
+        # contract. Reproduced on all four shapes during PR #67 review.
+        for payload in ([{"candidates": []}], "unexpected", 42, None):
+            with self.subTest(payload=type(payload).__name__):
+
+                class _FakeResponse:
+                    def raise_for_status(self):
+                        pass
+
+                    def json(self, _p=payload):
+                        return _p
+
+                class _FakeClient:
+                    async def post(self, url, **kwargs):
+                        return _FakeResponse()
+
+                data = self._run_helper(_FakeClient())
+                self.assertEqual(data["status"], "failed")
+                self.assertIn("expected object", data["error"])
+
+    def test_handler_survives_non_object_json(self):
+        # End-to-end: the tool call must return the failure envelope text,
+        # not raise AttributeError on data.get("status").
+        class _FakeResponse:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return ["not", "an", "object"]
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                return _FakeResponse()
+
+        async def fake_get_client():
+            return _FakeClient()
+
+        async def fake_headers():
+            return {"Authorization": "Bearer test-token"}
+
+        with (
+            mock.patch.object(mcp_server, "_gemini_headers", side_effect=fake_headers),
+            mock.patch.object(
+                mcp_server, "_get_http_client", side_effect=fake_get_client
+            ),
+            mock.patch.object(mcp_server, "_gemini_billing_project", "proj-1"),
+        ):
+            result = asyncio.run(mcp_server.call_tool("quick_research", {"query": "q"}))
+        self.assertIn("quick_research failed", result[0].text)
+        self.assertIn("expected object", result[0].text)
+
+    def test_http_error_becomes_failure_envelope(self):
+        class _FakeErrorResponse:
+            status_code = 429
+            text = "quota exceeded"
+
+            def raise_for_status(self):
+                exc = mcp_server.httpx.HTTPStatusError("429")
+                exc.response = self
+                raise exc
+
+            def json(self):  # pragma: no cover - raise_for_status fires first
+                return {}
+
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                return _FakeErrorResponse()
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("429", data["error"])
+
+    def test_request_error_becomes_failure_envelope(self):
+        class _FakeClient:
+            async def post(self, url, **kwargs):
+                raise mcp_server.httpx.RequestError("connection refused")
+
+        data = self._run_helper(_FakeClient())
+        self.assertEqual(data["status"], "failed")
+        self.assertIn("connection refused", data["error"])
+
+    def test_credential_errors_propagate(self):
+        async def failing_headers():
+            raise RuntimeError("ADC credentials unavailable")
+
+        with (
+            mock.patch.object(
+                mcp_server, "_gemini_headers", side_effect=failing_headers
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            asyncio.run(
+                mcp_server._vertex_generate_content(
+                    system_prompt="s", query="q", max_tokens=64
+                )
+            )
+
+
+class TestRenderGroundedAnswer(unittest.TestCase):
+    """Rendering contract for Vertex grounded responses: answer text plus a
+    Sources section from groundingChunks; malformed/empty responses fail
+    closed with an explicit error string rather than raising."""
+
+    def test_renders_text_sources_and_queries(self):
+        data = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "Answer body."}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"title": "Example", "uri": "https://e.x/1"}},
+                            {"web": {"domain": "no-title.example"}},
+                        ],
+                        "webSearchQueries": ["q1", "q2"],
+                    },
+                }
+            ]
+        }
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("## Quick Research", out)
+        self.assertIn("Answer body.", out)
+        self.assertIn("- Example: https://e.x/1", out)
+        # A chunk with no URI is dropped rather than rendered as a bare dash.
+        self.assertNotIn("no-title.example", out)
+        self.assertIn("*Search queries: q1, q2*", out)
+
+    def test_malformed_shapes_fail_closed_without_raising(self):
+        # PR #67: Gemini and CodeRabbit independently flagged this, and
+        # direct reproduction confirmed five of these shapes raised
+        # AttributeError. Falsy-coalescing (`or {}`) does not help when a
+        # field is PRESENT with the wrong type, so each nested access is
+        # type-narrowed. The renderer must return its own fail-closed
+        # message rather than let the MCP SDK flatten an AttributeError
+        # into a generic error string.
+        cases = {
+            "candidates not a list": {"candidates": "nope"},
+            "candidate not a dict": {"candidates": ["nope"]},
+            "content not a dict": {"candidates": [{"content": "nope"}]},
+            "parts not a list": {"candidates": [{"content": {"parts": "nope"}}]},
+            "groundingMetadata not a dict": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hi"}]},
+                        "groundingMetadata": "nope",
+                    }
+                ]
+            },
+            "groundingChunks not a list": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hi"}]},
+                        "groundingMetadata": {"groundingChunks": "nope"},
+                    }
+                ]
+            },
+            "chunk web not a dict": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hi"}]},
+                        "groundingMetadata": {"groundingChunks": [{"web": "nope"}]},
+                    }
+                ]
+            },
+            "webSearchQueries not a list": {
+                "candidates": [
+                    {
+                        "content": {"parts": [{"text": "hi"}]},
+                        "groundingMetadata": {"webSearchQueries": "nope"},
+                    }
+                ]
+            },
+            "part text not a string": {
+                "candidates": [{"content": {"parts": [{"text": 42}]}}]
+            },
+            "top level not a dict": "nope",
+        }
+        for label, data in cases.items():
+            with self.subTest(shape=label):
+                out = mcp_server._render_grounded_answer(data, "Quick Research")
+                self.assertIsInstance(out, str)
+                self.assertTrue(out.startswith(("## Quick Research", "Error:")), out)
+
+    def test_max_tokens_ceiling_matches_vertex_exclusive_range(self):
+        # Vertex documents its range as "1 (inclusive) to 65536 (exclusive)",
+        # so 65535 is the largest accepted value and 65536 itself 400s.
+        # Verified live 2026-08-10 against gemini-flash-latest. An
+        # off-by-one here would let a caller pass local validation and then
+        # fail at the API — exactly what this boundary exists to prevent.
+        self.assertEqual(mcp_server._VERTEX_MAX_OUTPUT_TOKENS, 65535)
+        ok = mcp_server._validate_research_arguments(
+            "quick_research", {"query": "q", "max_tokens": 65535}
+        )
+        self.assertEqual(ok, ("q", 65535))
+        rejected = mcp_server._validate_research_arguments(
+            "quick_research", {"query": "q", "max_tokens": 65536}
+        )
+        self.assertIsInstance(rejected, str)
+        self.assertIn("max_tokens", rejected)
+
+    def test_non_string_title_falls_back_instead_of_repr(self):
+        # A truthy non-string title/domain must not be repr'd into the
+        # citation line; fall through to the next usable string, else
+        # the "source" placeholder.
+        data = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "body"}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"title": {"a": 1}, "uri": "https://e.x/1"}},
+                            {"web": {"domain": 42, "uri": "https://e.x/2"}},
+                            {
+                                "web": {
+                                    "title": ["x"],
+                                    "domain": "fallback.example",
+                                    "uri": "https://e.x/3",
+                                }
+                            },
+                        ]
+                    },
+                }
+            ]
+        }
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("- source: https://e.x/1", out)
+        self.assertIn("- source: https://e.x/2", out)
+        self.assertIn("- fallback.example: https://e.x/3", out)
+        for leaked in ("{'a': 1}", "['x']", ": 42"):
+            self.assertNotIn(leaked, out)
+
+    def test_source_needs_a_usable_uri(self):
+        # A chunk whose uri is missing or the wrong type is skipped, not
+        # rendered as a bare dash or crashed on.
+        data = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "body"}]},
+                    "groundingMetadata": {
+                        "groundingChunks": [
+                            {"web": {"title": "No URI"}},
+                            {"web": {"title": "Bad URI", "uri": 42}},
+                            {"web": {"title": "Good", "uri": "https://e.x/1"}},
+                        ]
+                    },
+                }
+            ]
+        }
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("- Good: https://e.x/1", out)
+        self.assertNotIn("No URI", out)
+        self.assertNotIn("Bad URI", out)
+
+    def test_empty_candidates_fail_closed(self):
+        out = mcp_server._render_grounded_answer({}, "Quick Research")
+        self.assertIn("Error", out)
+        self.assertIn("no candidates", out)
+
+    def test_empty_text_fails_closed(self):
+        data = {"candidates": [{"content": {"parts": []}}]}
+        out = mcp_server._render_grounded_answer(data, "Research Results")
+        self.assertIn("Error", out)
+        self.assertIn("empty answer", out)
+
+    def test_handler_redacts_secret_shapes(self):
+        # The call_tool handler must pass rendered output through
+        # redact_secrets — grounded web content is untrusted.
+        data = {
+            "candidates": [
+                {"content": {"parts": [{"text": f"leaked {FAKE_GOOG_API_KEY} key"}]}}
+            ]
+        }
+
+        async def fake_vertex(**kwargs):
+            return data
+
+        with mock.patch.object(
+            mcp_server, "_vertex_generate_content", side_effect=fake_vertex
+        ):
+            result = asyncio.run(mcp_server.call_tool("quick_research", {"query": "q"}))
+        self.assertIn("[REDACTED_GOOGLE_API_KEY]", result[0].text)
+        self.assertNotIn(FAKE_GOOG_API_KEY, result[0].text)
+
+    def test_handler_rejects_invalid_arguments_before_any_call(self):
+        # Validation must run before authentication or any Vertex call —
+        # a network/credential mock that raises proves nothing was invoked.
+        async def must_not_be_called(**kwargs):
+            raise AssertionError("_vertex_generate_content must not be called")
+
+        cases = [
+            ("quick_research", {}, "non-empty string 'query'"),
+            ("quick_research", {"query": "   "}, "non-empty string 'query'"),
+            ("deep_research", {"query": 7}, "non-empty string 'query'"),
+            ("quick_research", {"query": "q", "max_tokens": 0}, "max_tokens"),
+            ("deep_research", {"query": "q", "max_tokens": True}, "max_tokens"),
+            ("deep_research", {"query": "q", "max_tokens": "2048"}, "max_tokens"),
+            (
+                "quick_research",
+                {"query": "q", "max_tokens": 10**6},
+                "max_tokens",
+            ),
+        ]
+        with mock.patch.object(
+            mcp_server, "_vertex_generate_content", side_effect=must_not_be_called
+        ):
+            for tool, args, expect in cases:
+                with self.subTest(tool=tool, args=args):
+                    result = asyncio.run(mcp_server.call_tool(tool, args))
+                    self.assertIn("Error", result[0].text)
+                    self.assertIn(expect, result[0].text)
+
+    def test_handler_surfaces_failure_envelope(self):
+        async def fake_vertex(**kwargs):
+            return {"status": "failed", "error": "503: upstream"}
+
+        with mock.patch.object(
+            mcp_server, "_vertex_generate_content", side_effect=fake_vertex
+        ):
+            result = asyncio.run(mcp_server.call_tool("deep_research", {"query": "q"}))
+        self.assertIn("deep_research failed", result[0].text)
+        self.assertIn("503", result[0].text)
+
+
 if __name__ == "__main__":
     runner = unittest.TextTestRunner(verbosity=2)
     loader = unittest.TestLoader()
@@ -812,6 +1186,8 @@ if __name__ == "__main__":
             loader.loadTestsFromTestCase(TestGeminiResultTerminalStates),
             loader.loadTestsFromTestCase(TestPostGeminiInteractionHelper),
             loader.loadTestsFromTestCase(TestGetGeminiInteractionHelper),
+            loader.loadTestsFromTestCase(TestVertexGenerateContentHelper),
+            loader.loadTestsFromTestCase(TestRenderGroundedAnswer),
         ]
     )
     sys.exit(0 if runner.run(suite).wasSuccessful() else 1)

@@ -4,10 +4,10 @@ This repository contains a small MCP server that exposes hosted AI APIs and the 
 
 ## Purpose
 
-- Expose `deep_research` for Perplexity Sonar Pro deep research with multi-source synthesis and citations.
-- Expose `agent_research` for Perplexity Agent API Search-as-Code — a hosted sandbox agent that searches programmatically for bulk/enumerable research tasks.
+- Expose `quick_research` / `deep_research` for Gemini Flash grounded search on Vertex AI (Google Search grounding, ADC-authenticated) — inline citation-backed answers, concise or multi-source.
+- Expose `agent_research` for Perplexity Agent API Search-as-Code — a hosted sandbox agent that searches programmatically for bulk/enumerable research tasks. This is the only Perplexity-billed surface, and it is never selected implicitly.
 - Expose `gemini_deep_research_start` / `_result` for Google Gemini Deep Research — long-running, citation-dense reports drawn from many sources.
-- Complement Claude's built-in WebSearch (quick lookups) with thorough-research tiers (fast inline via Perplexity, programmatic bulk via the Agent API sandbox, multi-minute report via Gemini).
+- Complement Claude's built-in WebSearch (quick lookups) with thorough-research tiers (fast inline via grounded Gemini Flash, programmatic bulk via the Agent API sandbox, multi-minute report via Gemini Deep Research).
 
 ## Stable Public Surface
 
@@ -169,12 +169,10 @@ closed.
 
 ## Provider Mapping
 
-- `quick_research`:
-  - Provider: Perplexity
-  - Model: `sonar`
-- `deep_research`:
-  - Provider: Perplexity
-  - Model: `sonar-pro`
+- `quick_research` / `deep_research`:
+  - Provider: Vertex AI `generateContent` with `googleSearch` grounding (location `global` — verified cheapest; do not regionalize)
+  - Model: `gemini-flash-latest` (the `-latest` alias is deliberate: pinned older flash tags have started returning 404 for new credentials)
+  - Auth: ADC bearer (no API key); the two tools differ only by system prompt and answer budget
 - `agent_research` / `agent_research_result`:
   - Provider: Perplexity Agent API (`/v1/responses`) with the `sandbox` tool
   - Models: `anthropic/claude-sonnet-4-6` (default) or `perplexity/sonar` — server-side allowlist (the Agent API does not offer `sonar-pro`)
@@ -199,9 +197,9 @@ inherits no profile. Keep env first — that is what makes an install
 upgrade-safe and a vault cutover reversible. Never log a credential value;
 `_resolve_credential` returns a source label for that purpose.
 
-- macOS Keychain: service `api_tokens`, account `perplexity` (required)
+- macOS Keychain: service `api_tokens`, account `perplexity` (required for `agent_research` only)
 - Windows Credential Manager: generic targets `ai-tools-mcp-cf-access/client-id` and `.../client-secret`
-- Google Cloud ADC at `~/.config/gcloud/application_default_credentials.json` (required for Gemini Deep Research). Configure with `gcloud auth application-default login`. Billing project is auto-detected.
+- Google Cloud ADC at `~/.config/gcloud/application_default_credentials.json` (required for `quick_research`, `deep_research`, and Gemini Deep Research). Configure with `gcloud auth application-default login`. Billing project is auto-detected.
 
 ## Running
 
