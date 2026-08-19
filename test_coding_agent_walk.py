@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Unit tests for coding_agent.walk (no docker, no git).
+"""Unit tests for coding_agent.walk and coding_agent.basetree (no docker).
+
+The basetree cases DO run git, but only ever as `git -C <repo>` against a
+throwaway repository the test itself created — never with a worktree as cwd
+or gitdir (spec §6.5).
+
 Run:  uv run --with pytest --with pathspec pytest test_coding_agent_walk.py -q
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+from coding_agent.basetree import make_ignore, read_base_tree
 from coding_agent.walk import snapshot_tree, tree_hash
 
 
@@ -158,6 +165,166 @@ class RootResolution(unittest.TestCase):
         os.symlink(str(real), link)
         self.assertIn("a.py", snapshot_tree(str(real), lambda p: False).entries)
         self.assertEqual(snapshot_tree(str(link), lambda p: False).entries, {})
+
+
+def _mkrepo(root: Path) -> None:
+    subprocess.run(["git", "-C", str(root), "init", "-q", "-b", "main"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "config", "user.email", "t@e.com"], check=True
+    )
+    subprocess.run(["git", "-C", str(root), "config", "user.name", "T"], check=True)
+
+
+def _commit(root: Path, message: str) -> None:
+    subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", message], check=True)
+
+
+class BaseTreeRead(unittest.TestCase):
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        _mkrepo(self.repo)
+        (self.repo / ".gitignore").write_text("*.secret\nignored-dir/\n")
+        (self.repo / "pkg").mkdir()
+        (self.repo / "pkg" / ".gitignore").write_text("*.log\n")
+        (self.repo / "app.py").write_text("print(1)\n")
+        (self.repo / "app.secret").write_text("tracked-despite-pattern\n")  # force-add
+        (self.repo / "ignored-dir").mkdir()
+        (self.repo / "ignored-dir" / "keep.py").write_text("kept\n")  # force-added
+        os.symlink("app.py", self.repo / "link")
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A", "-f"], check=True)
+        _commit(self.repo, "base")
+
+    def test_reads_files_symlinks_and_tracked_set(self):
+        base = read_base_tree(str(self.repo), "HEAD")
+        self.assertEqual(base.entries["app.py"].data, b"print(1)\n")
+        self.assertEqual(base.entries["link"].kind, "symlink")
+        self.assertEqual(base.entries["link"].data, b"app.py")
+        self.assertIn("app.secret", base.tracked)
+        self.assertIn("ignored-dir/keep.py", base.tracked)
+
+    def test_ignore_is_tracked_aware_so_gate_cannot_be_blinded(self):
+        """Pass 4: uniform ignore hid edits to TRACKED files matching a base
+        pattern. git's rule: ignore never applies to tracked files."""
+        base = read_base_tree(str(self.repo), "HEAD")
+        ign = make_ignore(base)
+        self.assertFalse(ign("app.secret"))  # tracked -> shown
+        self.assertFalse(ign("ignored-dir/keep.py"))  # tracked -> shown
+        self.assertFalse(ign("ignored-dir/"))  # contains a tracked file -> walked
+        self.assertTrue(ign("new.secret"))  # untracked + matches -> ignored
+        self.assertTrue(ign("ignored-dir/new.py"))  # untracked under ignored dir
+        self.assertTrue(ign("pkg/debug.log"))  # NESTED .gitignore honoured
+        self.assertFalse(ign("pkg/main.py"))
+
+    def test_repo_local_info_exclude_is_read_from_the_named_repo(self):
+        """`rev-parse --git-path` answers RELATIVE to the repo, so the answer
+        must be resolved against `repo`, not against whatever directory this
+        process happens to be sitting in. Resolving it against the process cwd
+        reads some OTHER repository's exclude file — a stranger's patterns
+        silently hiding paths is the under-showing direction.
+        """
+        (self.repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".git" / "info" / "exclude").write_text("*.scratch\n")
+        ign = make_ignore(read_base_tree(str(self.repo), "HEAD"))
+        self.assertTrue(ign("notes.scratch"))
+        self.assertFalse(ign("notes.py"))
+
+    def test_a_submodule_gitlink_is_skipped_not_fetched_as_a_blob(self):
+        """`ls-tree -r` still lists mode 160000 gitlinks. Their sha names a
+        COMMIT, so asking for it as a blob fails; the read must skip them
+        rather than abort the whole base-tree read.
+        """
+        head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"160000,{head},vendor/sub",
+            ],
+            check=True,
+        )
+        _commit(self.repo, "gitlink")
+        base = read_base_tree(str(self.repo), "HEAD")
+        self.assertNotIn("vendor/sub", base.entries)
+        self.assertIn("app.py", base.entries)
+
+
+class IgnorePrecedence(unittest.TestCase):
+    """git composes ignore files by precedence, not by first match.
+
+    `$GIT_DIR/info/exclude` is weakest, then ignore files shallowest-first,
+    and within one file the LAST matching pattern wins. Stopping at the first
+    spec that matches discards every re-inclusion, so a file the user's own
+    git would show as untracked never reaches the diff. The model reads the
+    repo's ignore files like anyone else, so a blind spot spelled out in them
+    is one it can aim a new file at.
+    """
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        _mkrepo(self.repo)
+        (self.repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
+        (self.repo / ".git" / "info" / "exclude").write_text("*.md\n")
+        (self.repo / ".gitignore").write_text("*.log\n!README.md\n")
+        (self.repo / "pkg").mkdir()
+        (self.repo / "pkg" / ".gitignore").write_text("!keep.log\n")
+        (self.repo / "app.py").write_text("print(1)\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A", "-f"], check=True)
+        _commit(self.repo, "base")
+
+    def test_deeper_and_later_patterns_override_shallower_ones(self):
+        ign = make_ignore(read_base_tree(str(self.repo), "HEAD"))
+        self.assertTrue(ign("debug.log"))  # root pattern, unopposed
+        self.assertTrue(ign("pkg/other.log"))  # root pattern reaches subdirs
+        self.assertFalse(ign("pkg/keep.log"))  # nested negation wins
+        self.assertTrue(ign("notes.md"))  # info/exclude applies
+        self.assertFalse(ign("README.md"))  # .gitignore outranks info/exclude
+
+
+class IgnoreComposesWithWalk(unittest.TestCase):
+    """The seam between Task 2 and Task 3, which neither proves alone.
+
+    `walk.py` PRUNES a directory whose query returns True — it never descends,
+    so nothing beneath it reaches the snapshot at all. A tracked file inside an
+    ignored directory is therefore invisible unless `make_ignore` answers False
+    for the DIRECTORY query too. Unit-testing the predicate proves the answer;
+    only walking a real tree proves the two halves actually compose.
+    """
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        _mkrepo(self.repo)
+        (self.repo / ".gitignore").write_text("ignored-dir/\n")
+        (self.repo / "app.py").write_text("print(1)\n")
+        (self.repo / "ignored-dir").mkdir()
+        (self.repo / "ignored-dir" / "keep.py").write_text("kept\n")  # force-added
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A", "-f"], check=True)
+        _commit(self.repo, "base")
+        # What the sandbox sees: the same checkout, plus the model's edits.
+        self.work = Path(tempfile.mkdtemp())
+        (self.work / ".gitignore").write_text("ignored-dir/\n")
+        (self.work / "app.py").write_text("print(1)\n")
+        (self.work / "ignored-dir").mkdir()
+        (self.work / "ignored-dir" / "keep.py").write_text("BACKDOOR\n")
+        (self.work / "ignored-dir" / "scratch.py").write_text("noise\n")
+
+    def test_edit_to_a_tracked_file_under_an_ignored_dir_reaches_the_snapshot(self):
+        base = read_base_tree(str(self.repo), "HEAD")
+        snap = snapshot_tree(str(self.work), make_ignore(base))
+        self.assertIn("ignored-dir/keep.py", snap.entries)
+        self.assertEqual(snap.entries["ignored-dir/keep.py"].data, b"BACKDOOR\n")
+        # Over-showing stays bounded: a genuinely NEW path under the ignored
+        # directory is still ignored, so walking that directory is not a
+        # blanket un-ignore.
+        self.assertNotIn("ignored-dir/scratch.py", snap.entries)
 
 
 if __name__ == "__main__":
