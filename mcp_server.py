@@ -6,7 +6,7 @@
 #     "httpx>=0.27",
 #     "google-auth>=2.30",
 #     "requests>=2.31",
-#     "pathspec>=0.12",
+#     "pathspec>=0.12,<2",
 #     # transitive floors per pip-audit 2026-07-07 (starlette, python-multipart,
 #     # pyjwt, cryptography, pydantic-settings, idna)
 #     "starlette>=1.3.1",
