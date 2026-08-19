@@ -12,6 +12,7 @@ Run:  uv run --with pytest --with pathspec pytest test_coding_agent_loop.py -q
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -263,6 +264,125 @@ class TeardownOrdering(_LoopCase):
             [_call("list_files", {"path": "."}), _say("done")]
         )
         self.assertEqual(alive, [True, False])
+
+    def test_the_blocking_host_reads_do_not_block_the_event_loop(self):
+        """SF-2 / NF-3. `read_base_tree` runs one `git cat-file` subprocess per
+        tracked blob — 9.4 ms per file measured — so a 5,000-file repo blocked
+        the shared MCP event loop for ~47 s with nothing else able to respond,
+        `coding_agent_result` included. `background=true`'s "poll for
+        progress" promise does not survive that.
+
+        Asserted by running a heartbeat coroutine CONCURRENTLY with the run
+        and counting its ticks: a loop blocked inside a synchronous call
+        cannot tick. The control below proves the heartbeat can be starved,
+        so a non-zero count here is a measurement and not a formality.
+        """
+        self.write("a.py", "x = 1\n")
+        for target in ("read_base_tree", "create_worktree", "snapshot_tree"):
+            with self.subTest(blocking_call=target):
+                ticks, calls = self._ticks_during_run(target, block=0.25)
+                # Scaled by how many times the slowed call actually ran, so a
+                # `snapshot_tree` whose PER-TURN uses went back on the loop
+                # cannot hide behind the teardown one still yielding. The
+                # heartbeat ticks 10x per `block`; 7 is slack for scheduling.
+                self.assertGreaterEqual(calls, 1, "the slowed call never ran")
+                self.assertGreaterEqual(
+                    ticks,
+                    7 * calls,
+                    f"the event loop was blocked while {target} ran "
+                    f"({calls} call(s), {ticks} tick(s))",
+                )
+
+    def test_MECHANISM_a_synchronous_host_read_really_would_starve_the_loop(self):
+        """The control. Without it, "the heartbeat ticked" could just mean the
+        heartbeat is cheap and the calls are fast."""
+        self.write("a.py", "x = 1\n")
+        ticks, _ = self._ticks_during_run(None, block=0.25)
+        self.assertLessEqual(
+            ticks, 1, "the heartbeat is not sensitive enough to prove anything"
+        )
+
+    def _ticks_during_run(self, target: str | None, *, block: float):
+        """Run the loop with ONE host call slowed, counting heartbeat ticks.
+
+        Returns (ticks, times the slowed call ran).
+
+        `target=None` is the control: the same `time.sleep` is taken directly
+        in the coroutine, the way every one of these calls used to be reached.
+        Same wall time either way; only the loop's ability to tick differs.
+        """
+        ops = _RecordingOps(self.wt)
+        base = _base_tree()
+        real_snapshot = L.snapshot_tree
+        real_create = ops.create_worktree
+        calls = {"n": 0}
+
+        def slow_read(repo, ref):
+            calls["n"] += 1
+            time.sleep(block)
+            return base
+
+        def slow_create(repo, ref):
+            calls["n"] += 1
+            time.sleep(block)
+            return real_create(repo, ref)
+
+        def slow_snapshot(root, is_ignored):
+            calls["n"] += 1
+            time.sleep(block)
+            return real_snapshot(root, is_ignored)
+
+        counter = {"n": 0}
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(block / 10)
+                counter["n"] += 1
+
+        async def scenario():
+            beat = asyncio.get_running_loop().create_task(heartbeat())
+            try:
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(
+                        mock.patch.object(
+                            L,
+                            "read_base_tree",
+                            slow_read
+                            if target == "read_base_tree"
+                            else lambda *a: base,
+                        )
+                    )
+                    if target == "create_worktree":
+                        ops.create_worktree = slow_create  # type: ignore[method-assign]
+                    if target == "snapshot_tree":
+                        stack.enter_context(
+                            mock.patch.object(L, "snapshot_tree", slow_snapshot)
+                        )
+                    if target is None:
+                        calls["n"] += 1
+                        time.sleep(block)  # the pre-fix shape, inline
+                    await self._bare_run(ops)
+            finally:
+                beat.cancel()
+            return counter["n"], calls["n"]
+
+        return asyncio.run(scenario())
+
+    async def _bare_run(self, ops):
+        # Three turns, so `snapshot_tree` runs its PER-TURN reads as well as
+        # the one that builds the diff — otherwise the teardown read alone
+        # yields enough for the assertion and the per-turn hop goes unpinned.
+        return await L.run_coding_agent(
+            task="t",
+            repo=self.repo,
+            base_ref="HEAD",
+            model="m",
+            max_turns=3,
+            max_seconds=60,
+            image="img",
+            chat=_scripted_chat([_call("list_files", {"path": "."}), _say("done")]),
+            sandbox_factory=lambda: ops,
+        )
 
     def test_the_result_carries_the_diff_the_post_destroy_read_produced(self):
         self.write("a.py", "x = 1\n")
@@ -692,6 +812,58 @@ class StopConditions(_LoopCase):
         self.assertGreaterEqual(result.turns, 1)
         self.assertLess(result.turns, 50)
 
+    def test_the_model_call_gets_a_budget_clamped_timeout_not_a_flat_300s(self):
+        """SF-1 / NF-2. `max_seconds` was documented as "a hard wall-clock cap"
+        in both the README and the tool schema, and was not one.
+
+        `run_command`'s timeout was clamped by `budget.remaining()`; the MODEL
+        call was handed `_CHAT_TIMEOUT_S = 300.0` unconditionally, after the
+        budget check had already passed. The check at the top of a turn only
+        decides whether to start one more turn — it says nothing about what
+        that turn may then spend. Measured worst case for a single turn:
+        `300 + 32 x 300`.
+        """
+        seen: list[float] = []
+
+        # Chosen to sit BETWEEN the floor and the ceiling, so the clamp is the
+        # thing being observed rather than the floor: a `max_seconds` under
+        # `_MIN_CMD_TIMEOUT_S` would hand out 5.0 every time and prove nothing.
+        budget_s = 30.0
+        self.assertLess(L._MIN_CMD_TIMEOUT_S, budget_s)
+        self.assertLess(budget_s, L._CHAT_TIMEOUT_S)
+
+        async def recording(payload, timeout_s):
+            seen.append(timeout_s)
+            await asyncio.sleep(0.02)
+            return {"message": _call("list_files", {})}
+
+        self.run_loop([], chat=recording, max_seconds=budget_s, max_turns=3)
+
+        self.assertEqual(len(seen), 3)
+        self.assertLess(
+            max(seen),
+            L._CHAT_TIMEOUT_S,
+            "the model call was handed the flat ceiling, not the remaining budget",
+        )
+        self.assertLessEqual(max(seen), budget_s)
+        # ...and never below the floor, or an expiring budget would time the
+        # last call out instead of stopping cleanly on max_seconds.
+        self.assertGreaterEqual(min(seen), L._MIN_CMD_TIMEOUT_S)
+        # The clamp tightens as the clock runs down.
+        self.assertLess(seen[-1], seen[0])
+
+    def test_a_generous_budget_leaves_the_model_call_at_its_full_ceiling(self):
+        """The other side: the clamp must not shorten a call that has plenty
+        of budget left, or it becomes a latency bug dressed as a safety fix."""
+        seen: list[float] = []
+
+        async def recording(payload, timeout_s):
+            seen.append(timeout_s)
+            return {"message": _say("done")}
+
+        self.run_loop([], chat=recording, max_seconds=3600)
+        self.assertEqual(seen, [L._CHAT_TIMEOUT_S])
+
     def test_no_progress(self):
         """Five read-only turns that change nothing. The default N is 5, so
         turn 5 is the one that trips it."""
@@ -911,6 +1083,145 @@ class TranscriptIsBounded(_LoopCase):
         executed = [e for e in result.transcript if e.get("tool") == "list_files"]
         self.assertEqual(len(executed), L._MAX_TOOL_CALLS_PER_TURN)
         self.assertIn("were dropped", result.transcript[-1]["result_head"])
+
+    def test_the_in_flight_conversation_is_bounded_across_turns(self):
+        """SF-4 / NF-8. The RETURNED transcript was bounded; the conversation
+        SENT to the model was not. Every tool result was appended in full and
+        the whole list re-serialised on every turn, so the ceiling was
+        `60 turns x 32 calls x MAX_READ` ~= 490 MB, re-encoded each turn.
+
+        Asserted on the PAYLOAD the chat callable actually receives, not on
+        the list afterwards — the bound is only worth anything if it applies
+        to what goes over the wire.
+        """
+        big = "B" * (600 * 1024)
+        self.write("big.txt", big)
+        sizes: list[int] = []
+
+        async def watching(payload, timeout_s):
+            n = len(sizes)
+            sizes.append(
+                sum(len(str(m.get("content") or "")) for m in payload["messages"])
+            )
+            if n >= 8:
+                return {"message": _say("done")}
+            # read_file grows the conversation by MAX_READ each turn;
+            # write_file keeps the no-progress detector satisfied so the run
+            # reaches enough turns to cross the bound.
+            return {
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "function": {
+                                "name": "read_file",
+                                "arguments": {"path": "big.txt"},
+                            }
+                        },
+                        {
+                            "function": {
+                                "name": "write_file",
+                                "arguments": {"path": f"t{n}.txt", "content": str(n)},
+                            }
+                        },
+                    ],
+                }
+            }
+
+        result, _ = self.run_loop([], chat=watching, max_turns=12)
+
+        self.assertEqual(result.stop_reason, L.StopReason.completed)
+        self.assertGreater(len(sizes), 3)
+        self.assertLessEqual(
+            max(sizes),
+            L._MAX_CONVERSATION_CHARS + len(big),
+            "the payload grew without bound across turns",
+        )
+        # MECHANISM: the conversation really did exceed the bound, so the
+        # trimming was exercised rather than never reached.
+        self.assertGreater(sum(sizes), L._MAX_CONVERSATION_CHARS)
+
+    def test_trimming_shrinks_only_tool_content_never_the_message_structure(self):
+        """The assistant/tool pairing is protocol. Dropping one side of a
+        `tool_calls` pair is how a memory fix becomes a backend rejecting the
+        payload, so this changes bytes only — never the count, the roles, or
+        the tool_calls."""
+        # Each protected message is deliberately LARGER than
+        # `_ELIDED_TOOL_CHARS`, so it is the ROLE check that spares it and not
+        # the "already small enough" shortcut — otherwise dropping the role
+        # check would leave this test green.
+        big = 50_000
+        self.assertGreater(big, L._ELIDED_TOOL_CHARS)
+        messages = [
+            {"role": "system", "content": "S" * big},
+            {"role": "user", "content": "U" * big},
+            {
+                "role": "assistant",
+                "content": "A" * big,
+                "tool_calls": [{"function": {}}],
+            },
+            {"role": "tool", "content": "T" * (L._MAX_CONVERSATION_CHARS + 5000)},
+            {"role": "tool", "content": "recent"},
+        ]
+        before = [(m["role"], "tool_calls" in m) for m in messages]
+
+        elided = L._trim_conversation(messages)
+
+        self.assertEqual(elided, 1)
+        self.assertEqual([(m["role"], "tool_calls" in m) for m in messages], before)
+        self.assertEqual(messages[0]["content"], "S" * big)  # system untouched
+        self.assertEqual(messages[1]["content"], "U" * big)  # task untouched
+        self.assertEqual(messages[2]["content"], "A" * big)  # tool_calls turn intact
+        self.assertEqual(messages[4]["content"], "recent")  # newest untouched
+        self.assertIn("chars elided", messages[3]["content"])
+        self.assertLess(len(messages[3]["content"]), L._ELIDED_TOOL_CHARS + 200)
+
+    def test_a_conversation_under_the_bound_is_left_alone(self):
+        messages = [
+            {"role": "system", "content": "S"},
+            {"role": "tool", "content": "T" * 50_000},
+        ]
+        self.assertEqual(L._trim_conversation(messages), 0)
+        self.assertEqual(len(messages[1]["content"]), 50_000)
+
+    def test_changed_files_and_unreadable_are_bounded_with_an_exact_count(self):
+        """SF-3 / NF-4. Every other model-controlled field was bounded; these
+        two were carried verbatim, and both are as long as the sandbox likes.
+        Measured at 200,000 unreadable paths: the diff TEXT stays correctly at
+        1,220 bytes while the result JSON reaches 11.8 MB and lands in the
+        caller's context. The accepted breadth-DoS trade-off was reasoned
+        about as a HOST MEMORY bound; this is the half that reaches a human.
+        """
+        n = L._RESULT_PATHS * 2
+        for i in range(n):
+            self.write(f"f{i:05d}.py", f"x = {i}\n")
+
+        result, _ = self.run_loop([_say("done")])
+
+        self.assertEqual(len(result.changed_files), L._RESULT_PATHS + 1)
+        overflow = result.changed_files[-1]
+        self.assertIn(f"and {n - L._RESULT_PATHS} more", overflow)
+        self.assertIn("spill file are complete", overflow)
+        # The kept entries are still real paths, in order, not a summary.
+        self.assertEqual(result.changed_files[0], "f00000.py")
+
+    def test_the_unreadable_overflow_marker_keeps_the_field_s_own_shape(self):
+        """`unreadable` is a list of dicts a gate reads programmatically, so
+        the marker must be a dict too — a bare string here would make a
+        consumer that fails closed crash instead."""
+        marker = L._capped_paths(
+            [{"path": f"p{i}", "reason": "EACCES"} for i in range(L._RESULT_PATHS + 3)]
+        )[-1]
+        self.assertIsInstance(marker, dict)
+        self.assertEqual(marker["reason"], "TRUNCATED")
+        self.assertIn("and 3 more", marker["path"])
+
+    def test_a_list_under_the_bound_is_returned_untouched(self):
+        """No marker, no copy semantics change, on the ordinary path."""
+        small = [{"path": "a", "reason": "EACCES"}]
+        self.assertIs(L._capped_paths(small), small)
+        self.assertEqual(L._capped_paths([]), [])
 
 
 class SecuritySignalsReachTheHuman(_LoopCase):

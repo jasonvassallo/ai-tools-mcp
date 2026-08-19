@@ -14,7 +14,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar, cast
 
 from . import sandbox as _sb
 from .basetree import BaseTree, make_ignore, read_base_tree
@@ -49,6 +49,23 @@ class Budget:
     def remaining(self) -> float:
         """Seconds left on the wall clock; negative once the budget is spent."""
         return self.max_seconds - (time.monotonic() - self.started)
+
+    def bounded(self, ceiling: float, floor: float) -> float:
+        """`ceiling`, cut down to what is left of the wall clock.
+
+        Every awaited call inside the loop goes through here. The budget check
+        at the top of a turn only decides whether to START one more turn; what
+        that turn is then ALLOWED TO SPEND is this. Without it, `max_seconds`
+        is not a cap but a check performed at turn boundaries — measured at
+        `max_seconds=1.0` giving a 3.0 s run, with a worst case of
+        `300 + 32 x 300` per turn, because the model call and each command
+        carried their own unconditional 300 s.
+
+        `floor` keeps the last slice usable: clamping to a remaining 0.01 s
+        would time every call out and turn an expiring budget into an error
+        instead of a clean `max_seconds` stop.
+        """
+        return max(floor, min(ceiling, self.remaining()))
 
 
 class ProgressTracker:
@@ -115,6 +132,8 @@ class ProgressTracker:
 _SLOT = asyncio.Lock()
 _SLOT_BUSY = "coding_agent: a run is already in progress on this host"
 
+_T = TypeVar("_T")
+
 # Cleanup's own ceiling (§6 item 3). Sized above sandbox.destroy_container's
 # 30s + 5s grace so a slow `docker rm -f` does not eat the worktree removal.
 _CLEANUP_BOUND_S = 60.0
@@ -130,7 +149,8 @@ _DIFF_MAX_BYTES = 512 * 1024
 _CHAT_TIMEOUT_S = 300.0
 _CMD_TIMEOUT_S = 300.0
 # Floor for the budget-clamped per-command timeout: a command must get a
-# usable slice even at the very end of the wall clock.
+# usable slice even at the very end of the wall clock. The same floor applies
+# to the model call — see `Budget.bounded`.
 _MIN_CMD_TIMEOUT_S = 5.0
 
 _CONTAINER_CPUS = "4"
@@ -143,8 +163,24 @@ _RESULT_HEAD = 400
 _ARG_HEAD = 200
 _ARG_KEYS = 8
 _OUTPUT_TAIL = 2000
+# ...including the two structured path lists. Chosen to sit above
+# `walk._CHANGED_SHOWN` (100), so a result never names fewer paths than the
+# diff text itself already does.
+_RESULT_PATHS = 500
 # One assistant turn may not queue unbounded work or unbounded transcript.
 _MAX_TOOL_CALLS_PER_TURN = 32
+
+# The IN-FLIGHT conversation, which is a different thing from the RETURNED
+# transcript and was the only model-controlled accumulation left unbounded.
+# Every tool result is appended in full and the whole list is re-serialised
+# into the Ollama payload on EVERY turn, so the ceiling was
+# `60 turns x 32 calls x MAX_READ (256 KB)` ~= 490 MB, re-encoded each turn.
+# 1 MiB is already well past any context window this feature targets, so the
+# bound costs nothing a real run would notice.
+_MAX_CONVERSATION_CHARS = 1 << 20
+# What an over-budget tool result is cut down to. Matches `_OUTPUT_TAIL`'s
+# scale: enough to keep the shape of what happened, not enough to matter.
+_ELIDED_TOOL_CHARS = 2000
 
 SYSTEM_PROMPT = (
     "You are a coding agent working in a sandboxed copy of a repository. You have "
@@ -295,7 +331,7 @@ async def _teardown(
             )
         # ---- the host read. Never before the line above. ----
         try:
-            snap = snapshot_tree(worktree, ignore)
+            snap = await asyncio.to_thread(snapshot_tree, worktree, ignore)
             diff = unified_diff(
                 base,
                 snap,
@@ -307,10 +343,10 @@ async def _teardown(
             out.diff = diff.text
             out.diff_truncated = diff.truncated
             out.diff_full_path = diff.full_path
-            out.changed_files = list(diff.changed_files)
-            out.unreadable = [
-                {"path": item.path, "reason": item.reason} for item in diff.unreadable
-            ]
+            out.changed_files = _capped_paths(list(diff.changed_files))
+            out.unreadable = _capped_paths(
+                [{"path": item.path, "reason": item.reason} for item in diff.unreadable]
+            )
         except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
             out.problems.append(
                 f"could not read the worktree to build the diff: "
@@ -320,6 +356,71 @@ async def _teardown(
         _remove_worktree(ops, repo, worktree, out)
 
 
+def _trim_conversation(messages: list[dict[str, Any]]) -> int:
+    """Bound the in-flight conversation by shrinking the OLDEST tool results.
+
+    Returns the number of messages it elided.
+
+    Shrinking content in place rather than dropping whole messages is
+    deliberate: the assistant/tool message pairing is protocol, and evicting
+    one side of a `tool_calls` pair is how a "memory fix" turns into a model
+    backend rejecting the payload. This changes only bytes — never the message
+    count, the roles, or the `tool_calls` structure.
+
+    Oldest first, because the recent turns are the ones the model is actually
+    reasoning about; the early ones have already done their work.
+    """
+    total = sum(len(str(m.get("content") or "")) for m in messages)
+    if total <= _MAX_CONVERSATION_CHARS:
+        return 0
+    elided = 0
+    for m in messages:
+        if total <= _MAX_CONVERSATION_CHARS:
+            break
+        if m.get("role") != "tool":
+            continue  # never touch the system prompt, the task, or a tool_calls turn
+        content = str(m.get("content") or "")
+        if len(content) <= _ELIDED_TOOL_CHARS:
+            continue
+        cut = content[:_ELIDED_TOOL_CHARS] + (
+            f"\n[... {len(content) - _ELIDED_TOOL_CHARS} chars elided from an "
+            f"earlier tool result to bound this conversation ...]"
+        )
+        total -= len(content) - len(cut)
+        m["content"] = cut
+        elided += 1
+    return elided
+
+
+def _capped_paths(items: list[_T]) -> list[_T]:
+    """Bound a sandbox-sized list, keeping an EXACT count of what was dropped.
+
+    Every other model-controlled field in the result is already bounded — the
+    diff at 512 KB, `result_head` at 400, arguments at 8x200, `output_tail` at
+    2000 — but `changed_files` and `unreadable` were carried verbatim, and
+    both are as long as the sandbox chooses. Measured: 200,000 unreadable
+    paths keep the diff TEXT correctly at 1,220 bytes while the result JSON
+    reaches 11.8 MB, and that JSON lands in the caller's context. The breadth
+    DoS is accepted as an availability trade-off for host MEMORY; this is the
+    other half of it, and it is the half that reaches a human.
+
+    The overflow marker is a value of the same SHAPE as the list's elements,
+    so a consumer iterating either field sees a well-formed entry rather than
+    a type error — and the count is exact, which is the property that keeps
+    this from being one more silent truncation.
+    """
+    if len(items) <= _RESULT_PATHS:
+        return items
+    dropped = len(items) - _RESULT_PATHS
+    kept = items[:_RESULT_PATHS]
+    note = (
+        f"[... and {dropped} more; the diff text and its spill file are complete ...]"
+    )
+    if kept and isinstance(kept[0], dict):
+        return [*kept, cast("_T", {"path": note, "reason": "TRUNCATED"})]
+    return [*kept, cast("_T", note)]
+
+
 def _remove_worktree(ops: SandboxOps, repo: str, worktree: str, out: _Cleanup) -> None:
     """The last layer, on its own so the abandonment path can also run it.
 
@@ -327,6 +428,14 @@ def _remove_worktree(ops: SandboxOps, repo: str, worktree: str, out: _Cleanup) -
     real repo's prune — which is what lets it be the fallback when the async
     teardown cannot be awaited: sync code cannot be cancelled. Idempotent, so
     running it twice costs nothing.
+
+    DELIBERATELY NOT moved to `asyncio.to_thread`, unlike the other blocking
+    host calls in this module. Being uncancellable is the entire reason this
+    layer exists: it is what the repeated-cancellation path runs when the
+    shielded teardown cannot be awaited to completion, and an `await` there
+    would reintroduce exactly the cancellation point that would leak the
+    worktree. It blocks the event loop, and that is the cheaper of the two
+    costs — a leaked worktree is permanent, a blocked loop is not.
     """
     try:
         out.problems.extend(ops.teardown_worktree(repo, worktree))
@@ -445,11 +554,22 @@ async def run_coding_agent(
         started = time.monotonic()
         budget = Budget(max_turns=max_turns, max_seconds=max_seconds, started=started)
         # The REAL repo, before anything exists to clean up. Trusted side.
-        base: BaseTree = read_base_tree(repo, base_ref)
+        #
+        # OFF THE EVENT LOOP, like every other blocking host call here. This
+        # one is the expensive one: `read_base_tree` runs one `git cat-file`
+        # subprocess PER TRACKED BLOB, measured at 9.4 ms per file on this
+        # repo — ~47 s for an ordinary 5,000-file checkout, ~3 min at 20,000.
+        # Run inline it blocks the shared MCP event loop for that whole
+        # window, during which nothing else the server offers responds,
+        # INCLUDING `coding_agent_result` — so `background=true`'s "poll for
+        # progress" promise would not hold precisely while the run was
+        # starting. `mcp_server.py` already uses `asyncio.to_thread` for its
+        # other blocking work; this makes the coding path match.
+        base: BaseTree = await asyncio.to_thread(read_base_tree, repo, base_ref)
         ignore = make_ignore(base)
         # The literal path, recorded once. Teardown rm -rf's this string and
         # never re-derives it through the sandbox-controlled worktree.
-        worktree = ops.create_worktree(repo, base_ref)
+        worktree = await asyncio.to_thread(ops.create_worktree, repo, base_ref)
         container: str | None = None
         transcript: list[dict[str, Any]] = []
         last_cmd: dict[str, Any] | None = None
@@ -478,6 +598,10 @@ async def run_coding_agent(
                     stop = StopReason.max_seconds
                     break
                 turns += 1
+                # Bounded BEFORE the payload is built, so the cap applies to
+                # what actually goes over the wire rather than to what is
+                # kept afterwards.
+                _trim_conversation(messages)
                 response = await chat(
                     {
                         "model": model,
@@ -486,7 +610,10 @@ async def run_coding_agent(
                         "stream": False,
                         "think": False,
                     },
-                    _CHAT_TIMEOUT_S,
+                    # Clamped by what is left of the wall clock, for the same
+                    # reason `run_command` is: the budget check above decides
+                    # whether to start a turn, not how long that turn may run.
+                    budget.bounded(_CHAT_TIMEOUT_S, _MIN_CMD_TIMEOUT_S),
                 )
                 if response.get("status") == "failed":
                     transcript.append(
@@ -580,9 +707,8 @@ async def run_coding_agent(
                                     # Clamped by what is left of the wall
                                     # clock, so `sleep 100000` cannot push the
                                     # run far past the caller's max_seconds.
-                                    timeout_s=max(
-                                        _MIN_CMD_TIMEOUT_S,
-                                        min(_CMD_TIMEOUT_S, budget.remaining()),
+                                    timeout_s=budget.bounded(
+                                        _CMD_TIMEOUT_S, _MIN_CMD_TIMEOUT_S
                                     ),
                                 )
                                 last_cmd = {
@@ -622,7 +748,12 @@ async def run_coding_agent(
                     )
                     messages.append({"role": "tool", "content": note})
                 # Host byte-walk, never `git add -A` in the worktree (§6.5/§7a).
-                snapshot_hash = tree_hash(snapshot_tree(worktree, ignore))
+                # Off the event loop: this one runs once per TURN, so on a
+                # large tree it is the repeat offender even though each walk
+                # is cheaper than the base-tree read.
+                snapshot_hash = tree_hash(
+                    await asyncio.to_thread(snapshot_tree, worktree, ignore)
+                )
                 pair = (
                     (str(last_cmd["cmd"]), int(last_cmd["exit"])) if last_cmd else None
                 )

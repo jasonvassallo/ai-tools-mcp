@@ -2765,7 +2765,14 @@ async def list_tools() -> list[Tool]:
                         "default": _CODING_AGENT_DEFAULT_SECONDS,
                         "minimum": 1,
                         "maximum": _CODING_AGENT_MAX_SECONDS,
-                        "description": "Hard wall-clock cap on the run.",
+                        "description": (
+                            "Wall-clock budget for the run. No new turn "
+                            "starts past it, and the model call and every "
+                            "command are clamped by what is left of it, but "
+                            "an in-flight call still gets a small floor, so "
+                            "the run can overshoot by up to a couple of "
+                            "minutes before the sandbox is torn down."
+                        ),
                     },
                     "background": {
                         "type": "boolean",
