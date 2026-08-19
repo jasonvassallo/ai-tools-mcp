@@ -103,6 +103,7 @@ Two more things worth knowing:
 
 - **`git` does not work inside the sandbox.** A linked worktree's `.git` is a file pointing at `<repo>/.git/worktrees/<name>`, and only the worktree itself — not that path inside the main repo — is mounted into the container, so every git command fails `fatal: not a git repository`. This is security-positive (the model cannot touch repo history, branches, or remotes), but don't expect `git` to work in `run_command`.
 - **The sandbox can learn the host repo's absolute path**, via `cat /work/.git` or any failing git command's error message (both reveal `<host-path>/.git/worktrees/<name>`). Low severity, and inherent to how `git worktree add` names its gitdir — documented here rather than fixed.
+- **`/tmp` and `$HOME` are `noexec`.** Both are tmpfs mounts (3.9 GB each) and both come up `nosuid,nodev,noexec`, so a script or binary written there cannot be run — verified in a live container, where the attempt fails with `Permission denied`. `/work` *is* executable, so the intended workflow is unaffected, but anything that writes-then-executes under `$TMPDIR` or `$HOME` will fail in a way that does not obviously point at a mount option.
 
 Together these complement Claude's built-in `WebSearch`: use `WebSearch` for
 quick lookups, `deep_research` for thorough inline investigation,
