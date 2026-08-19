@@ -1,101 +1,170 @@
 ---
 name: choosing-local-model-context
-description: Pick the right qwen3.6 context-window tag (32k, 64k, or 256k) for a local_delegate call, and the host it implies. Applies only when explicitly choosing a qwen tag — the tool-wide default is gemma4:12b-nvfp4. Use whenever calling local_delegate with anything other than a trivially small prompt, when a delegate call fails because the prompt exceeded the model window, when choosing the model param explicitly, or when deciding whether a task can run on the always-on 32k endpoint vs the laptop-only 256k one.
+description: Estimate a local_delegate prompt's token size and pick (or configure) a host whose context window fits it. local_delegate has NO num_ctx parameter and no per-context model tags — every call runs at the serving host's OLLAMA_CONTEXT_LENGTH — so "sizing" means choosing the right host or raising that setting, never passing a per-call window. Use whenever calling local_delegate with anything other than a trivially small prompt, when a delegate call fails or truncates because the prompt exceeded the host window, when choosing the model param explicitly, or when deciding whether a task can run on the always-on endpoint vs the laptop-only one.
 ---
 
 # Choosing a Context Window for local_delegate
 
-**The default model is `gemma4:12b-nvfp4`, not qwen.** This skill is about the
-qwen tags, so it only applies once you've decided to pass `model=` explicitly.
-Reach for a qwen tag when the prompt is large or the work is genuinely
-code-heavy; leave the default alone for short mechanical tasks, where gemma
-scored better (0.92 vs 0.73) and never returned another prompt's answer.
-Neither model can be trusted to count or aggregate over long inputs.
+## What changed (2026-08-17) — read this before trusting any older note
 
-The qwen model (`qwen3.6:35b-a3b-coding-nvfp4`, 35B MoE, nvfp4) is served under
-three tags that differ **only** in max context window, and the endpoint chain
-means the tag you pick also decides **which machine can serve you**.
+The `qwen3.6:*` tags this skill used to be about **are gone from every endpoint we
+can measure.** There are no longer any per-context-window tag variants of anything:
+no `-32k`, no `-64k`, no `-256k`.
+
+**And there is no `num_ctx` knob on `local_delegate` either.** Verified against
+`mcp_server.py` (2026-08-18, Greptile + gemma4 review finding, confirmed by grep): the
+tool's request carries `model`, `messages`, `think`, `stream: false` and (conditionally)
+`keep_alive`, and nothing else — no `options` block, so `options.num_ctx` is never sent. **Every `local_delegate` call runs at
+the serving host's default window** (`OLLAMA_CONTEXT_LENGTH` on that Ollama server — the
+tool description states it: 64k on JVMBPro, 32k on jvmacmini). The window is chosen by
+the *operator on the host*, not by the caller per request. Two OTHER tools do set
+`options.num_ctx` themselves, and neither is `local_delegate`: `scripts/pr_review_local.sh`
+in this repo pins a **16384 floor** (`PR_AGENT_NUM_CTX`) with no diff-based sizing; and
+`review.ps1` — which lives in `~\.ollama-qodo\`, NOT in this repository — auto-sizes to the
+diff (capped 262144, `LargeCutoffKB=150`).
+
+Both endpoints were probed directly on 2026-08-17. **They do not serve the same
+things**, and that is the routing fact that matters:
+
+| Endpoint | Machine | Serves | Availability |
+|---|---|---|---|
+| `ollama-mbp.djvassallo.com` | MBP (laptop) | `gemma4:31b-nvfp4` (kept warm), `gemma4:12b-nvfp4`, `qwen3.8:27b-nvfp4`, `muse-glimmer:30b-nvfp4-dflash`, `granite3.2-vision:2b`, `minicpm-v` | **may be asleep/closed** |
+| `ollama.djvassallo.com` | jvmacmini | **`gemma4:12b-nvfp4` ONLY** (kept warm for the signal openclaw agent) | **always on** |
+
+`gemma4:31b-nvfp4` reports `parameter_size` 31.7B and `context_length` **262144**, and
+`/api/show` lists **no** `num_ctx` parameter — the tag pins no window, so the host's
+`OLLAMA_CONTEXT_LENGTH` governs `local_delegate` calls (and `options.num_ctx` governs
+callers like `review.ps1` that set it).
+
+**The consequence to internalize: the 31b exists on exactly ONE host, and that host is a
+laptop.** If the MBP is asleep there is no 31b anywhere — review and long-context work have
+no home, and the honest fallback is `gemma4:12b-nvfp4` on the always-on mini (or
+your small local model — e.g. `qwen2.5-coder:14b` on a constrained Windows box) with a
+note in your reply that you dropped a tier. Never silently
+substitute.
+
+**CF Access tokens are per-application.** The `ollama-mbp-cf-access/*` pair reaches only the
+MBP app — it returns **403** against `ollama.djvassallo.com`. The `ai-tools-mcp-cf-access/*`
+pair reaches **both**. Use that one when you need to probe the mini.
+
+**Always name a model by its BARE tag** — `gemma4:31b-nvfp4`, never
+`ollama-mbp/gemma4:31b-nvfp4`. The host comes from the endpoint chain, and Ollama parses a
+host-prefixed name as a *model* called `ollama-mbp/gemma4` (measured: 404).
+
+**Verify before you trust.** The tag list written into any skill or config here has been
+wrong twice. Query `/api/tags` (creds in Credential Manager) rather than believing this table.
 
 ## The one fact that changes the math
 
-With flash attention + q8_0 KV quantization (how every host here runs), the
-KV cache **grows with tokens actually used, not with the window size**. A 5k
-token task on the 256k tag costs the same RAM as on the 32k tag. The window
-is a *cap*, not a preallocation. So you never pick a smaller tag to "save
-memory" on a per-call basis — you pick tags to match **host availability**
-and **worst-case bounding on small machines**.
+With flash attention + q8_0 KV quantization (how every host here runs), the KV cache
+**grows with tokens actually used, not with the window size** — in a measurement taken
+on these hosts (2026-07, flash attention + q8_0 KV), a 5k-token task on a host configured
+for 262144 cost about the same RAM as on one configured for 32768. Treat that as a
+**version-specific observation, not a guarantee**: Ollama documents that memory grows
+with `OLLAMA_CONTEXT_LENGTH` and scales with `OLLAMA_NUM_PARALLEL`; flash attention and
+q8_0 *reduce* KV-cache usage, they do not remove the constraint. So for a *small* prompt
+there is little per-call memory reason to prefer a smaller-window host — but re-measure
+before relying on it after an Ollama upgrade.
 
-## Tag ↔ host map
-
-| Tag | Window | Served by | Notes |
-|---|---|---|---|
-| `qwen3.6:35b-a3b-coding-nvfp4` (base) | host's default: **64k** on JVMBPro / **32k** on jvmacmini | localhost (JVMBPro), `ollama-mbp.djvassallo.com` (64k), `ollama.djvassallo.com` (jvmacmini, 32k, always-on) | Default **qwen** tag (gemma4:12b-nvfp4 is the tool-wide default). Window depends on which host answers. |
-| `-32k` | 32,768 | JVMBPro only (tag exists there) | Rarely needed — prefer base. |
-| `-256k` | 262,144 | JVMBPro only (localhost or `ollama-mbp`) | Not on the mini (32 GB — a full window would exceed the machine). By default, no qwen tag stays resident between `local_delegate` calls; see the explicit `keep_alive` opt-in below. |
+The configured window IS a **memory constraint at the host level**: it bounds the *peak*
+KV cache the host must be able to reach, and parallelism multiplies that. This repo's own
+history recorded the old `-256k` tag needing several GB of KV cache. So: pick the host by
+whether the prompt FITS its window and whether it is awake; and if you are the one raising
+`OLLAMA_CONTEXT_LENGTH` on a host, size it to that host's memory, not to the model's
+advertised maximum.
 
 ## Sizing rule of thumb
 
-Tokens ≈ characters ÷ 3.5 for code, ÷ 4 for prose. Budget = prompt + inlined
-files + expected answer + thinking tokens (if `think:true`, add 1–4k).
+Tokens ≈ characters ÷ 3.5 for code, ÷ 4 for prose. Budget = prompt + inlined files +
+expected answer + thinking tokens (if `think:true`, add 1–4k).
 
-- **≤ ~28k tokens total** → any tag/host works, including the always-on
-  32k mini endpoint. Most "simple/easy coding task" delegations live here:
-  a few files, a summary, boilerplate, a focused review.
-- **~28k–60k** → base tag, but it must land on a 64k host (JVMBPro local or
-  `ollama-mbp`) — the mini would truncate. Multi-file context, long diffs,
-  big log analysis.
-- **> ~60k** → `-256k`, explicitly. Whole-repo dumps, giant transcripts.
-  JVMBPro must be on.
+The `~28k` and `~60k` figures below are **conservative safety thresholds, not the host
+limits** (those are 32k on the mini and 64k on the MBP). The gap is deliberate headroom
+for the answer plus any thinking — a prompt sized right up to the window leaves nothing
+for the model to reply with, and Ollama then truncates the *input* silently.
 
-## Constrained machines (e.g. 32 GB Windows desktop, CPU-only, office apps open)
+- **≤ ~28k tokens** → anything works. Most delegations live here: a few files, a
+  summary, boilerplate, a focused review.
+- **~28k–60k** → `gemma4:31b-nvfp4` on the MBP, whose host default is 64k. Multi-file
+  context, long diffs, big log analysis. Will NOT fit the mini's 32k.
+- **> ~60k** → does not fit `local_delegate` safely at the current host defaults (no
+  per-request window; the MBP host default is 64k) — the tool itself is not the limit, the
+  host's `OLLAMA_CONTEXT_LENGTH` is. Either raise `OLLAMA_CONTEXT_LENGTH` on the MBP's Ollama —
+  the model advertises 262144 — or route the job through `~\.ollama-qodo\review.ps1`
+  (outside this repo), which sets `options.num_ctx` itself, auto-sized to the diff.
+  `scripts/pr_review_local.sh` here does NOT help: it pins `num_ctx` at 16384.
+  Do not tell a caller to "raise num_ctx" on `local_delegate`; the parameter does not exist.
 
-When the host can't fit the 35B qwen (~20 GB loaded), the allowlist is
-overridden per machine (`ollama_models` extension setting /
-`AI_TOOLS_OLLAMA_MODELS`) with a small local model first — e.g.
-`qwen2.5-coder:14b` (q4, ~9 GB; the qwen3-coder line starts at 30B and does
-not fit). Routing then works itself out: calls for the small tag run
-locally; calls that name a qwen3.6 tag miss the local probe and fall
-through the endpoint chain to `ollama-mbp` (64k/256k) or the always-on
-`ollama` (32k) endpoint. On CPU-only hosts keep `think:false` (thinking is
-slow there) and expect ~4–8 tok/s from a dense 12–14B q4.
+## think flag
 
-## Host-specific etiquette
+`gemma4:31b-nvfp4` is thinking-capable (`/api/show` lists `thinking`). Send
+**`think:false`** for review and delegation work — with thinking on, the generation is
+spent in the `thinking` field and the response comes back empty. A small local
+coder like `qwen2.5-coder:14b` has
+no thinking support at all; the server strips a `think:true` it can't honor and says so.
 
-- **Qwen tags unload after every call by default.** When the caller omits
-  `keep_alive`, `local_delegate` sends `keep_alive: "0"` for any qwen tag, so
-  no qwen instance is left resident. That is the contamination mitigation: a
-  long-lived qwen runner returns *other prompts'* answers on ~15–25% of
-  repeat calls, and unloading between calls measured 0/96 contaminated. Other
-  models — including the `gemma4:12b-nvfp4` default — still inherit the
-  server's `OLLAMA_KEEP_ALIVE`. The cost is latency: every qwen call now pays
-  a cold load — ~20 GB for the qwen3.6 35B tags, less for a smaller override
-  tag such as the ~9 GB `qwen2.5-coder:14b` above, which the `qwen` prefix
-  also matches.
-- **Pass `keep_alive` explicitly to keep one warm — an explicit value always
-  wins.** `keep_alive: "5m"` is the deliberate opt-out when repeated cold
-  loads would dominate the work. Know what you are re-enabling: the measured
-  trigger is **many short, structurally similar prompts through one resident
-  runner**, and *distinctness is not the protective factor* — 16 genuinely
-  distinct delegation tasks came back 0/30 contaminated on first exposure but
-  8/30 and 7/30 on re-runs, while review prompts each embedding a unique diff
-  measured 0/120. Size and dissimilarity are what protect you. So warm-pinning
-  is defensible for a handful of large, unlike calls and unsafe for a batch of
-  small similar ones, however distinct their subjects.
-- **Don't leave two qwen tags warm on JVMBPro.** Each tag is its own runner
-  instance, so a second warm-pinned tag loads a *second* ~20 GB copy of the
-  same weights (weights on disk are shared, loaded GPU memory is not). Under
-  the default, *sequential* calls leave no resident copy to collide with, so
-  tag choice is free — pick purely by the window the task needs. Two caveats:
-  `keep_alive: "0"` unloads only when a call *finishes*, so overlapping calls
-  against two tags (`background=true` allows up to four in flight) can still
-  hold two runners at once; and if you do warm-pin, pin exactly one tag per
-  host and reuse it.
-- **The mini endpoint (`ollama.djvassallo.com`) is the always-on fallback.**
-  It serves only the base tag at 32k. "Always-on" means the host and its
-  Ollama server are always up — not that the model stays resident: a
-  `local_delegate` call unloads it afterwards like any other qwen tag, unless
-  you passed `keep_alive` yourself. If the task fits 32k, it works even when
-  the laptop is closed.
-- If Ollama returns a context-length error or output is silently truncated,
-  step up one tier and retry — never trim the user's input to force a fit
-  without saying so.
+## keep_alive: which tags stay resident
+
+`local_delegate` defaults an omitted `keep_alive` to `"0"` (unload after the call)
+for any tag whose final path component starts with **`qwen`**, case-folded
+(`_KEEP_ALIVE_ZERO_MODEL_PREFIXES` in `mcp_server.py`; matching the last path
+component means `hf.co/acme/qwen-model` and `Qwen3:latest` are covered too). That
+is the cross-task contamination mitigation: leaving a qwen instance resident
+measured contaminated answers across repeat calls, and unloading between calls
+measured 0/96. An explicit caller `keep_alive` always wins, so deliberate
+warm-pinning stays possible.
+
+**This still matters after the retag, for a different tag.** The qwen3.6 tags it
+was written for are gone, but `qwen3.8:27b-nvfp4` is present on `ollama-mbp` and
+matches the same prefix — so it unloads per call unless you ask otherwise. The
+gemma4 tags do NOT match, which is what lets `gemma4:31b-nvfp4` stay warm on the
+MBP and `gemma4:12b-nvfp4` stay warm on the mini for the signal openclaw agent.
+Do not "fix" that asymmetry without re-running the contamination measurement.
+
+Note `keep_alive: "0"` unloads only when a call *finishes*, so overlapping calls
+can briefly hold two runners at once. Each tag is its own runner instance, so a
+second warm-pinned tag on the same host loads a second full copy of the weights —
+pin at most one tag per host.
+
+## Constrained machines (32 GB Windows boxes, CPU-only)
+
+The 31B does not fit locally on TSDPUR012 / TSLPUR110, and the gemma4 tags are
+macOS/MLX builds that cannot even be pulled on Windows (`ollama pull` → 412). The
+allowlist is overridden per machine via `AI_TOOLS_OLLAMA_MODELS` with a small local
+model first — the one you actually pulled, e.g. `qwen2.5-coder:14b` per the README's
+Windows setup (`AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,gemma4:12b-nvfp4,gemma4:31b-nvfp4`)
+— so short mechanical calls run on-device and anything naming a remote tag misses the
+local probe and falls through the endpoint chain. Whatever tag you put first MUST be one
+`ollama list` shows locally, or implicit calls skip it and go remote. Keep
+`think:false` on these boxes and expect ~4–8 tok/s from a dense 12–14B q4.
+
+Which model to force per task type, in short: `gemma4:12b-nvfp4` (the default) for
+short mechanical delegation; `gemma4:31b-nvfp4` with `think:false` for review and
+long-context work (MBP only — if the MBP is asleep there is no 31b anywhere, drop to
+12b and say so); your small local model for anything that must stay on-device or
+offline. Neither gemma nor qwen can be trusted to count or aggregate over long inputs.
+
+## When a call fails on length
+
+Two different failures look alike from the outside, and moving to a bigger host fixes
+only one of them:
+
+- **Context-window overflow** — Ollama returns a context-length error, or the prompt is
+  silently truncated at the *input* side. `local_delegate` cannot raise the window per
+  call: move the job to the larger-window host (MBP 64k over the mini's 32k), raise
+  `OLLAMA_CONTEXT_LENGTH` on that host, or use `~\.ollama-qodo\review.ps1`.
+- **Generation-limit truncation** — the *output* stops early: mid-sentence, mid-list,
+  or mid-code-block. Underneath, Ollama reported `done_reason: length` — but
+  `local_delegate` returns only `message.content` and **discards `done_reason` and
+  `eval_count`**, so through this tool you can only infer it from the shape of the text.
+  (Calling Ollama directly, e.g. `review.ps1`, you can read those fields.) Note
+  `done_reason: length` is ambiguous on its own: it fires when the `num_predict` cap is
+  hit AND when the *remaining* context budget runs out mid-generation. Disambiguate by
+  the prompt size — a small prompt that stops early is `num_predict` (a bigger host
+  changes nothing: ask for a shorter answer, split the task, or reduce `think`); a
+  prompt near the host's window that stops early is the context budget, and belongs in
+  the bullet above. `local_delegate` exposes no `num_predict` either. Surfacing
+  `done_reason` in the tool's response would make this diagnosable instead of guessed;
+  that is a code change, not a doc one.
+
+Never trim the user's input to force a fit without saying so.

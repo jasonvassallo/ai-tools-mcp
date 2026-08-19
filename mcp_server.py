@@ -1737,16 +1737,31 @@ def _render_agent_research(data: dict[str, Any]) -> list[TextContent]:
 # is immune under the identical config (0/141 lifetime). Hence the
 # qwen-conditional keep_alive default below.
 #
-# The qwen tags remain selectable and are still the better pick for
-# long-context code work; neither model can be trusted to count or aggregate
-# over long inputs (both scored 0.33 on that task).
+# The measurement above is against qwen3.6:35b-a3b, which no longer exists on
+# the endpoint (retired 2026-08-17). The surviving qwen tag, qwen3.8:27b-nvfp4,
+# has NOT been benchmarked here and its "long-context advantage" is gone with
+# the per-context tag variants: every call now runs at the serving host's
+# window regardless of tag. Prefer gemma4:31b-nvfp4 for review and
+# long-context work (see the tool schema description and the allowlist comment
+# below); neither family can be trusted to count or aggregate over long inputs
+# (both scored 0.33 on that task).
 _OLLAMA_MODELS_ENV_VAR = "AI_TOOLS_OLLAMA_MODELS"
 _OLLAMA_BUILTIN_DELEGATE_MODELS: tuple[str, ...] = (
     "gemma4:12b-nvfp4",
-    "qwen3.6:35b-a3b-coding-nvfp4",
-    "qwen3.6:35b-a3b-coding-nvfp4-32k",
-    "qwen3.6:35b-a3b-coding-nvfp4-64k",
-    "qwen3.6:35b-a3b-coding-nvfp4-256k",
+    # 2026-08-17: the qwen3.6 tags were removed from the endpoint. There are no
+    # per-context-window tag variants any more -- both remaining large tags
+    # advertise context_length 262144 (verified via /api/show on ollama-mbp
+    # 2026-08-18: gemma4.context_length=262144, qwen3_5.context_length=262144 --
+    # `qwen3_5` there is Ollama's model_info ARCHITECTURE key for the qwen3.8:27b
+    # tag, not a typo: the family key is independent of the release tag name;
+    # this is the model's advertised window, NOT a quality benchmark -- qwen3.8
+    # remains unbenchmarked here), but local_delegate sends no options.num_ctx,
+    # so a call runs at the serving host's OLLAMA_CONTEXT_LENGTH (64k on JVMBPro,
+    # 32k on jvmacmini). gemma4:31b is the reviewer/long-context tier (kept warm on the
+    # MBP); qwen3.8:27b is the surviving qwen-family tag, still subject to the
+    # qwen keep_alive:"0" contamination default below.
+    "gemma4:31b-nvfp4",
+    "qwen3.8:27b-nvfp4",
 )
 
 
@@ -1819,8 +1834,9 @@ _OLLAMA_DEFAULT_MODEL_ENV_VAR = "AI_TOOLS_OLLAMA_DEFAULT_MODEL"
 
 # v1.1 (spec amendment): local-first endpoint chain. The remote defaults are
 # the user's own Cloudflare-Access-gated tunnels — never a third-party
-# service. Order: local → JVMBPro (64k/256k tags, laptop, may be off) →
-# jvmacmini (32k base tag, always-on server).
+# service. Order: local → JVMBPro (ollama-mbp: gemma4:31b/12b, qwen3.8;
+# 64k host window; laptop, may be off) → jvmacmini (ollama.djvassallo.com:
+# gemma4:12b-nvfp4 only, 32k host window, always-on server).
 _OLLAMA_DEFAULT_CHAIN: tuple[str, ...] = (
     "http://localhost:11434",
     "https://ollama-mbp.djvassallo.com",
@@ -2139,8 +2155,79 @@ async def _model_capabilities(endpoint: str, model: str) -> frozenset[str] | Non
     return result
 
 
+# An eviction is a control-plane call, not inference: it either drops a
+# resident runner or no-ops. Bounded well under the delegate timeout so a
+# wedged Ollama cannot stall the caller's real request behind it.
+_OLLAMA_EVICT_TIMEOUT_S = 30.0
+
+# Whatever the eviction costs, the chat still gets a usable slice: a caller
+# timeout consumed entirely by a pathological eviction would turn a working
+# call into an instant timeout, which is worse than the contamination.
+_OLLAMA_MIN_CHAT_TIMEOUT_S = 5.0
+
+
+async def _evict_ollama_runner(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    model: str,
+    headers: dict[str, str],
+    timeout_s: float,
+) -> None:
+    """Best-effort: drop `model`'s resident runner before a protected call.
+
+    `keep_alive` is a POST-*response* TTL, so `keep_alive:"0"` does not
+    protect the request that carries it: a protected call landing on an
+    already-resident, already-dirty qwen runner is exposed to exactly the
+    cross-task contamination that default exists to prevent. Measured on
+    JVMBPro 2026-08-08 (Ollama 0.32.6, q8_0 KV, OLLAMA_KEEP_ALIVE=-1) —
+    see the benchmark note in _KEEP_ALIVE_ZERO_MODEL_PREFIXES' comment.
+    Evicting first is what actually puts the call on a fresh runner.
+
+    Empty prompt + keep_alive 0 is Ollama's documented unload idiom, and on
+    an ABSENT model it is a measured 22 ms no-op that returns
+    done_reason:"unload" without loading anything. So in the steady state —
+    where the qwen keep_alive default already unloads after every call —
+    this costs a round trip and no reload. A reload (~2.5 s warm page cache)
+    is paid only when another client had warmed the model, which is exactly
+    the exposed case.
+
+    Concurrency: with Ollama's num_parallel=1 generation is serialized and a
+    busy runner is refcounted, so an eviction from one background delegate
+    job should not abort another's in-flight generation — but that
+    interaction was NOT measured here, and overlapping background qwen jobs
+    may cost each other a reload.
+
+    Bounded by `timeout_s` in WALL CLOCK, via asyncio.wait_for. httpx's
+    float timeout is per-phase — connect, write, read and pool each get that
+    value — so passing it alone would let a pathological eviction overshoot
+    and erode the caller's total budget that the pre_unload path reserves
+    against (CodeRabbit MINOR on 4a46cc2). The httpx timeout is kept as the
+    inner per-phase bound; wait_for is the outer total.
+
+    Never raises. A failed OR timed-out eviction leaves exactly today's
+    behaviour; it must not turn into a failure of the caller's real request.
+    """
+    try:
+        await asyncio.wait_for(
+            client.post(
+                f"{endpoint}/api/generate",
+                json={"model": model, "prompt": "", "keep_alive": 0, "stream": False},
+                headers=headers,
+                timeout=timeout_s,
+            ),
+            timeout=timeout_s,
+        )
+    except (
+        httpx.RequestError,
+        httpx.HTTPStatusError,
+        ValueError,
+        asyncio.TimeoutError,
+    ):
+        return
+
+
 async def _post_ollama_chat(
-    payload: dict[str, Any], timeout_s: float
+    payload: dict[str, Any], timeout_s: float, pre_unload: bool = False
 ) -> dict[str, Any]:
     """POST /api/chat to the first chain endpoint serving payload['model'].
 
@@ -2163,6 +2250,26 @@ async def _post_ollama_chat(
             "error": f"no credentials for {redact_secrets(endpoint)}",
         }
     client = await _get_http_client()
+    # Here, not at the call site: this is the one place that has resolved
+    # the endpoint, so the eviction and the chat provably hit the SAME host
+    # (no second resolution that could drift), and both the sync and the
+    # background delegate paths route through it.
+    if pre_unload:
+        # timeout_s is the documented ceiling for the WHOLE delegate call, so
+        # the chat's minimum slice is reserved up front rather than restored
+        # afterwards. Restoring a floor after the fact hands back budget the
+        # eviction already spent, which lets the total reach ~2x the caller's
+        # ceiling on small timeouts (CodeRabbit MAJOR, reproduced at
+        # timeout_s=1). Reserving first makes the sum bounded by construction.
+        chat_reserve = min(_OLLAMA_MIN_CHAT_TIMEOUT_S, timeout_s)
+        evict_budget = min(_OLLAMA_EVICT_TIMEOUT_S, timeout_s - chat_reserve)
+        # A budget too small to afford an eviction skips it and runs
+        # unprotected rather than overrunning. Moot in practice: no qwen tag
+        # completes a generation in the seconds that implies.
+        if evict_budget > 0:
+            started = time.monotonic()
+            await _evict_ollama_runner(client, endpoint, model, headers, evict_budget)
+            timeout_s = max(chat_reserve, timeout_s - (time.monotonic() - started))
     try:
         response = await client.post(
             f"{endpoint}/api/chat", json=payload, headers=headers, timeout=timeout_s
@@ -2253,7 +2360,7 @@ def _render_delegate_answer(
 _delegate_jobs: dict[str, dict[str, Any]] = {}
 
 
-def _start_delegate_job(payload: dict[str, Any]) -> str:
+def _start_delegate_job(payload: dict[str, Any], pre_unload: bool = False) -> str:
     """Launch a background delegate call; return its job id.
 
     Raises ValueError when _DELEGATE_JOB_CAP jobs are already running —
@@ -2294,7 +2401,7 @@ def _start_delegate_job(payload: dict[str, Any]) -> str:
         )
     job_id = uuid.uuid4().hex
     coro = asyncio.wait_for(
-        _post_ollama_chat(payload, _DELEGATE_BG_CEILING_S),
+        _post_ollama_chat(payload, _DELEGATE_BG_CEILING_S, pre_unload=pre_unload),
         timeout=_DELEGATE_BG_CEILING_S,
     )
     _delegate_jobs[job_id] = {
@@ -2599,16 +2706,17 @@ async def list_tools() -> list[Tool]:
                             "is the `default` field above (it follows the "
                             "allowlist's first entry, which AI_TOOLS_OLLAMA_"
                             "MODELS can override per machine). Out of the box "
-                            "that is gemma4:12b-nvfp4 — it outscored the qwen tags "
-                            "on mechanical delegate work (0.92 vs 0.73) and is "
-                            "the safer pick for short repeated prompts. Prefer "
-                            "a qwen tag for "
-                            "long-context code work. Neither is reliable at "
-                            "counting or aggregating over long inputs. The "
-                            "qwen base tag inherits each serving host's "
-                            "context window (64k on JVMBPro, 32k on "
-                            "jvmacmini); -32k/-256k pin explicit windows "
-                            "(-256k = several GB of KV cache, JVMBPro only). "
+                            "that is gemma4:12b-nvfp4 — it outscored the (since-"
+                            "retired) qwen3.6 tags on mechanical delegate work "
+                            "(0.92 vs 0.73) and is the safer pick for short "
+                            "repeated prompts; qwen3.8:27b-nvfp4 is unbenchmarked. Prefer "
+                            "gemma4:31b-nvfp4 for review and long-context code "
+                            "work (served by the MBP only). Neither is reliable "
+                            "at counting or aggregating over long inputs. There "
+                            "is no per-request context window: every call runs "
+                            "at the serving host's OLLAMA_CONTEXT_LENGTH (64k on "
+                            "JVMBPro, 32k on jvmacmini) — no -32k/-64k/-256k "
+                            "tag variants exist any more. "
                             "Explicit tags resolve strictly: the endpoint "
                             "chain is probed per call and the first endpoint "
                             "serving the tag wins, else the call fails. "
@@ -2625,13 +2733,19 @@ async def list_tools() -> list[Tool]:
                         "default": False,
                         "description": (
                             "Enable the model's thinking mode. Off by default "
-                            "for speed; enable for reasoning-heavy asks. Every "
-                            "built-in allowlist tag reports the 'thinking' "
-                            "capability; if an overridden tag does not, the "
-                            "server disables the flag and prefixes an advisory "
-                            "instead of letting Ollama reject the call. Note "
-                            "qwen thinking can consume the whole output budget "
-                            "on large inputs and return no answer at all."
+                            "for speed. KEEP IT OFF for the gemma4 tags "
+                            "(including the gemma4:31b-nvfp4 reviewer): with "
+                            "thinking on they put the generation in "
+                            "message.thinking, which this tool discards, so the "
+                            "call returns 'Error: Ollama returned no content'. "
+                            "Enable it only on a model whose content you have "
+                            "confirmed survives it. Every built-in allowlist tag "
+                            "reports the 'thinking' capability; if an overridden "
+                            "tag does not, the server disables the flag and "
+                            "prefixes an advisory instead of letting Ollama "
+                            "reject the call. Qwen thinking can likewise consume "
+                            "the whole output budget on large inputs and return "
+                            "no answer at all."
                         ),
                     },
                     "background": {
@@ -2647,7 +2761,7 @@ async def list_tools() -> list[Tool]:
                         "description": (
                             "Optional: how long Ollama keeps the model loaded "
                             "after the call ('0' = unload immediately — use "
-                            "after a big -256k job). Omitted: qwen tags "
+                            "after a big one-off job). Omitted: qwen tags "
                             "default to '0' (repeat-call contamination "
                             "mitigation; pass e.g. '5m' to deliberately keep "
                             "one warm); other models inherit the server's "
@@ -2657,7 +2771,15 @@ async def list_tools() -> list[Tool]:
                     "timeout_s": {
                         "type": "integer",
                         "default": 300,
-                        "description": "Sync timeout in seconds (1-600).",
+                        "description": (
+                            "Sync timeout in seconds (1-600). The qwen "
+                            "contamination pre-unload is wall-clock bounded and "
+                            "deducted from this budget; at 5s or less it is "
+                            "skipped rather than allowed to eat it, so such a "
+                            "call runs unprotected. Note httpx applies the "
+                            "remainder per network phase, so this is a phase "
+                            "bound rather than a hard total."
+                        ),
                     },
                 },
                 "required": ["prompt"],
@@ -3222,8 +3344,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # After final model resolution (implicit calls may have re-resolved
         # `model` above): qwen tags default to keep_alive "0" — the proven
         # repeat-call contamination mitigation. Explicit caller values win.
+        #
+        # The pre-unload follows the EFFECTIVE zero TTL, not how it was
+        # chosen. Gating it on "we applied the default" left the repo's own
+        # documented route unprotected: commands/local-delegate.md tells
+        # callers to pass keep_alive="0" for long-context qwen work, so the
+        # most likely qwen caller opted itself out of the very protection
+        # this exists to provide (Codex P1 + Gemini, PR #65, both confirmed
+        # against that file). An explicit NON-zero value still opts out —
+        # deliberate warm-pinning stays possible.
         if keep_alive is None and _keep_alive_zero_default_applies(model):
             keep_alive = "0"
+        pre_unload = keep_alive == "0" and _keep_alive_zero_default_applies(model)
 
         messages: list[dict[str, str]] = []
         if system:
@@ -3240,7 +3372,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         if background:
             try:
-                job_id = _start_delegate_job(payload)
+                job_id = _start_delegate_job(payload, pre_unload=pre_unload)
             except ValueError as exc:
                 return [TextContent(type="text", text=f"Error: {exc}")]
             # Carried as a JSON field, NOT prepended: this envelope is
@@ -3255,7 +3387,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 )
             ]
 
-        data = await _post_ollama_chat(payload, float(timeout_s))
+        data = await _post_ollama_chat(payload, float(timeout_s), pre_unload=pre_unload)
         return _render_delegate_answer(data, prefix=advisory)
 
     if name == "local_delegate_result":

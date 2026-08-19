@@ -25,7 +25,20 @@ set -uo pipefail
 # before Python ever starts) — and an mcpb manifest cannot create it. This
 # hook runs at every CLI session start, so create it here: idempotent, and
 # inert on macOS (Unix tempdir logic reads TMPDIR, not TMP/TEMP).
-mkdir -p "${HOME}/.uvtmp" 2>/dev/null || true
+#
+# Windows fallback + root-path guard: this hook only runs under bash (which
+# always sets HOME), but on Windows a Desktop-launched shell can have HOME
+# unset with only USERPROFILE present. `${VAR:+word}` substitutes `word` only
+# when VAR is set AND non-empty (unlike `:-`, which substitutes on absence but
+# leaves an empty VAR as empty) — nesting it makes UVTMP_TARGET itself empty
+# whenever both are, so the guard below skips mkdir entirely rather than ever
+# resolving to the root-relative path "/.uvtmp" (confirmed under Git Bash that
+# `mkdir -p /.uvtmp` can actually SUCCEED there, not fail silently).
+UVTMP_TARGET="${HOME:+$HOME/.uvtmp}"
+UVTMP_TARGET="${UVTMP_TARGET:-${USERPROFILE:+$USERPROFILE/.uvtmp}}"
+if [[ -n "$UVTMP_TARGET" ]]; then
+  mkdir -p "$UVTMP_TARGET" 2>/dev/null || true
+fi
 
 SERVER="${CLAUDE_PLUGIN_ROOT}/mcp_server.py"
 
