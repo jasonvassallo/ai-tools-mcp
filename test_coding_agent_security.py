@@ -133,7 +133,7 @@ _SECRET_MARKER = b"STOLEN_SECRET_BYTES"
 _SECRET_BLOB = b"-----BEGIN OPENSSH PRIVATE KEY-----\n" + _SECRET_MARKER + b"\n"
 
 
-def _swap_on_first_lstat(victim_abs: str, link_target: str):
+def _swap_on_first_lstat(victim_abs: str, link_target: str, as_fifo: bool = False):
     """Return an os.lstat replacement that swaps `victim_abs` for a symlink
     exactly ONCE, on the first lstat of that name.
 
@@ -161,6 +161,10 @@ def _swap_on_first_lstat(victim_abs: str, link_target: str):
         if stat.S_ISDIR(st.st_mode):
             os.rmdir(victim_abs)
             os.symlink(link_target, victim_abs)
+        elif as_fifo:
+            # `link_target` is an existing FIFO; rename it over the victim so
+            # the name the walk is about to open is a FIFO, not a symlink.
+            os.rename(link_target, victim_abs)
         else:
             staged = victim_abs + ".staged"
             os.symlink(link_target, staged)
@@ -231,6 +235,31 @@ class WalkRaceCannotDereference(unittest.TestCase):
             snap.entries,
             "the walk descended through a symlink swapped in after lstat",
         )
+
+    def test_file_swapped_for_fifo_after_classification_does_not_hang(self):
+        """O_NOFOLLOW alone does not close the swap — it only refuses SYMLINKS.
+
+        A FIFO renamed over a regular file between the classifying lstat and
+        the open passes O_NOFOLLOW and then BLOCKS a plain open forever, which
+        takes the host walk (and the human gate with it) offline. O_NONBLOCK is
+        what closes that half.
+
+        Regression signal, be warned: if O_NONBLOCK is ever dropped from
+        _FILE_FLAGS this test HANGS rather than failing red — the same property
+        the original FIFO test has, and the reason the repo would want
+        pytest-timeout before this suite runs unattended in CI.
+        """
+        victim = self.root / "victim.txt"
+        victim.write_bytes(b"benign\n")
+        fifo = str(victim) + ".fifo"
+        os.mkfifo(fifo)
+        fake, state = _swap_on_first_lstat(str(victim), fifo, as_fifo=True)
+        with unittest.mock.patch("os.lstat", fake):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+        self.assertTrue(state["swapped"], "the interposition never fired")
+        entry = snap.entries.get("victim.txt")
+        if entry is not None:
+            self.assertNotEqual(entry.kind, "file", "a FIFO was read as a file")
 
     def _race(self, attacker_src: str, max_walks: int, budget_s: float) -> int:
         """Run `attacker_src` as a SEPARATE PROCESS while walking repeatedly.

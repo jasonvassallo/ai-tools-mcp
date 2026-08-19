@@ -96,6 +96,35 @@ class DescriptorHygiene(unittest.TestCase):
         # per queued directory would sit ~200 above the baseline.
         self.assertLess(peak - baseline, 10, f"peak={peak} baseline={baseline}")
 
+    def test_no_descriptors_leak_when_the_ignore_callable_raises(self):
+        """Task 3 owns `is_ignored`; a bug in it must not leak the host
+        process's descriptors. This is the path where the walk unwinds with
+        frames still on the stack, so it exercises the outer `finally`.
+        """
+
+        class Boom(Exception):
+            pass
+
+        cur = self.root
+        for i in range(40):
+            cur = cur / f"lvl{i:02d}"
+            cur.mkdir()
+            (cur / "f.txt").write_text("x\n")
+
+        def raise_deep(p: str) -> bool:
+            if p.count("/") >= 35:  # ~36 directory descriptors are open here
+                raise Boom(p)
+            return False
+
+        snapshot_tree(str(self.root), lambda p: False)  # warm up
+        before = _open_fd_count()
+        for _ in range(50):
+            with self.assertRaises(Boom):
+                snapshot_tree(str(self.root), raise_deep)
+            with self.assertRaises(Boom):
+                snapshot_tree(str(self.root), lambda p: (_ for _ in ()).throw(Boom(p)))
+        self.assertEqual(_open_fd_count(), before)
+
     def test_deep_tree_is_walked_to_the_bottom(self):
         cur = self.root
         for i in range(60):

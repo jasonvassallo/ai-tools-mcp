@@ -6,9 +6,18 @@ review demonstrated host RCE via a sandbox-controlled `.git`; a later pass
 demonstrated that a naive os.walk+read() then leaked host secrets through
 planted symlinks; a FIFTH pass demonstrated that classifying with `lstat` and
 then acting on that classification BY PATH leaked them again through a race —
-a separate process swapped the path for a symlink in the window and the host
-read a private key into the snapshot on walk #13. All three are pinned by
+a separate process swapped the path for a symlink inside the window and the
+host read a planted private key into the snapshot on walk #28 (file vector)
+and walk #696 (directory vector). All three are pinned by
 test_coding_agent_security.py.
+
+Out of scope, by spec §6.5 and not by oversight: a HARDLINK is indistinguishable
+from a regular file to both `lstat` and `fstat`, so nothing below defends
+against one. Safety there rests on the container mount model — host paths are
+not in the sandbox's mount namespace, and `/work` is a different device from
+the image and tmpfs, so `link()` is EXDEV. Adding a second bind-mount reopens
+it. (Beware when probing this: `os.link` FOLLOWS a symlink source on macOS, so
+a probe that links a symlink is measuring the hardlink vector, not this one.)
 
 The race fix in one sentence: the walk holds every directory OPEN and reaches
 each child through that descriptor, every open is `O_NOFOLLOW`, and every
@@ -156,6 +165,16 @@ def _visit(
     swapped underneath the walk. Returns at most one of (entry, child frame);
     the caller owns the returned frame's descriptor.
     """
+    # Re-classifying must not re-query the injected callable: the query string
+    # is the same, so the answer is the same, and Task 3's matcher should see
+    # the same call pattern it would see on a quiescent tree.
+    decided: dict[str, bool] = {}
+
+    def ignored(query: str) -> bool:
+        if query not in decided:
+            decided[query] = is_ignored(query)
+        return decided[query]
+
     for _attempt in range(_RECLASSIFY_ATTEMPTS):
         try:
             classified = os.lstat(name, dir_fd=dir_fd)  # lstat: never follows
@@ -163,16 +182,23 @@ def _visit(
             return None, None
         mode = classified.st_mode
         if stat.S_ISLNK(mode):
+            # Deliberately NOT ino/dev re-verified, unlike the two branches
+            # below. `readlink` never dereferences, whatever now occupies the
+            # name, so no host CONTENT can reach the snapshot through here —
+            # the worst a winning racer achieves is having a different link's
+            # target TEXT recorded, which is data the sandbox already controls.
+            # There is no descriptor to fstat either: O_NOFOLLOW would refuse
+            # to open a symlink at all, which is the point of it.
             try:
                 target = os.readlink(name, dir_fd=dir_fd)
             except OSError:
                 continue  # swapped or vanished; re-classify
-            if is_ignored(rel):
+            if ignored(rel):
                 return None, None
             data = target.encode("utf-8", "surrogateescape")
             return Entry(rel, "symlink", data), None
         if stat.S_ISDIR(mode):
-            if is_ignored(rel + "/"):
+            if ignored(rel + "/"):
                 return None, None
             frame = _open_child_dir(dir_fd, name, rel + "/", classified)
             if frame is not None:
@@ -180,11 +206,21 @@ def _visit(
             continue  # lost the race; re-classify
         if not stat.S_ISREG(mode):
             return None, None  # FIFO / socket / device: skip
-        if is_ignored(rel):
+        if ignored(rel):
             return None, None
         entry = _read_regular(dir_fd, name, rel, classified)
         if entry is not None:
             return entry, None
+    # KNOWN GAP, escalated rather than papered over. Losing the race
+    # _RECLASSIFY_ATTEMPTS times in a row drops this entry from the snapshot
+    # with no signal — indistinguishable from "never existed". Confidentiality
+    # holds (no host bytes are ever read on a losing attempt), but it is a
+    # narrow, timing-gated instance of the under-showing failure §6.5 calls the
+    # dangerous direction. It cannot be surfaced from here without changing
+    # TreeSnapshot, which downstream tasks are written against; the fix belongs
+    # with whoever owns the §9 error path — a dropped-path count carried
+    # alongside the diff, so the gate can say "N paths could not be read
+    # consistently" instead of silently showing fewer.
     return None, None
 
 
