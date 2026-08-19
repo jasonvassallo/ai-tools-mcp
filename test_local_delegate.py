@@ -68,6 +68,15 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
     class _FakeConnectError(_FakeRequestError):
         pass
 
+    class _FakeTimeoutException(_FakeRequestError):
+        pass
+
+    class _FakeConnectTimeout(_FakeTimeoutException):
+        pass
+
+    class _FakeReadTimeout(_FakeTimeoutException):
+        pass
+
     class _FakeRequestsException(Exception):
         pass
 
@@ -155,6 +164,9 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             HTTPStatusError=_FakeHTTPStatusError,
             RequestError=_FakeRequestError,
             ConnectError=_FakeConnectError,
+            TimeoutException=_FakeTimeoutException,
+            ConnectTimeout=_FakeConnectTimeout,
+            ReadTimeout=_FakeReadTimeout,
         ),
         "requests": _make(
             "requests",
@@ -961,12 +973,30 @@ class TestThinkingModelAdvisory(unittest.TestCase):
             ),
         )
 
-    def _delegate(self, args, caps, post=None, resolved="gemma4:12b-nvfp4", note=""):
+    def _delegate(
+        self,
+        args,
+        caps,
+        post=None,
+        resolved="gemma4:12b-nvfp4",
+        note="",
+        queue_job_id=None,
+    ):
+        # _queue_submit is stubbed (default: no durable queue) so these
+        # tests exercise the advisory plumbing, not queue reachability.
         fake = post or mock.AsyncMock(
             return_value=({"model": resolved, "message": {"content": "ok"}}, "")
         )
         r1, r2, r3 = self._env(caps, resolved=resolved, note=note)
-        with r1, r2, r3, mock.patch.object(mcp_server, "_post_ollama_chat", fake):
+        with (
+            r1,
+            r2,
+            r3,
+            mock.patch.object(mcp_server, "_post_ollama_chat", fake),
+            mock.patch.object(
+                mcp_server, "_queue_submit", mock.AsyncMock(return_value=queue_job_id)
+            ),
+        ):
             out = _call("local_delegate", args)
         return out, fake
 
@@ -1097,13 +1127,28 @@ class TestThinkingModelAdvisory(unittest.TestCase):
         self.assertIn("job_id", env)
         self.assertEqual(env["status"], "started")
         self.assertIn("think=true was disabled", env["warning"])
+        # No queue reachable in this fixture: the fallback note composes
+        # with the advisory in the same JSON field.
+        self.assertIn("No durable queue endpoint reachable", env["warning"])
 
     def test_background_envelope_has_no_warning_key_when_not_needed(self):
+        # A durable-queue submit with no advisory carries no warning at
+        # all — the fallback note is only for the in-memory path. Model
+        # passed explicitly: an implicit model on the queue path now
+        # carries its own resolved-against-this-machine advisory.
         out, _ = self._delegate(
-            {"prompt": "hi", "think": True, "background": True}, self.THINKING
+            {
+                "prompt": "hi",
+                "think": True,
+                "background": True,
+                "model": mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL,
+            },
+            self.THINKING,
+            queue_job_id="q" + "c" * 32,
         )
         env = json.loads(out[0].text)
         self.assertNotIn("warning", env)
+        self.assertEqual(env["queue"], "durable")
 
     def test_error_returns_are_not_prefixed(self):
         # Callers may pattern-match the "Error:" shape; keep it unpolluted.
@@ -1568,6 +1613,14 @@ class TestLocalDelegateBackground(unittest.TestCase):
     def setUp(self):
         mcp_server._delegate_jobs.clear()
         _stub_resolution(self)
+        # No durable queue in this fixture — these tests pin the legacy
+        # in-memory fallback path (TestLocalDelegateQueue covers the
+        # queue-first path).
+        queue = mock.patch.object(
+            mcp_server, "_queue_submit", mock.AsyncMock(return_value=None)
+        )
+        queue.start()
+        self.addCleanup(queue.stop)
 
     def test_background_returns_job_id_then_result_collects(self):
         async def scenario():
@@ -2440,17 +2493,31 @@ class TestEvictWarningSurfacing(unittest.TestCase):
             }, "endpoint answered HTTP 403"
 
         async def scenario():
-            with mock.patch.object(mcp_server, "_post_ollama_chat", fake_post):
+            with (
+                # No durable queue in this fixture: this test pins the
+                # legacy in-memory fallback path, which is what actually
+                # collects the eviction warning below. TestLocalDelegateQueue
+                # covers the queue-first path.
+                mock.patch.object(
+                    mcp_server, "_queue_submit", mock.AsyncMock(return_value=None)
+                ),
+                mock.patch.object(mcp_server, "_post_ollama_chat", fake_post),
+            ):
                 started = await mcp_server.call_tool(
                     "local_delegate",
                     {"prompt": "p", "model": _MODEL, "background": True},
                 )
                 # The START envelope is json.loads()-ed by callers, so the
                 # banner must never leak into it as a bare text prefix and
-                # the envelope must gain no field: exact key set, not a
-                # subset check.
+                # the envelope must gain no UNEXPECTED field: exact key set,
+                # not a subset check. "warning" IS expected here — the
+                # in-memory-fallback path always carries the "no durable
+                # queue reachable" advisory; it is a different field from
+                # the eviction-warning banner this test actually exercises,
+                # which never appears in the START envelope at all (it only
+                # renders in the later local_delegate_result text).
                 envelope = json.loads(started[0].text)
-                self.assertEqual(set(envelope), {"job_id", "status"})
+                self.assertEqual(set(envelope), {"job_id", "status", "warning"})
                 self.assertEqual(envelope["status"], "started")
                 await _settle(
                     lambda: all(
@@ -2975,6 +3042,566 @@ class TestModelAllowlistOverride(unittest.TestCase):
                 mcp_server._resolve_delegate_models(),
                 mcp_server._OLLAMA_BUILTIN_DELEGATE_MODELS,
             )
+
+
+# ─── Durable queue client (v1.6) ──────────────────────────────────────
+
+_QID = "q" + "d" * 32
+
+
+class _FakeQueueClient:
+    """Programmable GET/POST fake for the queue client helpers.
+
+    Routes by exact URL. ``get_map``/``post_map`` values are either a
+    _FakeResponse or an Exception instance to raise.
+    """
+
+    def __init__(self, get_map=None, post_map=None):
+        self.get_map = get_map or {}
+        self.post_map = post_map or {}
+        self.get_calls: list = []
+        self.post_calls: list = []
+
+    @staticmethod
+    def _resolve(mapping, url):
+        outcome = mapping.get(url)
+        if outcome is None:
+            raise mcp_server.httpx.ConnectError(f"no route for {url}")
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    async def get(self, url, **kwargs):
+        self.get_calls.append((url, kwargs))
+        return self._resolve(self.get_map, url)
+
+    async def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        return self._resolve(self.post_map, url)
+
+
+_LOCAL_QUEUE = "http://localhost:11438"
+_REMOTE_QUEUE = "https://queue-mbp.example"
+_HEALTH_OK = {"status": "ok", "queued": 0, "running": 0}
+
+
+class TestResolveQueueChain(unittest.TestCase):
+    def _chain(self, env):
+        cleared = {"AI_TOOLS_QUEUE_URLS": ""}
+        with mock.patch.dict(os.environ, {**cleared, **env}):
+            return mcp_server._resolve_queue_chain()
+
+    def test_default_chain(self):
+        self.assertEqual(self._chain({}), list(mcp_server._QUEUE_DEFAULT_CHAIN))
+
+    def test_env_csv_override_dedupes_and_strips(self):
+        chain = self._chain(
+            {
+                "AI_TOOLS_QUEUE_URLS": (
+                    " http://localhost:11438/ ,https://q.example,"
+                    "http://localhost:11438,,"
+                )
+            }
+        )
+        self.assertEqual(chain, ["http://localhost:11438", "https://q.example"])
+
+    def test_plain_http_remote_rejected(self):
+        # Same fail-closed rule as the Ollama chain: a non-localhost
+        # endpoint must be https (the Access-gated tunnel).
+        with self.assertRaises(ValueError):
+            self._chain({"AI_TOOLS_QUEUE_URLS": "http://remote.example:11438"})
+
+    def test_embedded_credentials_rejected(self):
+        with self.assertRaises(ValueError):
+            self._chain({"AI_TOOLS_QUEUE_URLS": "https://u:pw@q.example"})
+
+
+class _QueueClientCase(unittest.TestCase):
+    """Shared env/keychain scaffolding for the queue helper tests."""
+
+    URLS = _LOCAL_QUEUE
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ, {"AI_TOOLS_QUEUE_URLS": self.URLS})
+        env.start()
+        self.addCleanup(env.stop)
+        kc = mock.patch.object(
+            mcp_server, "get_api_key_from_keychain", side_effect=_no_keychain
+        )
+        kc.start()
+        self.addCleanup(kc.stop)
+
+    def _with(self, client):
+        return mock.patch.object(
+            mcp_server, "_get_http_client", mock.AsyncMock(return_value=client)
+        )
+
+
+class TestSelectQueueEndpoint(_QueueClientCase):
+    def test_healthy_localhost_selected_with_empty_headers(self):
+        client = _FakeQueueClient(
+            get_map={f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)}
+        )
+        with self._with(client):
+            selected = asyncio.run(mcp_server._select_queue_endpoint())
+        self.assertEqual(selected, (_LOCAL_QUEUE, {}))
+
+    def test_unreachable_endpoint_yields_none(self):
+        client = _FakeQueueClient(
+            get_map={
+                f"{_LOCAL_QUEUE}/healthz": mcp_server.httpx.ConnectError("refused")
+            }
+        )
+        with self._with(client):
+            self.assertIsNone(asyncio.run(mcp_server._select_queue_endpoint()))
+
+    def test_unhealthy_endpoint_yields_none(self):
+        client = _FakeQueueClient(
+            get_map={f"{_LOCAL_QUEUE}/healthz": _FakeResponse(status_code=500)}
+        )
+        with self._with(client):
+            self.assertIsNone(asyncio.run(mcp_server._select_queue_endpoint()))
+
+    def test_remote_without_creds_is_skipped_and_never_called(self):
+        # Fail closed: an Access-gated queue host is never probed bare.
+        with mock.patch.dict(os.environ, {"AI_TOOLS_QUEUE_URLS": _REMOTE_QUEUE}):
+            client = _FakeQueueClient(
+                get_map={
+                    f"{_REMOTE_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)
+                }
+            )
+            with self._with(client):
+                self.assertIsNone(asyncio.run(mcp_server._select_queue_endpoint()))
+        self.assertEqual(client.get_calls, [])
+
+    def test_remote_with_creds_gets_cf_access_headers(self):
+        creds = {
+            "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+            "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+        }
+
+        def keychain(service, account):
+            if service in creds:
+                return creds[service]
+            raise ValueError("not found")
+
+        with (
+            mock.patch.dict(os.environ, {"AI_TOOLS_QUEUE_URLS": _REMOTE_QUEUE}),
+            mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", side_effect=keychain
+            ),
+        ):
+            client = _FakeQueueClient(
+                get_map={
+                    f"{_REMOTE_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)
+                }
+            )
+            with self._with(client):
+                selected = asyncio.run(mcp_server._select_queue_endpoint())
+        endpoint, headers = selected
+        self.assertEqual(endpoint, _REMOTE_QUEUE)
+        self.assertEqual(headers["CF-Access-Client-Id"], "id-123")
+        _, kwargs = client.get_calls[0]
+        self.assertEqual(kwargs["headers"]["CF-Access-Client-Secret"], "sec-456")
+
+    def test_falls_through_dead_localhost_to_healthy_remote(self):
+        creds = {
+            "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+            "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+        }
+
+        def keychain(service, account):
+            if service in creds:
+                return creds[service]
+            raise ValueError("not found")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"AI_TOOLS_QUEUE_URLS": f"{_LOCAL_QUEUE},{_REMOTE_QUEUE}"},
+            ),
+            mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", side_effect=keychain
+            ),
+        ):
+            client = _FakeQueueClient(
+                get_map={
+                    f"{_LOCAL_QUEUE}/healthz": mcp_server.httpx.ConnectError("dead"),
+                    f"{_REMOTE_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK),
+                }
+            )
+            with self._with(client):
+                endpoint, _headers = asyncio.run(mcp_server._select_queue_endpoint())
+        self.assertEqual(endpoint, _REMOTE_QUEUE)
+
+
+class TestQueueSubmit(_QueueClientCase):
+    def _submit(self, client, payload=None):
+        with self._with(client):
+            return asyncio.run(mcp_server._queue_submit(payload or {"model": "m"}))
+
+    def test_happy_path_returns_job_id(self):
+        client = _FakeQueueClient(
+            get_map={f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)},
+            post_map={
+                f"{_LOCAL_QUEUE}/v1/jobs": _FakeResponse(
+                    json_data={"job_id": _QID, "status": "queued"}
+                )
+            },
+        )
+        self.assertEqual(self._submit(client), _QID)
+        url, kwargs = client.post_calls[0]
+        self.assertEqual(url, f"{_LOCAL_QUEUE}/v1/jobs")
+        self.assertEqual(kwargs["json"]["model"], "m")
+
+    def test_no_reachable_endpoint_returns_none(self):
+        client = _FakeQueueClient(
+            get_map={
+                f"{_LOCAL_QUEUE}/healthz": mcp_server.httpx.ConnectError("refused")
+            }
+        )
+        self.assertIsNone(self._submit(client))
+        self.assertEqual(client.post_calls, [])
+
+    def test_submit_rejection_returns_none(self):
+        client = _FakeQueueClient(
+            get_map={f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)},
+            post_map={
+                f"{_LOCAL_QUEUE}/v1/jobs": _FakeResponse(
+                    status_code=413, json_data={"error": "too big"}
+                )
+            },
+        )
+        self.assertIsNone(self._submit(client))
+
+    def test_malformed_job_id_is_ambiguous_not_a_fallback(self):
+        # HTTP 200 proves the queue ACCEPTED the job; a missing/garbage
+        # job_id must not quietly fall back to the in-memory store, or
+        # the same prompt executes twice (queue worker + in-memory).
+        for bad in ("no-prefix", "q" + "z" * 32, "", None, 42):
+            client = _FakeQueueClient(
+                get_map={
+                    f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)
+                },
+                post_map={
+                    f"{_LOCAL_QUEUE}/v1/jobs": _FakeResponse(
+                        json_data={"job_id": bad, "status": "queued"}
+                    )
+                },
+            )
+            with self.assertRaises(ValueError, msg=repr(bad)) as ctx:
+                self._submit(client)
+            self.assertIn("twice", str(ctx.exception))
+
+    def test_connect_error_on_submit_falls_back(self):
+        # The POST never reached the service — safe to fall back (None).
+        client = _FakeQueueClient(
+            get_map={f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)},
+            post_map={
+                f"{_LOCAL_QUEUE}/v1/jobs": mcp_server.httpx.ConnectError("refused")
+            },
+        )
+        self.assertIsNone(self._submit(client))
+
+    def test_read_timeout_on_submit_is_ambiguous(self):
+        # The request was sent and the response never came back: the job
+        # may be enqueued server-side, so falling back would risk double
+        # execution. Must raise, not return None.
+        client = _FakeQueueClient(
+            get_map={f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK)},
+            post_map={
+                f"{_LOCAL_QUEUE}/v1/jobs": mcp_server.httpx.ReadTimeout("mid-flight")
+            },
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self._submit(client)
+        self.assertIn("unknown", str(ctx.exception))
+        self.assertIn("twice", str(ctx.exception))
+
+
+class TestQueuePoll(_QueueClientCase):
+    RESULT_URL = f"{_LOCAL_QUEUE}/v1/jobs/{_QID}/result"
+
+    def _poll(self, client):
+        with self._with(client):
+            return asyncio.run(mcp_server._queue_poll(_QID))
+
+    def _client(self, result_response):
+        return _FakeQueueClient(
+            get_map={
+                f"{_LOCAL_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK),
+                self.RESULT_URL: result_response,
+            }
+        )
+
+    def test_running_maps_to_delegate_running_envelope(self):
+        out = self._poll(
+            self._client(
+                _FakeResponse(
+                    json_data={"job_id": _QID, "status": "running", "elapsed_s": 7}
+                )
+            )
+        )
+        self.assertEqual(out, {"status": "running", "elapsed_s": 7, "queue": "durable"})
+
+    def test_done_returns_stored_chat_response(self):
+        stored = {"model": "m", "message": {"content": "queued answer"}}
+        out = self._poll(
+            self._client(_FakeResponse(json_data={"job_id": _QID, "result": stored}))
+        )
+        self.assertEqual(out, stored)
+
+    def test_failed_envelope_passes_through(self):
+        stored = {"status": "failed", "error": "upstream HTTP 500"}
+        out = self._poll(
+            self._client(_FakeResponse(json_data={"job_id": _QID, "result": stored}))
+        )
+        self.assertEqual(out, stored)
+
+    def test_unknown_id_404_raises_purge_hint(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._poll(
+                self._client(_FakeResponse(status_code=404, json_data={"error": "x"}))
+            )
+        # The message must not flatly assert the job was purged: each
+        # endpoint has its own store, so "unknown here" also covers a job
+        # whose accepting endpoint is currently unreachable.
+        self.assertIn("purged", str(ctx.exception))
+        self.assertIn("unreachable", str(ctx.exception))
+        self.assertIn(_LOCAL_QUEUE, str(ctx.exception))
+
+    def test_404_walks_chain_to_endpoint_that_knows_the_job(self):
+        # Two endpoints, each with its own store: a 404 from the first
+        # must not end the poll — the second endpoint has the job.
+        creds = {
+            "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+            "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+        }
+
+        def keychain(service, account):
+            if service in creds:
+                return creds[service]
+            raise ValueError("not found")
+
+        stored = {"model": "m", "message": {"content": "found remotely"}}
+        client = _FakeQueueClient(
+            get_map={
+                self.RESULT_URL: _FakeResponse(
+                    status_code=404, json_data={"error": "x"}
+                ),
+                f"{_REMOTE_QUEUE}/v1/jobs/{_QID}/result": _FakeResponse(
+                    json_data={"job_id": _QID, "result": stored}
+                ),
+            }
+        )
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"AI_TOOLS_QUEUE_URLS": f"{_LOCAL_QUEUE},{_REMOTE_QUEUE}"},
+            ),
+            mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", side_effect=keychain
+            ),
+            self._with(client),
+        ):
+            out = asyncio.run(mcp_server._queue_poll(_QID))
+        self.assertEqual(out, stored)
+
+    def test_no_endpoint_raises_retryable_error(self):
+        client = _FakeQueueClient(
+            get_map={
+                f"{_LOCAL_QUEUE}/healthz": mcp_server.httpx.ConnectError("refused")
+            }
+        )
+        with self.assertRaises(ValueError) as ctx:
+            self._poll(client)
+        self.assertIn("retry local_delegate_result later", str(ctx.exception))
+
+    def test_request_error_raises_retryable_error(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._poll(self._client(mcp_server.httpx.ConnectError("mid-flight")))
+        self.assertIn("durable", str(ctx.exception))
+
+    def test_http_error_scrubs_cf_headers_from_body(self):
+        creds = {
+            "OLLAMA_CF_ACCESS_CLIENT_ID": "id-123",
+            "OLLAMA_CF_ACCESS_CLIENT_SECRET": "sec-456",
+        }
+
+        def keychain(service, account):
+            if service in creds:
+                return creds[service]
+            raise ValueError("not found")
+
+        remote_result = f"{_REMOTE_QUEUE}/v1/jobs/{_QID}/result"
+        client = _FakeQueueClient(
+            get_map={
+                f"{_REMOTE_QUEUE}/healthz": _FakeResponse(json_data=_HEALTH_OK),
+                remote_result: _FakeResponse(
+                    status_code=500, text="echo CF-Access-Client-Secret: sec-456"
+                ),
+            }
+        )
+        with (
+            mock.patch.dict(os.environ, {"AI_TOOLS_QUEUE_URLS": _REMOTE_QUEUE}),
+            mock.patch.object(
+                mcp_server, "get_api_key_from_keychain", side_effect=keychain
+            ),
+            self._with(client),
+        ):
+            out = asyncio.run(mcp_server._queue_poll(_QID))
+        self.assertEqual(out["status"], "failed")
+        self.assertNotIn("sec-456", out["error"])
+
+
+class TestLocalDelegateQueue(unittest.TestCase):
+    """Handler-level queue-first submit and q-id result routing."""
+
+    def setUp(self):
+        mcp_server._delegate_jobs.clear()
+        _stub_resolution(self)
+
+    def test_queue_submit_wins_and_envelope_is_durable(self):
+        submit = mock.AsyncMock(return_value=_QID)
+        start = mock.Mock()
+        with (
+            mock.patch.object(mcp_server, "_queue_submit", submit),
+            mock.patch.object(mcp_server, "_start_delegate_job", start),
+        ):
+            out = _call("local_delegate", {"prompt": "p", "background": True})
+        env = json.loads(out[0].text)
+        self.assertEqual(env["job_id"], _QID)
+        self.assertEqual(env["status"], "started")
+        self.assertEqual(env["queue"], "durable")
+        # The model was implicit: the queue executes against ITS upstream,
+        # not the endpoint the model was resolved on, and the envelope
+        # says so.
+        self.assertIn("resolved against", env["warning"])
+        start.assert_not_called()
+        (payload,), _ = submit.call_args
+        self.assertEqual(payload["messages"], [{"role": "user", "content": "p"}])
+
+    def test_queue_submit_explicit_model_has_no_warning(self):
+        submit = mock.AsyncMock(return_value=_QID)
+        with mock.patch.object(mcp_server, "_queue_submit", submit):
+            out = _call(
+                "local_delegate",
+                {
+                    "prompt": "p",
+                    "background": True,
+                    "model": mcp_server.OLLAMA_DELEGATE_DEFAULT_MODEL,
+                },
+            )
+        env = json.loads(out[0].text)
+        self.assertEqual(env["queue"], "durable")
+        self.assertNotIn("warning", env)
+
+    def test_ambiguous_queue_submit_errors_without_memory_fallback(self):
+        # An ambiguous submit outcome (job may already be enqueued) must
+        # surface as an error — starting an in-memory copy could execute
+        # the prompt twice.
+        submit = mock.AsyncMock(
+            side_effect=ValueError("submit outcome is unknown — twice")
+        )
+        start = mock.Mock()
+        with (
+            mock.patch.object(mcp_server, "_queue_submit", submit),
+            mock.patch.object(mcp_server, "_start_delegate_job", start),
+        ):
+            out = _call("local_delegate", {"prompt": "p", "background": True})
+        self.assertTrue(out[0].text.startswith("Error:"))
+        self.assertIn("unknown", out[0].text)
+        start.assert_not_called()
+
+    def test_fallback_to_memory_carries_warning(self):
+        async def scenario():
+            fake = mock.AsyncMock(
+                return_value={"model": "m", "message": {"content": "ok"}}
+            )
+            with (
+                mock.patch.object(
+                    mcp_server, "_queue_submit", mock.AsyncMock(return_value=None)
+                ),
+                mock.patch.object(mcp_server, "_post_ollama_chat", fake),
+            ):
+                out = await mcp_server.call_tool(
+                    "local_delegate", {"prompt": "p", "background": True}
+                )
+                env = json.loads(out[0].text)
+                self.assertNotIn("queue", env)
+                self.assertIn("No durable queue endpoint reachable", env["warning"])
+                self.assertIn(env["job_id"], mcp_server._delegate_jobs)
+                # Drain the in-memory job so no pending task leaks.
+                task = mcp_server._delegate_jobs[env["job_id"]]["task"]
+                await _settle(task.done)
+                mcp_server._collect_delegate_job(env["job_id"])
+
+        asyncio.run(scenario())
+
+    def test_sync_call_never_touches_the_queue(self):
+        submit = mock.AsyncMock()
+        # _post_ollama_chat returns (data, evict_warning) since #69; a bare
+        # dict here unpacks by iterating its keys instead of raising, which
+        # silently turned `data` into the string "model" — caught by running
+        # this test in isolation after a merge, not by the type checker.
+        fake = mock.AsyncMock(
+            return_value=({"model": "m", "message": {"content": "x"}}, "")
+        )
+        with (
+            mock.patch.object(mcp_server, "_queue_submit", submit),
+            mock.patch.object(mcp_server, "_post_ollama_chat", fake),
+        ):
+            _call("local_delegate", {"prompt": "p"})
+        submit.assert_not_awaited()
+
+    def test_result_routes_q_id_to_queue_poll(self):
+        poll = mock.AsyncMock(
+            return_value={"model": "m", "message": {"content": "durable answer"}}
+        )
+        collect = mock.Mock()
+        with (
+            mock.patch.object(mcp_server, "_queue_poll", poll),
+            mock.patch.object(mcp_server, "_collect_delegate_job", collect),
+        ):
+            out = _call("local_delegate_result", {"job_id": _QID})
+        self.assertIn("durable answer", out[0].text)
+        poll.assert_awaited_once_with(_QID)
+        collect.assert_not_called()
+
+    def test_result_routes_legacy_id_to_memory_store(self):
+        poll = mock.AsyncMock()
+        with mock.patch.object(mcp_server, "_queue_poll", poll):
+            out = _call("local_delegate_result", {"job_id": "b" * 32})
+        self.assertIn("Error", out[0].text)  # unknown in-memory id
+        poll.assert_not_awaited()
+
+    def test_result_running_envelope_stays_json(self):
+        poll = mock.AsyncMock(
+            return_value={"status": "running", "elapsed_s": 3, "queue": "durable"}
+        )
+        with mock.patch.object(mcp_server, "_queue_poll", poll):
+            out = _call("local_delegate_result", {"job_id": _QID})
+        env = json.loads(out[0].text)
+        self.assertEqual(env["status"], "running")
+        self.assertEqual(env["queue"], "durable")
+
+    def test_result_queue_unreachable_is_clean_retryable_error(self):
+        poll = mock.AsyncMock(
+            side_effect=ValueError("No queue endpoint reachable — retry later.")
+        )
+        with mock.patch.object(mcp_server, "_queue_poll", poll):
+            out = _call("local_delegate_result", {"job_id": _QID})
+        self.assertTrue(out[0].text.startswith("Error:"))
+        self.assertIn("retry", out[0].text)
+
+    def test_result_failed_envelope_renders_as_error(self):
+        poll = mock.AsyncMock(
+            return_value={"status": "failed", "error": "upstream HTTP 500"}
+        )
+        with mock.patch.object(mcp_server, "_queue_poll", poll):
+            out = _call("local_delegate_result", {"job_id": _QID})
+        self.assertIn("Error", out[0].text)
+        self.assertIn("upstream HTTP 500", out[0].text)
 
 
 if __name__ == "__main__":
