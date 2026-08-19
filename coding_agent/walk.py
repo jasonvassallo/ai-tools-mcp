@@ -701,6 +701,41 @@ _UNREADABLE_MORE = (
 )
 _UNREADABLE_SHOWN = 20
 
+# The suffix marking an unreadable path that the BASE TREE also holds. It is
+# the difference between "the model created something I cannot read" and "a
+# committed file I cannot compare", and the second is the one a reviewer would
+# otherwise mistake for a deletion.
+_IN_BASE = " [tracked in the base tree - NOT deleted]"
+
+# The line standing in for a file section that cannot be rendered, emitted at
+# the path's own sorted position so a reviewer scanning the body for that file
+# finds the reason where the section would have been. It is NOT patch
+# structure: no `diff --git` header, no `--- / +++`, no hunk. `git apply` skips
+# it (verified) and therefore cannot be made to delete the file.
+_NOT_COMPARED = (
+    "coding_agent: NOT COMPARED: {path} ({reason}) - the base tree holds this "
+    "path and\ncoding_agent:   it is NOT deleted; this diff cannot say whether "
+    "it changed.\n"
+)
+
+# The whole-snapshot read budget running out is categorically worse than one
+# oversize file: every path the walk had not reached yet is unread, so the diff
+# is incomplete by an unknown amount rather than by one named file. That earns
+# its own top-line statement instead of being one entry among N in a list — 33
+# instantly-created sparse files were demonstrated to drain it and turn 37 of
+# 40 tracked files into spurious deletions while displacing the model's real
+# edit. Stated FIRST, above even the unreadable block, for the same truncation
+# reason that block is stated early.
+_BUDGET_EXHAUSTED = (
+    "coding_agent: WARNING: the whole-snapshot read budget was EXHAUSTED "
+    "({n} path(s) hit it).\n"
+    "coding_agent: THIS DIFF IS INCOMPLETE FOR THAT REASON ALONE - an unknown "
+    "number of\n"
+    "coding_agent: changes are missing from it. Do not approve this run on the "
+    "strength\n"
+    "coding_agent: of what is shown below.\n\n"
+)
+
 # The footer a TRUNCATED diff carries. Truncation is the sandbox's to trigger
 # — one `dd` of a file that sorts early buys 5000 bytes of `xxxx` ahead of
 # every other section — so a cap that drops the tail also drops the EXISTENCE
@@ -852,18 +887,78 @@ def _changed_block(summary: list[str]) -> str:
     return "".join(out)
 
 
-def _unreadable_block(unreadable: tuple[Unreadable, ...], limit: int | None) -> str:
+def _not_compared(unreadable: tuple[Unreadable, ...], base: BaseTree) -> dict[str, str]:
+    """Base-tree paths the walk refused to read, so the diff cannot compare them.
+
+    THE POINT OF THIS FUNCTION. `unified_diff` compares `base ∪ snapshot`, and
+    a path present in `base` and absent from `snapshot.entries` used to mean
+    exactly one thing — the model deleted it. Since the read caps landed it can
+    also mean the walk REFUSED the file (`OVERSIZE`, `BUDGET`, `EACCES`, ...).
+    Rendering that as `deleted file mode` is a false statement about a file
+    nobody touched, and the resulting patch really does delete it: `git apply
+    --check` accepts a 1.9-million-line removal hunk for an untouched 9 MiB
+    file. Under-showing is the dangerous direction (§6.5), and a diff that
+    displaces the model's real edit with 37 fabricated deletions — demonstrated
+    for the cost of 33 sparse files and zero seconds — is that failure in its
+    purest form.
+
+    A DIRECTORY record covers its whole subtree. `Unreadable.path` carries a
+    trailing slash for a directory precisely so this distinction survives, and
+    an unreadable directory hides every base path beneath it — the same defect
+    one level up, and the reason this is a prefix test and not a set lookup.
+    The root is spelled `.` and blocks everything.
+
+    Returns each blocked base path mapped to the reason to show for it, which
+    for a subtree names the directory that actually failed rather than
+    implying the file itself was tried.
+    """
+    blocked: dict[str, str] = {}
+    for u in unreadable:
+        if u.path == _ROOT:
+            return dict.fromkeys(base.entries, f"{u.reason} on the worktree root")
+        if u.path.endswith("/"):
+            under = f"{u.reason} under {_quote_path(u.path, force=True)}"
+            blocked.update((p, under) for p in base.entries if p.startswith(u.path))
+        elif u.path in base.entries:
+            blocked[u.path] = u.reason
+    return blocked
+
+
+def _budget_block(unreadable: tuple[Unreadable, ...]) -> str:
+    """The distinct, loud signal for "the diff is incomplete because the read
+    budget ran out", as opposed to "these specific files changed".
+
+    Separated from the per-path list because the two say different things: one
+    `OVERSIZE` file means one named file is missing from the comparison, while
+    an exhausted whole-snapshot budget means every path the walk had not
+    reached yet is missing and the reviewer cannot know how many.
+    """
+    n = sum(1 for u in unreadable if u.reason == _BUDGET)
+    return _BUDGET_EXHAUSTED.format(n=n) if n else ""
+
+
+def _unreadable_block(
+    unreadable: tuple[Unreadable, ...],
+    limit: int | None,
+    blocked: frozenset[str] = frozenset(),
+) -> str:
     """The "these paths exist and I could not read them" preamble.
 
     Every line is prefixed, and every path force-quoted, so nothing in this
     block can be mistaken for — or forged into — diff structure.
+
+    `blocked` names the subset that the BASE TREE also holds. Those get an
+    explicit "NOT deleted" marker, because a reviewer who sees a tracked file
+    named as unreadable and then finds no section for it below has to be told
+    which of the two possible readings is the true one.
     """
     if not unreadable:
         return ""  # silence when clean, or the signal becomes noise
     shown = unreadable if limit is None else unreadable[:limit]
     out = [_UNREADABLE_HEAD.format(n=len(unreadable))]
     out.extend(
-        f"coding_agent:   {_quote_path(u.path, force=True)} ({u.reason})\n"
+        f"coding_agent:   {_quote_path(u.path, force=True)} ({u.reason})"
+        f"{_IN_BASE if u.path in blocked else ''}\n"
         for u in shown
     )
     if len(shown) != len(unreadable):
@@ -894,17 +989,35 @@ def unified_diff(
       still names every changed path, so the cap can cost the reviewer the
       DETAIL of a change but never the knowledge that one happened;
     - paths the walk could not read are stated FIRST, so the cap cannot cut
-      the warning off.
+      the warning off;
+    - a base path the walk REFUSED to read is never rendered as a deletion —
+      absent-from-the-snapshot stopped meaning "deleted" when the read caps
+      landed, and the patch that resulted really did delete untouched files
+      (see `_not_compared`). It is named at its own sorted position instead,
+      as prose that `git apply` skips;
+    - an exhausted whole-snapshot read budget is announced above everything
+      else, because it means the diff is incomplete by an unknown amount
+      rather than by one named file.
 
     `max_bytes` bounds the RETURNED text only; `spill_dir` must be a host
     directory the sandbox cannot reach.
     """
+    blocked = _not_compared(snap.unreadable, base)
     paths = sorted(set(base.entries) | set(snap.entries))
     body: list[str] = []
     changed: list[str] = []
     summary: list[str] = []
     for p in paths:
         b, s = base.entries.get(p), snap.entries.get(p)
+        if p in blocked:
+            # NOT `changed`: a path nobody could read did not necessarily
+            # change, and `changed_files` is a positive assertion consumed by
+            # callers that never see this text. Completeness is carried by
+            # `unreadable`, which is non-empty exactly when this fires.
+            body.append(
+                _NOT_COMPARED.format(path=_quote_path(p, force=True), reason=blocked[p])
+            )
+            continue
         # Mode equality implies kind equality (a symlink is 120000 and nothing
         # else is), so these two comparisons are the whole test for "same".
         if b is not None and s is not None and b.mode == s.mode and b.data == s.data:
@@ -930,7 +1043,11 @@ def unified_diff(
             body,
         )
     joined = "".join(body)
-    text = _unreadable_block(snap.unreadable, _UNREADABLE_SHOWN) + joined
+    in_base = frozenset(blocked)
+    preamble = _budget_block(snap.unreadable) + _unreadable_block(
+        snap.unreadable, _UNREADABLE_SHOWN, in_base
+    )
+    text = preamble + joined
     full_path: str | None = None
     truncated = False
     if len(text.encode("utf-8", "surrogateescape")) > max_bytes:
@@ -940,7 +1057,11 @@ def unified_diff(
         with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as fh:
             # The SPILL carries every unreadable path, not the bounded render:
             # nothing is lost, it is only the in-context text that is capped.
-            fh.write(_unreadable_block(snap.unreadable, None) + joined)
+            fh.write(
+                _budget_block(snap.unreadable)
+                + _unreadable_block(snap.unreadable, None, in_base)
+                + joined
+            )
         text = (
             text.encode("utf-8", "surrogateescape")[:max_bytes].decode(
                 "utf-8", "ignore"
