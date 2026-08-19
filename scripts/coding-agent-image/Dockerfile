@@ -55,15 +55,40 @@ RUN pip install --no-cache-dir \
         ruff==0.16.3 \
         mypy==2.3.1
 
+# CPython's __pycache__ .pyc cache is invalidated by (mtime, size), not by
+# content hash. When the sandboxed model fixes a bug with a same-length edit
+# within the same wall-clock second the original file was compiled, that
+# invalidation check can pass on stale bytecode: pytest re-runs against the
+# OLD compiled code and reports the (already-fixed) failure again. The model
+# then "re-fixes" code that was already correct, burning turns against its
+# no-progress budget on this tool's core use case -- fix a failing test,
+# rerun pytest, see it pass. Measured n=4 per cell during Task 11: a
+# same-length edit landed on stale bytecode roughly half the time, and an
+# added delay does NOT help, because the delay elapses AFTER the write, not
+# before the next read. Disabling .pyc writes entirely removes the
+# invalidation check instead of trying to outrun its resolution.
+ENV PYTHONDONTWRITEBYTECODE=1
+
 # git refuses to operate on a repository whose directory owner doesn't match
-# the running uid ("detected dubious ownership") -- exactly the situation
-# here, since /work is bind-mounted from the host and the container is
-# started with an arbitrary --user <uid>:<gid> chosen by the caller at
-# runtime (settled by the §6.7 spike:
-# docs/superpowers/spikes/2026-08-16-docker-desktop-uid.md). This must be a
-# SYSTEM config (/etc/gitconfig via --system), not a per-user ~/.gitconfig:
-# the runtime uid has no /etc/passwd entry and therefore no resolvable home
-# directory for a user-level config to live in.
+# the running uid ("detected dubious ownership"). This does NOT fix git
+# inside this sandbox on Docker Desktop for macOS -- Task 11 measured two
+# separate reasons git is unusable there regardless of this config:
+#   (a) "dubious ownership" is UNREACHABLE at any --user on that platform,
+#       because a bind mount presents files as owned by the container's own
+#       uid, so the ownership check that safe.directory would waive never
+#       fires in the first place; and
+#   (b) even so, every git command still dies `fatal: not a git repository`,
+#       because a linked worktree's .git is a FILE naming
+#       <repo>/.git/worktrees/<name>, and only the worktree itself -- not
+#       that path inside the main repo's .git -- is bind-mounted into
+#       /work. There is nothing for git to find at the location the file
+#       points to.
+# The config is kept anyway because it IS load-bearing on Linux hosts: a
+# real (non-Docker-Desktop-macOS) bind mount passes the host's real uid/gid
+# through, so the ownership mismatch this waives is reachable there. Must be
+# a SYSTEM config (/etc/gitconfig via --system), not a per-user
+# ~/.gitconfig: the runtime uid has no /etc/passwd entry and therefore no
+# resolvable home directory for a user-level config to live in.
 RUN git config --system --add safe.directory /work
 
 # A named, non-root fallback account for anyone running this image directly
