@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 from coding_agent.basetree import make_ignore, read_base_tree
@@ -200,6 +201,84 @@ def _mkrepo(root: Path) -> None:
 
 def _commit(root: Path, message: str) -> None:
     subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", message], check=True)
+
+
+class BaseTreeGitArgvIsAnchoredToTheRealRepo(unittest.TestCase):
+    """The security spine, at `basetree.py`'s door.
+
+    `sandbox.py` has an argv-level pin on every git call it makes. `basetree`
+    is the OTHER module that runs git, and it had none — the shape was
+    verified by hand during the build and nothing held it there. That matters
+    because the failure this prevents is not a crash: pointing git at a
+    directory the model controls is how two adversarial passes reached host
+    RCE, and `git -C <worktree>` differs from `git -C <repo>` by one argument.
+
+    A `cwd=`, an ambient `GIT_DIR`, or an inherited `PATH` would each
+    reintroduce it without touching the argv, so all three are asserted too.
+    """
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        _mkrepo(self.repo)
+        (self.repo / "a.py").write_text("x = 1\n")
+        (self.repo / ".gitignore").write_text("*.log\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "-A"], check=True)
+        _commit(self.repo, "base")
+
+    def _record(self):
+        real = subprocess.run
+        seen: list[tuple[list[str], dict]] = []
+
+        def recorder(argv, **kwargs):
+            seen.append((list(argv), dict(kwargs)))
+            return real(argv, **kwargs)
+
+        with unittest.mock.patch("subprocess.run", side_effect=recorder):
+            base = read_base_tree(str(self.repo), "HEAD")
+        return base, seen
+
+    def test_every_git_call_is_git_dash_C_the_real_repo(self):
+        base, seen = self._record()
+        self.assertIn("a.py", base.entries)  # the read really happened
+        # ls-tree + one cat-file per blob + rev-parse for info/exclude
+        self.assertGreaterEqual(len(seen), 3)
+        for argv, _ in seen:
+            self.assertEqual(argv[:3], ["git", "-C", str(self.repo)], argv)
+
+    def test_no_git_call_carries_a_cwd_or_an_inheritable_environment(self):
+        _, seen = self._record()
+        for argv, kwargs in seen:
+            self.assertIsNone(kwargs.get("cwd"), f"git ran with a cwd: {argv}")
+            env = kwargs.get("env")
+            self.assertIsInstance(env, dict, f"git inherited the environment: {argv}")
+            assert isinstance(env, dict)
+            # An ambient GIT_DIR/GIT_WORK_TREE/GIT_COMMON_DIR would repoint a
+            # `-C`-anchored call at the worktree without changing the argv.
+            for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+                self.assertNotIn(var, env, argv)
+            # No PATH: git resolves through os.defpath, so an ambient PATH
+            # cannot substitute a different binary.
+            self.assertNotIn("PATH", env, argv)
+            # And the read must be deterministic: a user's global config —
+            # core.excludesFile above all — must not change what the human
+            # sees in the review diff.
+            self.assertEqual(env.get("GIT_CONFIG_NOSYSTEM"), "1", argv)
+            self.assertNotIn("HOME", env, argv)
+
+    def test_the_env_REPLACES_rather_than_extends_the_ambient_one(self):
+        """`env={**_GIT_ENV}` and `env={**os.environ, **_GIT_ENV}` look alike
+        and are not: only the first keeps an ambient GIT_DIR out."""
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"GIT_DIR": "/tmp/attacker", "GIT_WORK_TREE": "/tmp/attacker"},
+            clear=False,
+        ):
+            base, seen = self._record()
+        self.assertIn("a.py", base.entries)
+        for argv, kwargs in seen:
+            self.assertNotIn("GIT_DIR", kwargs["env"], argv)
+            self.assertNotIn("GIT_WORK_TREE", kwargs["env"], argv)
 
 
 class BaseTreeRead(unittest.TestCase):
