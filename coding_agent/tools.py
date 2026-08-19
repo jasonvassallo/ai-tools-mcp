@@ -315,9 +315,14 @@ def tool_list_files(
     """Recursive listing of `rel`, as paths relative to the worktree root.
 
     `ignore` is the tracked-aware predicate from `basetree.make_ignore` —
-    directories are queried with a trailing `/`, matching `walk.py`. It is
-    optional only so the guard can be tested on its own; the loop passes it,
-    which is what makes the tool's "respects .gitignore" description true.
+    directories are queried with a trailing `/` and symlinks without one,
+    matching `walk.py`. It is optional only so the guard can be tested on its
+    own; the loop passes it, which is what makes the tool's "respects
+    .gitignore" description true.
+
+    A symlink is LISTED — including one pointing at a directory — and never
+    descended, so the listing names every path that exists without ever
+    reaching through one.
     """
     real_root, parts, _ = _validate(root, rel or os.curdir, for_write=False)
     is_ignored = ignore if ignore is not None else (lambda _p: False)
@@ -332,24 +337,44 @@ def tool_list_files(
         # `follow_symlinks=False` makes fwalk lstat each name and then confirm,
         # via samestat against the fstat of the descriptor it opened, that it
         # descended the same object it classified — the identity check walk.py
-        # spells out by hand. A symlinked directory is therefore listed but
-        # never descended.
-        for dirpath, dirnames, filenames, _dfd in os.fwalk(
+        # spells out by hand.
+        #
+        # It does NOT keep a symlinked directory out of `dirnames`: fwalk
+        # classifies names with `entry.is_dir()`, which FOLLOWS symlinks, so a
+        # symlink-to-directory lands there, is then refused by the samestat
+        # check, and — because it was never in `filenames` either — used to
+        # vanish from the listing entirely while this docstring claimed it was
+        # "listed but never descended". A path that exists and is not shown is
+        # an under-show, so the symlinks are separated out by hand below and
+        # listed as themselves.
+        for dirpath, dirnames, filenames, dfd in os.fwalk(
             dir_fd=base_fd, follow_symlinks=False
         ):
             here = (
                 "" if dirpath == os.curdir else dirpath[len(os.curdir + os.sep) :] + "/"
             )
             depth = here.count("/")
-            keep = []
+            keep: list[str] = []
+            links: list[str] = []
             for d in sorted(dirnames):
-                if d == _GIT_META or is_ignored(prefix + here + d + "/"):
+                if d == _GIT_META:
                     continue
-                if depth >= MAX_DEPTH:
+                try:
+                    linked = stat.S_ISLNK(os.lstat(d, dir_fd=dfd).st_mode)
+                except OSError:
+                    continue  # vanished under the walk; nothing to name
+                if linked:
+                    # Queried WITHOUT a trailing slash, the way `walk.py`
+                    # queries a symlink: it is an entry, not a directory to
+                    # descend, and the two sides must ask the same question.
+                    if not is_ignored(prefix + here + d):
+                        links.append(d)
+                    continue
+                if is_ignored(prefix + here + d + "/") or depth >= MAX_DEPTH:
                     continue
                 keep.append(d)
             dirnames[:] = keep
-            for name in sorted(filenames):
+            for name in sorted(links + filenames):
                 full = prefix + here + name
                 if name == _GIT_META or is_ignored(full):
                     continue

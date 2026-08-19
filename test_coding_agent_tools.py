@@ -532,12 +532,48 @@ class ListFiles(_Tree):
         out = tool_list_files(str(self.root))
         self.assertNotIn(".git", out)
 
-    def test_a_symlinked_directory_is_not_descended(self) -> None:
+    def test_a_symlinked_directory_is_listed_but_not_descended(self) -> None:
+        """Both halves, because the one-sided version could not fail.
+
+        `assertNotIn("loot.txt", out)` passes whether the symlink is listed
+        and not descended — what this module documents — or absent from the
+        listing altogether, which is what it actually did: `os.fwalk`
+        classifies names with `entry.is_dir()`, which FOLLOWS symlinks, so a
+        symlink-to-directory landed in `dirnames`, was refused by the samestat
+        check, and was never in `filenames` to be printed. A path that exists
+        and is not shown is an under-show, and a docstring that says otherwise
+        is the "the tool's own description is a lie" class.
+        """
         (self.outside / "loot.txt").write_text("secret\n")
         os.symlink(str(self.outside), self.root / "peek")
+        os.symlink(str(self.outside / "loot.txt"), self.root / "peekfile")
+        os.symlink("nowhere", self.root / "dangling")
         _assert_is_symlink(self, self.root / "peek")
-        out = tool_list_files(str(self.root))
-        self.assertNotIn("loot.txt", out)
+
+        lines = tool_list_files(str(self.root)).splitlines()
+
+        # LISTED — all three shapes, including the one pointing at a directory.
+        for name in ("peek", "peekfile", "dangling"):
+            self.assertIn(name, lines, f"{name} vanished from the listing")
+        # NOT DESCENDED, and nothing reached through.
+        self.assertNotIn("loot.txt", "\n".join(lines))
+        self.assertNotIn("peek/loot.txt", lines)
+
+    def test_a_symlink_the_ignore_predicate_excludes_is_not_listed(self) -> None:
+        """The symlink is queried WITHOUT a trailing slash, as `walk.py`
+        queries one — the two sides must ask the predicate the same question
+        or the diff and the model's view of the tree disagree."""
+        os.symlink(str(self.outside), self.root / "peek")
+        asked: list[str] = []
+
+        def ign(path: str) -> bool:
+            asked.append(path)
+            return path == "peek"
+
+        lines = tool_list_files(str(self.root), ".", ignore=ign).splitlines()
+        self.assertNotIn("peek", lines)
+        self.assertIn("peek", asked, "the symlink was never offered to `ignore`")
+        self.assertNotIn("peek/", asked, "a symlink was queried as a directory")
 
     def test_a_newline_in_a_filename_cannot_forge_a_listing_line(self) -> None:
         (self.root / "ev\nil.py").write_text("x\n")

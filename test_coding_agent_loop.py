@@ -745,8 +745,31 @@ class StopConditions(_LoopCase):
         self.assertEqual(payload["model"], "m")
 
     def test_elapsed_seconds_measures_the_loop_not_the_teardown(self):
+        """Bounded on BOTH sides, and the lower bound is the point.
+
+        The upper bound alone was decorative: deleting the `elapsed = round(
+        time.monotonic() - started, 2)` assignment outright, so the field kept
+        its `0.0` initialiser, left the whole loop+mcp suite green. A constant
+        zero satisfies "less than the teardown delay" perfectly. The chat
+        callable is therefore made to take a measurable amount of time, so the
+        assertion can tell a measurement from an initialiser.
+        """
+        # The field is rounded to ONE decimal, so the floor asserted below is
+        # deliberately looser than the sleep: 0.15 s cannot round to less than
+        # 0.1, and it cannot round to 0.0 at all.
         ops = _RecordingOps(self.wt, destroy_delay=0.30)
-        result, _ = self.run_loop([_say("done")], ops=ops)
+
+        async def slow_chat(payload, timeout_s):
+            await asyncio.sleep(0.15)
+            return {"message": _say("done")}
+
+        result, _ = self.run_loop([], ops=ops, chat=slow_chat)
+        self.assertGreaterEqual(
+            result.elapsed_seconds,
+            0.1,
+            "elapsed_seconds is not measuring the loop",
+        )
+        # ...and still excludes the 0.30 s teardown that ran after it.
         self.assertLess(result.elapsed_seconds, 0.30)
 
 
