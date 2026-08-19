@@ -1361,6 +1361,118 @@ class DefenceInDepthLayersAreIndividuallyPinned(unittest.TestCase):
         )
         self.assertIn(b"SANDBOX-AUTHORED", got.entry.data)
 
+    # -- §6.5 rule 2: stay on the root's device --
+
+    def test_a_file_on_another_device_is_refused_as_XDEV(self):
+        """`walk._XDEV` had NO test at all — deleting the check in
+        `_read_regular` left the whole suite green, and the token appeared in
+        the suite only as a string inside a `_STABLE_REASONS` list.
+
+        Asserted by handing the guard a `root_dev` that is not this object's
+        device, which is exactly the comparison it makes. A real second
+        filesystem would be a truer fixture but would mean creating and
+        mounting a volume from a unit test; the guard compares two integers,
+        so this varies the one that matters, and the control below holds it
+        equal to prove the refusal comes from THIS check and nothing else.
+        """
+        victim = self.root / "victim"
+        victim.write_bytes(b"content\n")
+        classified = os.lstat("victim", dir_fd=self.fd)
+
+        refused = walkmod._read_regular(
+            self.fd,
+            "victim",
+            "victim",
+            classified,
+            classified.st_dev + 1,  # "the root is on some other device"
+            walkmod._Budget(1 << 20),
+        )
+        self.assertIsInstance(refused, walkmod._Refusal)
+        self.assertEqual(refused.reason, walkmod._XDEV)
+        self.assertTrue(refused.terminal, "a device boundary cannot be retried away")
+
+        # CONTROL: the very same call with the real device READS the file, so
+        # the refusal above is the device check and not an unrelated failure.
+        allowed = walkmod._read_regular(
+            self.fd,
+            "victim",
+            "victim",
+            classified,
+            classified.st_dev,
+            walkmod._Budget(1 << 20),
+        )
+        self.assertIsInstance(allowed, Entry)
+        self.assertEqual(allowed.data, b"content\n")
+
+    def test_a_directory_on_another_device_is_refused_as_XDEV(self):
+        """The descent carries its own copy of the check, and its own
+        mutation: dropping either one alone left the suite green."""
+        sub = self.root / "sub"
+        sub.mkdir()
+        classified = os.lstat("sub", dir_fd=self.fd)
+
+        refused = walkmod._open_child_dir(
+            self.fd, "sub", "sub/", classified, classified.st_dev + 1
+        )
+        self.assertIsInstance(refused, walkmod._Refusal)
+        self.assertEqual(refused.reason, walkmod._XDEV)
+
+        allowed = walkmod._open_child_dir(
+            self.fd, "sub", "sub/", classified, classified.st_dev
+        )
+        self.assertIsInstance(allowed, walkmod._Frame)
+        assert isinstance(allowed, walkmod._Frame)
+        os.close(allowed.fd)
+
+    def test_reclassification_is_bounded_and_the_path_is_then_recorded(self):
+        """SF-8. `_RECLASSIFY_ATTEMPTS` was unpinned — mutation `W20`
+        survived. The bound is what stops a writer that keeps losing the race
+        for the walk from spinning it forever, and it is only half the
+        property: giving up must RECORD the path, because "indistinguishable
+        from never existed" is the under-show §6.5 calls dangerous.
+
+        The recorded reason is the LAST refusal seen (`ENOENT` here), not the
+        generic `_RACED` — `_RACED` is the initialiser and survives only when
+        no attempt produced a reason of its own. That is the more informative
+        of the two and is asserted as such rather than papered over.
+        """
+        (self.root / "flaky").write_bytes(b"x\n")
+        real_lstat = os.lstat
+        attempts = {"n": 0}
+
+        def racing_lstat(path, *args, **kwargs):
+            # ENOENT is deliberately retryable — a racing writer produces it
+            # and a later attempt can still win — so this models a writer
+            # that never settles rather than a permanent failure.
+            if path == "flaky" and kwargs.get("dir_fd") is not None:
+                attempts["n"] += 1
+                raise OSError(errno.ENOENT, "vanished")
+            return real_lstat(path, *args, **kwargs)
+
+        with unittest.mock.patch.object(walkmod.os, "lstat", racing_lstat):
+            snap = snapshot_tree(str(self.root), lambda p: False)
+
+        self.assertEqual(
+            attempts["n"],
+            walkmod._RECLASSIFY_ATTEMPTS,
+            "the walk did not stop at its own retry bound",
+        )
+        self.assertEqual(
+            [(u.path, u.reason) for u in snap.unreadable],
+            [("flaky", "ENOENT")],
+            "the walk gave up on a path and said nothing",
+        )
+        self.assertNotIn("flaky", snap.entries)
+
+    def test_XDEV_is_a_stable_reason_so_it_moves_the_hash(self):
+        """A device boundary is a property of the tree, not a moment inside
+        somebody else's race, so it must be one of the reasons `tree_hash`
+        keeps — otherwise a subtree that disappears across a mount point is
+        invisible to the no-progress detector as well as to the diff."""
+        self.assertIn(walkmod._XDEV, walkmod._STABLE_REASONS)
+        moved = tree_hash(TreeSnapshot({}, (Unreadable("mnt/", walkmod._XDEV),)))
+        self.assertNotEqual(moved, tree_hash(TreeSnapshot({})))
+
     def test_the_outer_prefix_skip_keeps_git_opaque_when_identity_no_longer_matches(
         self,
     ):

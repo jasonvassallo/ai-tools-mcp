@@ -724,6 +724,78 @@ class BackgroundJobs(_McpCase):
         self.assertIn("single-collect", second)
         self.assertEqual(mcp_server._coding_jobs, {})
 
+    def test_a_result_that_cannot_be_rendered_is_not_thrown_away(self):
+        """SF-9 / NF-9. The entry used to be deleted and THEN the payload
+        returned, so anything failing in between lost the result for good —
+        and the worktree it describes is already torn down, so nothing can
+        re-derive it. NF-5 was one live route to exactly that.
+
+        Retiring the job now happens AFTER the payload is rendered, so a
+        failed render leaves the job collectable and a retry can succeed.
+        """
+        boom = {"n": 0}
+        real_dumps = json.dumps
+
+        def failing_once(obj, **kw):
+            # Only the coding_agent_result payload is targeted; the
+            # `job_id`/`status` envelope from the start call must still work.
+            if isinstance(obj, dict) and obj.get("turns") == 7 and boom["n"] == 0:
+                boom["n"] += 1
+                raise ValueError("transport rejected the payload")
+            return real_dumps(obj, **kw)
+
+        async def scenario():
+            with _returns(_result(turns=7)):
+                out = await mcp_server.call_tool(
+                    "coding_agent", self.args(background=True)
+                )
+                job_id = json.loads(out[0].text)["job_id"]
+                await mcp_server._coding_jobs[job_id]["task"]
+                with mock.patch.object(mcp_server.json, "dumps", failing_once):
+                    with self.assertRaises(ValueError):
+                        await mcp_server.call_tool(
+                            "coding_agent_result", {"job_id": job_id}
+                        )
+                    # MECHANISM: the render really did fail once.
+                    self.assertEqual(boom["n"], 1)
+                    # ...and the job survived it.
+                    self.assertIn(job_id, mcp_server._coding_jobs)
+                retry = await mcp_server.call_tool(
+                    "coding_agent_result", {"job_id": job_id}
+                )
+            return job_id, retry[0].text
+
+        job_id, retry = asyncio.run(scenario())
+        self.assertEqual(json.loads(retry)["turns"], 7, "the result was unrecoverable")
+        # Single-collect still holds once delivery actually happened.
+        self.assertNotIn(job_id, mcp_server._coding_jobs)
+
+    def test_a_still_running_job_is_never_retired_by_a_poll(self):
+        """The commit callback must be a no-op while the run is in flight, or
+        polling for progress would delete the job it is polling."""
+
+        async def scenario():
+            with _never_returns():
+                out = await mcp_server.call_tool(
+                    "coding_agent", self.args(background=True)
+                )
+                job_id = json.loads(out[0].text)["job_id"]
+                for _ in range(3):
+                    body = json.loads(
+                        (
+                            await mcp_server.call_tool(
+                                "coding_agent_result", {"job_id": job_id}
+                            )
+                        )[0].text
+                    )
+                    self.assertEqual(body["status"], "running")
+                    self.assertIn(job_id, mcp_server._coding_jobs)
+                mcp_server._coding_jobs[job_id]["task"].cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await mcp_server._coding_jobs[job_id]["task"]
+
+        asyncio.run(scenario())
+
     def test_a_malformed_job_id_is_rejected_by_the_VALIDATOR_not_the_lookup(self):
         """Asserting "Error:" appeared was decorative: replacing
         `_CODING_JOB_ID_RE` with `^.*$` left the whole suite green, because a
@@ -885,6 +957,51 @@ class CancellationAndFailure(_McpCase):
             body = self.payload("coding_agent", self.args())
         self.assertEqual(body["status"], "failed")
         self.assertIn("already in progress", body["error"])
+
+    def test_a_secret_in_a_failure_message_is_redacted_on_BOTH_failure_paths(self):
+        """SF-8. `redact_secrets` on the coding_agent failure paths was
+        unpinned — mutation `M12` (drop the call) survived the whole suite.
+
+        The message an exception carries is not under this code's control:
+        it can hold a path, a command line, or whatever the underlying tool
+        put in it, and an exception raised while reading a repository is a
+        plausible place for a key to appear. The sync path and the background
+        collect path have SEPARATE call sites, so both are exercised — the
+        real defect here would be fixing one and not the other.
+        """
+        leak = (
+            "failed near -----BEGIN OPENSSH PRIVATE KEY-----\n"
+            "b3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY----- while reading"
+        )
+
+        # MECHANISM: this string really is a shape `redact_secrets` masks —
+        # otherwise both assertions below would pass for free.
+        self.assertNotIn("BEGIN OPENSSH PRIVATE KEY", mcp_server.redact_secrets(leak))
+
+        with _raises(RuntimeError(leak)):
+            sync = self.payload("coding_agent", self.args())
+        self.assertEqual(sync["status"], "failed")
+        self.assertNotIn("BEGIN OPENSSH PRIVATE KEY", sync["error"])
+        self.assertIn("REDACTED", sync["error"])
+        self.assertIn("RuntimeError", sync["error"])  # still diagnosable
+
+        async def scenario():
+            with _raises(RuntimeError(leak)):
+                out = await mcp_server.call_tool(
+                    "coding_agent", self.args(background=True)
+                )
+                job_id = json.loads(out[0].text)["job_id"]
+                with contextlib.suppress(Exception):
+                    await mcp_server._coding_jobs[job_id]["task"]
+                out = await mcp_server.call_tool(
+                    "coding_agent_result", {"job_id": job_id}
+                )
+            return json.loads(out[0].text)
+
+        polled = asyncio.run(scenario())
+        self.assertEqual(polled["status"], "failed")
+        self.assertNotIn("BEGIN OPENSSH PRIVATE KEY", polled["error"])
+        self.assertIn("REDACTED", polled["error"])
 
     def test_sync_cancellation_propagates_rather_than_becoming_a_status(self):
         """Our own request being cancelled must stay a cancellation: turning

@@ -1084,6 +1084,68 @@ class TranscriptIsBounded(_LoopCase):
         self.assertEqual(len(executed), L._MAX_TOOL_CALLS_PER_TURN)
         self.assertIn("were dropped", result.transcript[-1]["result_head"])
 
+    def test_the_loop_ships_its_own_diff_cap_and_spills_outside_the_worktree(self):
+        """SF-8. The size-cap MECHANISM is tested in `walk` with an explicit
+        `max_bytes`; the VALUES the loop actually passes were unpinned —
+        `_DIFF_MAX_BYTES` could be deleted and nothing went red.
+
+        `spill_dir` is the more serious half. `unified_diff`'s docstring says
+        it "must be a host directory the sandbox cannot reach", and repointing
+        it at the WORKTREE left the suite green — after which teardown
+        `rm -rf`s the spill and `diff_full_path` names a file that no longer
+        exists, so the human is handed a path to nothing precisely when the
+        diff was too big to read inline.
+        """
+        # Comfortably over the cap, and text so it is not binary-annotated.
+        self.write("huge.txt", "line of source\n" * 60_000)
+
+        result, _ = self.run_loop([_say("done")])
+
+        self.assertTrue(result.diff_truncated)
+        self.assertLessEqual(
+            len(result.diff.encode("utf-8", "surrogateescape")),
+            L._DIFF_MAX_BYTES + 4096,  # slack for the marker + changed block
+        )
+        self.assertIsNotNone(result.diff_full_path)
+        spill = result.diff_full_path or ""
+        # The spill survives teardown, which is the whole point of it being
+        # outside the worktree.
+        self.assertTrue(os.path.exists(spill), "the spill file was torn down with it")
+        self.addCleanup(lambda: os.path.exists(spill) and os.unlink(spill))
+        self.assertFalse(
+            os.path.realpath(spill).startswith(os.path.realpath(self.wt) + os.sep),
+            f"the full diff was spilled INSIDE the sandbox's worktree: {spill}",
+        )
+        self.assertTrue(
+            os.path.realpath(spill).startswith(
+                os.path.realpath(tempfile.gettempdir()) + os.sep
+            ),
+            spill,
+        )
+
+    def test_the_loop_ships_its_own_transcript_and_output_caps(self):
+        """`_RESULT_HEAD` and `_OUTPUT_TAIL` had the same gap as
+        `_DIFF_MAX_BYTES`: the mechanism was tested, the shipped value was
+        not."""
+        long_output = "y" * 50_000
+
+        async def fake_exec(container, cmd, *, timeout_s):
+            return 0, long_output, False
+
+        with mock.patch("coding_agent.tools.exec_in_container", fake_exec):
+            result, _ = self.run_loop(
+                [_call("run_command", {"cmd": "yes"}), _say("done")]
+            )
+
+        entry = next(e for e in result.transcript if e.get("tool") == "run_command")
+        self.assertLessEqual(len(entry["result_head"]), L._RESULT_HEAD)
+        self.assertIsNotNone(result.last_command)
+        assert result.last_command is not None
+        self.assertEqual(len(result.last_command["output_tail"]), L._OUTPUT_TAIL)
+        # The TAIL, not the head — the exit status and the last error a
+        # command printed are what a reviewer needs.
+        self.assertTrue(long_output.endswith(result.last_command["output_tail"]))
+
     def test_the_in_flight_conversation_is_bounded_across_turns(self):
         """SF-4 / NF-8. The RETURNED transcript was bounded; the conversation
         SENT to the model was not. Every tool result was appended in full and

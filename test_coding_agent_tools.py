@@ -31,6 +31,7 @@ from pathlib import Path
 from unittest import mock
 
 from coding_agent.tools import (
+    MAX_DEPTH,
     MAX_LIST,
     MAX_READ,
     TOOL_SCHEMAS,
@@ -599,6 +600,30 @@ class ListFiles(_Tree):
         out = tool_list_files(str(self.root))
         self.assertIn("capped", out)
         self.assertLessEqual(len(out.splitlines()), MAX_LIST + 1)
+
+    def test_the_listing_stops_descending_at_MAX_DEPTH(self) -> None:
+        """SF-8. `MAX_DEPTH` was unpinned — mutation `T12` survived. It is the
+        companion to `MAX_LIST`: one bounds a wide tree, this bounds a deep
+        one, and the sandbox chooses both. `mkdir -p a/a/a/...` is cheap.
+        """
+        deep = self.root
+        for _ in range(MAX_DEPTH + 6):
+            deep = deep / "d"
+            deep.mkdir()
+        (deep / "bottom.txt").write_text("x\n")
+        shallow = self.root
+        for _ in range(MAX_DEPTH - 1):
+            shallow = shallow / "d"
+        (shallow / "reachable.txt").write_text("x\n")
+
+        lines = tool_list_files(str(self.root)).splitlines()
+
+        # MECHANISM: the walk really does get deep, so the absence below is
+        # the cap and not a listing that stopped for some other reason.
+        self.assertIn(str(shallow.relative_to(self.root) / "reachable.txt"), lines)
+        self.assertNotIn(str(deep.relative_to(self.root) / "bottom.txt"), lines)
+        self.assertTrue(lines)
+        self.assertLessEqual(max(ln.count("/") for ln in lines), MAX_DEPTH)
 
 
 # --------------------------------------------------------------------------

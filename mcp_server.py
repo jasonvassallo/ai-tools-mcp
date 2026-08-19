@@ -92,6 +92,7 @@ import tempfile
 import time
 import urllib.parse
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from logging.handlers import QueueHandler, QueueListener
@@ -3049,10 +3050,29 @@ def _start_coding_job(coro: Any) -> str:
     return job_id
 
 
-def _collect_coding_job(job_id: str | None) -> dict[str, Any]:
-    """Poll/collect a background coding_agent run. Single-collect: the entry
-    is deleted on retrieval. Returns a status envelope while running (or on
-    failure), else the AgentResult's fields, surrogate-scrubbed."""
+def _collect_coding_job(
+    job_id: str | None,
+) -> tuple[dict[str, Any], Callable[[], None]]:
+    """Poll/collect a background coding_agent run.
+
+    Returns `(payload, commit)`. Single-collect still holds — but the entry is
+    dropped by CALLING `commit`, not by returning, so the caller drops it only
+    once the payload has actually been rendered. `commit` is idempotent and is
+    a no-op for a still-running job.
+
+    Why the split (NF-9). The old shape deleted the entry and then returned
+    the payload, so anything that went wrong between those two points lost the
+    result permanently — and the worktree is already gone, so there is nothing
+    to re-derive it from. NF-5 was one live way to make that happen: a
+    `NaN` in the payload made `json.dumps` emit a token a strict parser
+    rejects, taking the whole diff with it. That specific trigger is closed in
+    `_json_safe` now; this closes the shape rather than the instance.
+
+    HONEST LIMIT: this covers failures up to and including serialisation. A
+    failure further out — the transport dropping a rendered payload — still
+    loses the result, because nothing here can observe that. Closing THAT
+    needs an acknowledged-delivery protocol the MCP surface does not offer.
+    """
     if not isinstance(job_id, str) or not _CODING_JOB_ID_RE.fullmatch(job_id):
         raise ValueError("job_id must be the 32-hex id returned by coding_agent.")
     job = _coding_jobs.get(job_id)
@@ -3063,11 +3083,17 @@ def _collect_coding_job(job_id: str | None) -> dict[str, Any]:
         )
     task = job["task"]
     if not task.done():
-        return {
-            "status": "running",
-            "elapsed_s": int(time.monotonic() - job["started"]),
-        }
-    del _coding_jobs[job_id]
+        return (
+            {
+                "status": "running",
+                "elapsed_s": int(time.monotonic() - job["started"]),
+            },
+            lambda: None,  # nothing to retire: the run is still going
+        )
+
+    def commit() -> None:
+        _coding_jobs.pop(job_id, None)
+
     try:
         result = task.result()
     except asyncio.CancelledError:
@@ -3076,19 +3102,25 @@ def _collect_coding_job(job_id: str | None) -> dict[str, Any]:
         # a container is still up. CancelledError is a BaseException, so an
         # `except Exception` here would not catch it: it would escape this
         # handler and asyncio would mark the MCP request's task cancelled.
-        return {
-            "status": "cancelled",
-            "error": (
-                "the run was cancelled; coding_agent tore the sandbox down "
-                "before propagating"
-            ),
-        }
+        return (
+            {
+                "status": "cancelled",
+                "error": (
+                    "the run was cancelled; coding_agent tore the sandbox down "
+                    "before propagating"
+                ),
+            },
+            commit,
+        )
     except Exception as exc:  # noqa: BLE001 - any run failure is reportable
-        return {
-            "status": "failed",
-            "error": f"{type(exc).__name__}: {redact_secrets(str(exc))}",
-        }
-    return _json_safe(dict(result.__dict__))
+        return (
+            {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {redact_secrets(str(exc))}",
+            },
+            commit,
+        )
+    return _json_safe(dict(result.__dict__)), commit
 
 
 # Create MCP server
@@ -4398,10 +4430,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
     if name == "coding_agent_result":
         try:
-            outcome = _collect_coding_job(arguments.get("job_id"))
+            outcome, commit = _collect_coding_job(arguments.get("job_id"))
         except ValueError as exc:
             return [TextContent(type="text", text=f"Error: {exc}")]
-        return [TextContent(type="text", text=json.dumps(outcome, default=str))]
+        # Render FIRST, retire the job SECOND. The old order deleted the entry
+        # and then built the payload, so anything that failed in between lost
+        # the result for good — and the worktree it describes is already gone.
+        text = json.dumps(outcome, default=str)
+        commit()
+        return [TextContent(type="text", text=text)]
 
     if name == "list_sessions":
         sessions = list_sessions()
