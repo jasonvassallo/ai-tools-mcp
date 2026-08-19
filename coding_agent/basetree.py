@@ -37,6 +37,14 @@ _GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C
 # any repo with a submodule aborts outright.
 _BLOB_MODES = {"100644": "file", "100755": "file", "120000": "symlink"}
 
+# The mode column is also where the executable bit lives, and reading it here
+# is half of a fix that is only correct as a whole: `walk.py` reports the bit
+# from the worktree, and if this side did not, every file committed 100755
+# would look like a fresh `chmod +x` in the very first diff. The two halves
+# landed together, and `test_coding_agent_walk.py` pins them against a real
+# checkout of a real repository rather than against each other.
+_EXEC_MODE = "100755"
+
 _GITIGNORE = ".gitignore"
 
 
@@ -116,7 +124,7 @@ def read_base_tree(repo: str, ref: str) -> BaseTree:
             continue  # 160000 gitlink (and 040000 tree): not a file, not a blob
         path = path_b.decode("utf-8", "surrogateescape")
         data = _git(repo, "cat-file", "blob", sha)
-        entries[path] = Entry(path, kind, data)
+        entries[path] = Entry(path, kind, data, mode == _EXEC_MODE)
         # git does not honour a SYMLINKED .gitignore, so neither does this.
         if kind == "file" and (path == _GITIGNORE or path.endswith("/" + _GITIGNORE)):
             prefix = path[: -len(_GITIGNORE)]

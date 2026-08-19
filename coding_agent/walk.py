@@ -73,12 +73,18 @@ which is a redesign of the enumeration path rather than a local fix.
 
 from __future__ import annotations
 
+import difflib
 import errno
 import hashlib
 import os
 import stat
-from collections.abc import Callable
+import tempfile
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # import-time cycle otherwise: basetree imports this module
+    from .basetree import BaseTree
 
 # O_NOFOLLOW is the whole fix: it makes the open FAIL (ELOOP) when the final
 # component has been swapped for a symlink since it was classified, instead of
@@ -131,6 +137,14 @@ _STABLE_REASONS = frozenset(
     {errno.errorcode[code] for code in _PERMANENT_ERRNOS} | {_OVERSIZE, _BUDGET, _XDEV}
 )
 
+# The three modes a git tree can hold for something this walk records. git
+# keeps exactly ONE permission bit — the owner execute bit — and normalises
+# everything else away (`ce_mode_from_stat`: `mode & 0100 ? 100755 : 100644`),
+# so these are the only values either side of the diff can produce.
+_MODE_FILE = "100644"
+_MODE_EXEC = "100755"
+_MODE_SYMLINK = "120000"
+
 # The repo-metadata entry at the top of the worktree, opaque by §6.5.
 _META = ".git"
 # How the root itself is named when the root is what could not be read.
@@ -142,6 +156,27 @@ class Entry:
     path: str
     kind: str  # "file" | "symlink"
     data: bytes  # file bytes, or the symlink TARGET string as utf-8
+    # The owner execute bit, and NOTHING else about st_mode — the one
+    # permission bit git tracks. Carried because `chmod +x` changes no bytes:
+    # a diff keyed on content alone shows nothing at all while code the human
+    # already approved silently becomes something the shell will run. Recorded
+    # on BOTH sides in the same change (here from the walk's existing `fstat`,
+    # in basetree.py from `ls-tree`'s mode column) — a one-sided version would
+    # report every committed 100755 file as a mode change on turn one, and a
+    # diff that cries wolf on every entry is one a reviewer stops reading.
+    # Defaulted so the three-field constructions written before this build.
+    executable: bool = False
+
+    @property
+    def mode(self) -> str:
+        """The git tree mode for this entry: 100644, 100755 or 120000.
+
+        Derived rather than stored, so `Entry(p, "symlink", target)` cannot be
+        built claiming a regular file's mode.
+        """
+        if self.kind == "symlink":
+            return _MODE_SYMLINK
+        return _MODE_EXEC if self.executable else _MODE_FILE
 
 
 @dataclass(frozen=True, order=True)
@@ -333,7 +368,10 @@ def _read_regular(
         if data is None:
             return _Refusal(_OVERSIZE if limit == _MAX_FILE_BYTES else _BUDGET, True)
         budget.spend(len(data))
-        return Entry(rel, "file", data)
+        # The mode comes from the fstat that already verified the identity of
+        # this descriptor — no extra syscall, and no second path resolution a
+        # racing writer could answer differently.
+        return Entry(rel, "file", data, bool(opened.st_mode & stat.S_IXUSR))
     except OSError as exc:
         return _refuse(exc)
     finally:
@@ -603,6 +641,14 @@ def tree_hash(snap: TreeSnapshot) -> str:
         e = snap.entries[path]
         h.update(e.kind.encode())
         h.update(b"\0")
+        # The mode joins the hash for the same reason it joins the diff: a
+        # turn whose only change is `chmod +x` would otherwise read as no
+        # progress. It cannot add flap — a mode bit is a stable property of
+        # the tree, not a moment inside somebody else's race, and an entry
+        # that appears or vanishes under a racing writer already moves the
+        # hash through `entries`. Measured: see the report for this task.
+        h.update(e.mode.encode())
+        h.update(b"\0")
         h.update(path.encode("utf-8", "surrogateescape"))
         h.update(b"\0")
         h.update(hashlib.sha256(e.data).digest())
@@ -615,3 +661,298 @@ def tree_hash(snap: TreeSnapshot) -> str:
         h.update(b"\0")
         h.update(hashlib.sha256(u.reason.encode()).digest())
     return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# THE REVIEW DIFF (spec §5.1)
+#
+# Nothing the sandboxed model produces is ever applied automatically, so the
+# text rendered below is the ONLY artifact a human sees before deciding. That
+# makes it a security control rather than a convenience: a real change that
+# does not appear here defeats the entire design. Over-showing is noise;
+# UNDER-showing is the dangerous direction (§6.5), and every rule in this
+# section exists because some way of hiding a change was demonstrated.
+#
+# The comparison is TWO-SIDED over `base-tree ∪ worktree-walk`, so a tracked
+# file the model deletes — or replaces with a special file the walk skips —
+# still surfaces, as a deletion rather than as silence.
+# ---------------------------------------------------------------------------
+
+_TRUNC = "\n[... diff truncated by coding_agent size cap; full diff at {path} ...]\n"
+
+# The marker for a final line with no newline, spelled as git spells it.
+# Without it that line runs straight into the NEXT file's header, taking the
+# header out of column 0 and hiding a whole file section from anyone scanning
+# for one.
+_NO_NEWLINE = "\\ No newline at end of file\n"
+
+# The `unreadable` block. Rendered FIRST, and bounded, both deliberately:
+# truncation removes the TAIL, so a warning printed after the file sections is
+# exactly what an oversized diff drops — and the sandbox chooses the diff's
+# size. Bounded because an unlimited list of sandbox-chosen names would push
+# the real change out of the visible window instead (under-showing by
+# displacement). The COUNT is always exact and `DiffResult.unreadable` always
+# carries the complete list, so bounding the render costs nothing.
+_UNREADABLE_HEAD = (
+    "coding_agent: WARNING: {n} path(s) could not be read and are NOT in this diff:\n"
+)
+_UNREADABLE_MORE = (
+    "coding_agent:   ... and {n} more (complete list on DiffResult.unreadable)\n"
+)
+_UNREADABLE_SHOWN = 20
+
+# The footer a TRUNCATED diff carries. Truncation is the sandbox's to trigger
+# — one `dd` of a file that sorts early buys 5000 bytes of `xxxx` ahead of
+# every other section — so a cap that drops the tail also drops the EXISTENCE
+# of every change after it. (Found by the brief's own size-cap test: `big.txt`
+# sorts before `blob.bin`, and a 1000-byte cap removed the binary annotation
+# entirely.) The cap therefore truncates DETAIL only: every changed path is
+# named after the marker, with its mode transition, whatever the cap did to
+# the hunks. Bounded for the same reason the unreadable block is, and appended
+# AFTER the slice so the cap cannot eat it either.
+_CHANGED_HEAD = (
+    "coding_agent: {n} file(s) changed in total; the list below is complete "
+    "to {shown},\ncoding_agent: so a truncated diff cannot hide THAT a path "
+    "changed:\n"
+)
+_CHANGED_MORE = (
+    "coding_agent:   ... and {n} more (complete list on DiffResult.changed_files)\n"
+)
+_CHANGED_SHOWN = 100
+
+# C-style escapes for a quoted path, the same set a quoted path uses upstream.
+_ESCAPES = {
+    ord("\\"): "\\\\",
+    ord('"'): '\\"',
+    0x07: "\\a",
+    0x08: "\\b",
+    0x09: "\\t",
+    0x0A: "\\n",
+    0x0B: "\\v",
+    0x0C: "\\f",
+    0x0D: "\\r",
+}
+
+
+@dataclass(frozen=True)
+class DiffResult:
+    text: str  # unified diff, possibly truncated
+    truncated: bool
+    changed_files: list[str]  # sorted; RAW paths, never quoted
+    full_path: str | None  # where the untruncated diff was written
+    # The snapshot's unreadable records, verbatim. `text` states them too, but
+    # a gate that must fail closed should not have to parse prose to do it.
+    unreadable: tuple[Unreadable, ...] = ()
+
+
+def _quote_path(path: str, *, force: bool = False) -> str:
+    """C-quote a path when it holds anything that could break a line.
+
+    A path is as attacker-controlled as a symlink target — `os.listdir`
+    returns whatever bytes are on disk and `ls-tree -z` carries them through —
+    so a filename containing a newline drops the rest of itself into column 0
+    of the diff, where a forged `--- a/… / +++ / @@` block reads as an entire
+    extra file. That is the same structure injection §6.5 pins for symlink
+    targets, arriving through the other string. Quoting collapses any such
+    path onto ONE line.
+
+    Non-ASCII is left as itself (upstream would octal-escape it): unreadable
+    mojibake in a path a human must recognise is its own kind of hiding place,
+    and only control characters can break the line structure.
+    """
+    if not force and not any(ch in '"\\' or ch < " " or ch == "\x7f" for ch in path):
+        return path
+    out = ['"']
+    for ch in path:
+        esc = _ESCAPES.get(ord(ch))
+        if esc is not None:
+            out.append(esc)
+        elif ch < " " or ch == "\x7f":
+            out.append(f"\\{ord(ch):03o}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def _is_binary(data: bytes) -> bool:
+    return b"\0" in data[:8192]
+
+
+def _lines(data: bytes) -> list[str]:
+    return data.decode("utf-8", "surrogateescape").splitlines(keepends=True)
+
+
+def _render_symlink(data: bytes) -> list[str]:
+    """The 120000 rendering: the target text as CONTENT lines, so a forged
+    '--- a/' inside the target becomes '+--- a/' — never column 0."""
+    lines = _lines(data)
+    return lines if lines else [""]
+
+
+def _entry_lines(e: Entry | None) -> list[str]:
+    if e is None:
+        return []
+    if e.kind == "symlink":
+        return _render_symlink(e.data)
+    return _lines(e.data)
+
+
+def _emit(diff_lines: Iterable[str], out: list[str]) -> None:
+    """Append difflib's output, marking any line that carries no newline.
+
+    difflib prefixes every content line and computes its own `@@` counts, so
+    the structure it emits is trustworthy — except that it reproduces a final
+    line without a newline verbatim, which would splice the next header onto
+    the end of it.
+    """
+    for line in diff_lines:
+        out.append(line if line.endswith("\n") else line + "\n" + _NO_NEWLINE)
+
+
+def _mode_lines(b: Entry | None, s: Entry | None) -> list[str]:
+    """The mode header for one path. Also the ONLY output for a file whose
+    content is unchanged and whose mode is not."""
+    if b is None:
+        return [] if s is None else [f"new file mode {s.mode}\n"]
+    if s is None:
+        return [f"deleted file mode {b.mode}\n"]
+    if b.mode != s.mode:
+        return [f"old mode {b.mode}\n", f"new mode {s.mode}\n"]
+    return []
+
+
+def _binary_side(e: Entry | None) -> bool:
+    # A symlink is never binary: its data is the target TEXT, and rendering it
+    # as "Binary files differ" would hide where it points.
+    return e is not None and e.kind == "file" and _is_binary(e.data)
+
+
+def _sizes(b: Entry | None, s: Entry | None) -> str:
+    was = len(b.data) if b is not None else 0
+    now = len(s.data) if s is not None else 0
+    return f"{was} -> {now} bytes"
+
+
+def _transition(b: Entry | None, s: Entry | None) -> str:
+    """`100644 -> 100755`, with `-` for a side where the path is absent."""
+    was = b.mode if b is not None else "-"
+    now = s.mode if s is not None else "-"
+    return f"{was} -> {now}"
+
+
+def _changed_block(summary: list[str]) -> str:
+    if not summary:
+        return ""
+    shown = summary[:_CHANGED_SHOWN]
+    out = [_CHANGED_HEAD.format(n=len(summary), shown=len(shown))]
+    out.extend(shown)
+    if len(shown) != len(summary):
+        out.append(_CHANGED_MORE.format(n=len(summary) - len(shown)))
+    return "".join(out)
+
+
+def _unreadable_block(unreadable: tuple[Unreadable, ...], limit: int | None) -> str:
+    """The "these paths exist and I could not read them" preamble.
+
+    Every line is prefixed, and every path force-quoted, so nothing in this
+    block can be mistaken for — or forged into — diff structure.
+    """
+    if not unreadable:
+        return ""  # silence when clean, or the signal becomes noise
+    shown = unreadable if limit is None else unreadable[:limit]
+    out = [_UNREADABLE_HEAD.format(n=len(unreadable))]
+    out.extend(
+        f"coding_agent:   {_quote_path(u.path, force=True)} ({u.reason})\n"
+        for u in shown
+    )
+    if len(shown) != len(unreadable):
+        out.append(_UNREADABLE_MORE.format(n=len(unreadable) - len(shown)))
+    out.append("\n")
+    return "".join(out)
+
+
+def unified_diff(
+    base: BaseTree, snap: TreeSnapshot, *, max_bytes: int, spill_dir: str
+) -> DiffResult:
+    """Render `base` vs `snap` as a unified diff a human can act on.
+
+    What each rule is defending against:
+
+    - a path is compared on MODE and BYTES, never bytes alone, so `chmod +x`
+      on untouched content is a change (and so is a file <-> symlink
+      typechange whose two sides happen to hold identical bytes);
+    - a symlink is rendered as a 120000 blob — its target as content lines,
+      every one `+`-prefixed with an accurate `@@` count — because the target
+      string is sandbox-controlled and round-trips forged headers;
+    - a path that needs it is C-quoted, closing the same injection through the
+      filename;
+    - binary content is ANNOTATED with its sizes, never embedded, so one
+      `dd`-written blob cannot flood the reviewer's context;
+    - the text is capped, with the untruncated diff spilled to a file, because
+      the length of the diff is the sandbox's to choose — and a truncated diff
+      still names every changed path, so the cap can cost the reviewer the
+      DETAIL of a change but never the knowledge that one happened;
+    - paths the walk could not read are stated FIRST, so the cap cannot cut
+      the warning off.
+
+    `max_bytes` bounds the RETURNED text only; `spill_dir` must be a host
+    directory the sandbox cannot reach.
+    """
+    paths = sorted(set(base.entries) | set(snap.entries))
+    body: list[str] = []
+    changed: list[str] = []
+    summary: list[str] = []
+    for p in paths:
+        b, s = base.entries.get(p), snap.entries.get(p)
+        # Mode equality implies kind equality (a symlink is 120000 and nothing
+        # else is), so these two comparisons are the whole test for "same".
+        if b is not None and s is not None and b.mode == s.mode and b.data == s.data:
+            continue
+        changed.append(p)
+        summary.append(
+            f"coding_agent:   {_quote_path(p, force=True)} ({_transition(b, s)})\n"
+        )
+        left, right = _quote_path("a/" + p), _quote_path("b/" + p)
+        body.append(f"diff --git {left} {right}\n")
+        body.extend(_mode_lines(b, s))
+        if _binary_side(b) or _binary_side(s):
+            body.append(f"Binary files differ: {_quote_path(p)} ({_sizes(b, s)})\n")
+            continue
+        _emit(
+            difflib.unified_diff(
+                _entry_lines(b),
+                _entry_lines(s),
+                fromfile=left if b is not None else "/dev/null",
+                tofile=right if s is not None else "/dev/null",
+                lineterm="\n",
+            ),
+            body,
+        )
+    joined = "".join(body)
+    text = _unreadable_block(snap.unreadable, _UNREADABLE_SHOWN) + joined
+    full_path: str | None = None
+    truncated = False
+    if len(text.encode("utf-8", "surrogateescape")) > max_bytes:
+        fd, full_path = tempfile.mkstemp(
+            prefix="coding-agent-diff-", suffix=".patch", dir=spill_dir
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as fh:
+            # The SPILL carries every unreadable path, not the bounded render:
+            # nothing is lost, it is only the in-context text that is capped.
+            fh.write(_unreadable_block(snap.unreadable, None) + joined)
+        text = (
+            text.encode("utf-8", "surrogateescape")[:max_bytes].decode(
+                "utf-8", "ignore"
+            )
+            + _TRUNC.format(path=full_path)
+            + _changed_block(summary)
+        )
+        truncated = True
+    return DiffResult(
+        text=text,
+        truncated=truncated,
+        changed_files=changed,
+        full_path=full_path,
+        unreadable=snap.unreadable,
+    )

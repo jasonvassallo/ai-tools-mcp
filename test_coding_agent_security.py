@@ -26,7 +26,16 @@ import unittest.mock
 from pathlib import Path
 
 from coding_agent import walk as walkmod
-from coding_agent.walk import TreeSnapshot, Unreadable, snapshot_tree, tree_hash
+from coding_agent.basetree import BaseTree
+from coding_agent.walk import (
+    DiffResult,
+    Entry,
+    TreeSnapshot,
+    Unreadable,
+    snapshot_tree,
+    tree_hash,
+    unified_diff,
+)
 
 
 class SymlinkExfiltration(unittest.TestCase):
@@ -1035,6 +1044,355 @@ class RepoDirectoryOpacityIsIdentityBased(unittest.TestCase):
         snap = snapshot_tree(str(self.root), lambda p: False)
         self.assertNotIn(".git", snap.entries)
         self.assertIn("notes.txt", snap.entries, "a sandbox-chosen name vanished")
+
+
+# ---------------------------------------------------------------------------
+# Task 4: THE REVIEW DIFF.
+#
+# `unified_diff` renders the only artifact a human sees before deciding whether
+# to apply an untrusted model's work, so every failure mode below is a way to
+# make a real change absent from — or unreadable in — that artifact. Spec
+# §5.1/§6.5: over-showing is noise, UNDER-showing defeats the design.
+# ---------------------------------------------------------------------------
+
+
+def _base(**files: bytes) -> BaseTree:
+    ents = {p: Entry(p, "file", d) for p, d in files.items()}
+    return BaseTree(entries=ents, ignore=lambda p: False, tracked=frozenset(ents))
+
+
+def _base_of(*entries: Entry) -> BaseTree:
+    ents = {e.path: e for e in entries}
+    return BaseTree(entries=ents, ignore=lambda p: False, tracked=frozenset(ents))
+
+
+def _diff(base: BaseTree, snap: TreeSnapshot, max_bytes: int = 1 << 20) -> DiffResult:
+    return unified_diff(base, snap, max_bytes=max_bytes, spill_dir=tempfile.mkdtemp())
+
+
+def _starting(text: str, prefix: str) -> list[str]:
+    return [ln for ln in text.splitlines() if ln.startswith(prefix)]
+
+
+class DiffStructureInjection(unittest.TestCase):
+    """Pass 4: a symlink TARGET is attacker-controlled and round-trips
+    newlines + '--- a/' bytes. It must render like git's 120000 blob:
+    every target line '+'-prefixed, so no forged header lands in column 0."""
+
+    def test_forged_header_in_symlink_target_cannot_reach_column_zero(self):
+        forged = "harmless\n--- a/etc/shadow\n+++ b/etc/shadow\n@@ -0,0 +1 @@\n+root:INJECTED"
+        snap = TreeSnapshot({"leak": Entry("leak", "symlink", forged.encode())})
+        d = unified_diff(_base(), snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+        for line in d.text.splitlines():
+            if line.startswith(("--- ", "+++ ", "@@ ")):
+                # only OUR headers may appear at column 0
+                self.assertTrue(
+                    line.startswith(
+                        ("--- /dev/null", "--- a/leak", "+++ b/leak", "@@ -0,0 +")
+                    ),
+                    f"forged header reached column 0: {line!r}",
+                )
+        self.assertIn("+--- a/etc/shadow", d.text)  # rendered as content, '+'-prefixed
+
+    def test_the_at_counts_match_the_lines_actually_emitted(self):
+        """The other half of §10 test 4b. A '+'-prefix with a LYING hunk count
+        is still structure injection: a patch tool — or a reader counting
+        lines — resynchronises on the count, and everything after the short
+        count reads as the next file's content."""
+        snap = TreeSnapshot({"leak": Entry("leak", "symlink", b"a\nb\nc\nd\ne")})
+        d = _diff(_base(), snap)
+        self.assertEqual(_starting(d.text, "@@ "), ["@@ -0,0 +1,5 @@"])
+        added = [
+            ln
+            for ln in d.text.splitlines()
+            if ln.startswith("+") and not ln.startswith("+++")
+        ]
+        self.assertEqual(len(added), 5)
+
+    def test_forged_header_in_a_FILENAME_cannot_reach_column_zero(self):
+        """The same injection through the OTHER attacker-controlled string.
+
+        A path is as controllable as a symlink target — `os.listdir` returns
+        whatever bytes are on disk and `ls-tree -z` carries them through — and
+        a newline in a filename lands the rest of the name in column 0 of the
+        diff, where a forged `--- a/…` block reads as a whole extra file. The
+        forged block is what a reviewer would scrutinise while the REAL change
+        two files down is dismissed as part of it, so this is under-showing by
+        misdirection. git's answer is to C-quote such a path onto one line.
+        """
+        evil = "notes.txt\n--- a/etc/shadow\n+++ b/etc/shadow\n@@ -1 +1 @@\n-root:x\n+root:INJECTED"
+        snap = TreeSnapshot({evil: Entry(evil, "file", b"benign\n")})
+        d = _diff(_base(), snap)
+        # exactly ONE file is being described, so exactly one of each header
+        self.assertEqual(len(_starting(d.text, "--- ")), 1)
+        self.assertEqual(len(_starting(d.text, "+++ ")), 1)
+        self.assertEqual(len(_starting(d.text, "@@ ")), 1)
+        self.assertEqual(len(_starting(d.text, "diff --git ")), 1)
+        self.assertNotIn("\n--- a/etc/shadow", d.text)
+        self.assertIn("\\n", d.text)  # the newline is escaped, git-style
+        # the raw path still reaches the caller intact, unquoted
+        self.assertEqual(d.changed_files, [evil])
+
+
+class NoNewlineAtEofCannotSwallowTheNextHeader(unittest.TestCase):
+    """A file whose last line has no trailing newline used to run straight
+    into the NEXT file's header, taking it out of column 0 — one file with no
+    final newline hid the following file's entire section from a reader
+    scanning for headers. git's `\\ No newline at end of file` marker is what
+    keeps every header on its own line."""
+
+    def test_a_file_without_a_trailing_newline_does_not_eat_the_next_file(self):
+        snap = TreeSnapshot(
+            {
+                "a.txt": Entry("a.txt", "file", b"no trailing newline"),
+                "b.txt": Entry("b.txt", "file", b"second file\n"),
+            }
+        )
+        d = _diff(_base(), snap)
+        self.assertIn("\\ No newline at end of file", d.text)
+        self.assertIn("\ndiff --git a/b.txt b/b.txt\n", d.text)
+        self.assertIn("\n+++ b/b.txt\n", d.text)
+        self.assertIn("+second file", d.text)
+
+
+class ModeBitsAreVisible(unittest.TestCase):
+    """`chmod +x` is a real, persistent change to code a human already
+    approved: the same bytes become something the shell will RUN. It carries
+    no content delta at all, so a diff keyed on content alone shows nothing —
+    the quietest under-show in the module."""
+
+    def test_chmod_plus_x_with_identical_content_appears_in_the_diff(self):
+        same = b"#!/bin/sh\necho hello\n"
+        snap = TreeSnapshot(
+            {"tool.sh": Entry("tool.sh", "file", same, executable=True)}
+        )
+        d = _diff(_base(**{"tool.sh": same}), snap)
+        self.assertIn("tool.sh", d.changed_files)
+        self.assertIn("old mode 100644", d.text)
+        self.assertIn("new mode 100755", d.text)
+
+    def test_dropping_the_execute_bit_is_shown_too(self):
+        same = b"#!/bin/sh\n"
+        base = _base_of(Entry("tool.sh", "file", same, executable=True))
+        snap = TreeSnapshot({"tool.sh": Entry("tool.sh", "file", same)})
+        d = _diff(base, snap)
+        self.assertIn("old mode 100755", d.text)
+        self.assertIn("new mode 100644", d.text)
+
+    def test_an_already_executable_file_is_not_a_false_positive(self):
+        """The reason this had to land on BOTH sides at once: a walk that
+        reports the execute bit against a base tree that does not would call
+        every 100755 file in the repo a mode change, and a diff that cries
+        wolf on every entry is one a reviewer stops reading."""
+        same = b"#!/bin/sh\n"
+        base = _base_of(Entry("tool.sh", "file", same, executable=True))
+        snap = TreeSnapshot(
+            {"tool.sh": Entry("tool.sh", "file", same, executable=True)}
+        )
+        d = _diff(base, snap)
+        self.assertEqual(d.changed_files, [])
+        self.assertEqual(d.text, "")
+
+    def test_a_new_file_states_its_mode(self):
+        snap = TreeSnapshot(
+            {"run.sh": Entry("run.sh", "file", b"id\n", executable=True)}
+        )
+        d = _diff(_base(), snap)
+        self.assertIn("new file mode 100755", d.text)
+
+
+class GateCannotBeBlinded(unittest.TestCase):
+    def test_tracked_file_replaced_by_special_file_surfaces_as_deletion(self):
+        base = _base(**{"foo.py": b"print(1)\n"})
+        snap = TreeSnapshot({})  # walk skipped the FIFO that replaced foo.py
+        d = unified_diff(base, snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+        self.assertIn("foo.py", d.changed_files)
+        self.assertIn("--- a/foo.py", d.text)
+        self.assertIn("+++ /dev/null", d.text)
+
+    def test_new_untracked_file_appears(self):
+        snap = TreeSnapshot(
+            {
+                "tests/test_new.py": Entry(
+                    "tests/test_new.py", "file", b"def test_x(): pass\n"
+                )
+            }
+        )
+        d = unified_diff(_base(), snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+        self.assertIn("tests/test_new.py", d.changed_files)
+        self.assertIn("+def test_x(): pass", d.text)
+
+    def test_a_tracked_file_replaced_by_a_symlink_shows_as_a_typechange(self):
+        """§10 test 4c's typechange half. The dangerous shape is a config or
+        key file swapped for a symlink pointing somewhere else: the CONTENT
+        the reviewer reads (`/etc/passwd`) looks like a one-line edit unless
+        the 100644 -> 120000 transition is stated."""
+        base = _base(**{"config.json": b'{"a": 1}\n'})
+        snap = TreeSnapshot(
+            {"config.json": Entry("config.json", "symlink", b"/etc/passwd")}
+        )
+        d = _diff(base, snap)
+        self.assertIn("config.json", d.changed_files)
+        self.assertIn("old mode 100644", d.text)
+        self.assertIn("new mode 120000", d.text)
+        self.assertIn('-{"a": 1}', d.text)
+        self.assertIn("+/etc/passwd", d.text)
+
+    def test_a_symlink_replaced_by_a_file_is_a_typechange_too(self):
+        base = _base_of(Entry("link", "symlink", b"app.py"))
+        snap = TreeSnapshot({"link": Entry("link", "file", b"import os\n")})
+        d = _diff(base, snap)
+        self.assertIn("old mode 120000", d.text)
+        self.assertIn("new mode 100644", d.text)
+
+    def test_content_identical_across_a_typechange_is_still_shown(self):
+        """The nastiest shape of all: a file containing the text `app.py`
+        replaced by a SYMLINK to app.py. Both sides hold identical bytes, so
+        a content-only comparison emits nothing whatsoever."""
+        base = _base(**{"link": b"app.py"})
+        snap = TreeSnapshot({"link": Entry("link", "symlink", b"app.py")})
+        d = _diff(base, snap)
+        self.assertIn("link", d.changed_files)
+        self.assertIn("old mode 100644", d.text)
+        self.assertIn("new mode 120000", d.text)
+
+
+class UnreadablePathsReachTheHuman(unittest.TestCase):
+    """`TreeSnapshot.unreadable` exists because `chmod 000 backdoor.py` made a
+    file VANISH from the snapshot with no signal at all. Populating the field
+    only moved the silence one layer up: a record nothing renders leaves the
+    human reading a diff in which those paths simply do not exist."""
+
+    def test_unreadable_paths_are_stated_in_the_text_and_carried_on_the_result(self):
+        snap = TreeSnapshot(
+            {"visible.txt": Entry("visible.txt", "file", b"hi\n")},
+            (Unreadable("backdoor.py", "EACCES"), Unreadable("src/", "EACCES")),
+        )
+        d = _diff(_base(), snap)
+        # structured, for a gate that must fail closed without parsing text
+        self.assertEqual(d.unreadable, snap.unreadable)
+        # and in the text, for the human who only reads the diff
+        self.assertIn("2 path(s) could not be read", d.text)
+        self.assertIn("backdoor.py", d.text)
+        self.assertIn("src/", d.text)
+        self.assertIn("EACCES", d.text)
+
+    def test_the_warning_is_first_so_the_size_cap_cannot_cut_it_off(self):
+        """Truncation removes the TAIL. A warning rendered after the file
+        sections is exactly the thing an oversized diff drops, and an attacker
+        picks the diff's size."""
+        snap = TreeSnapshot(
+            {"big.txt": Entry("big.txt", "file", b"x" * 5000)},
+            (Unreadable("backdoor.py", "EACCES"),),
+        )
+        d = _diff(_base(), snap, max_bytes=400)
+        self.assertTrue(d.truncated)
+        self.assertTrue(d.text.startswith("coding_agent: WARNING"), d.text[:80])
+        self.assertIn("1 path(s) could not be read", d.text)
+        self.assertIn("backdoor.py", d.text)
+
+    def test_a_flood_of_unreadable_paths_cannot_displace_the_diff(self):
+        """The block is bounded for the same reason it is first: an unbounded
+        list of sandbox-chosen names would push the real change out of the
+        visible window. The COUNT stays exact and the full list stays on the
+        result, so bounding the render loses nothing."""
+        many = tuple(Unreadable(f"hidden{i:04d}.py", "EACCES") for i in range(500))
+        snap = TreeSnapshot({"real.py": Entry("real.py", "file", b"import os\n")}, many)
+        d = _diff(_base(), snap)
+        self.assertIn("500 path(s) could not be read", d.text)
+        self.assertIn("+import os", d.text)
+        self.assertLess(d.text.index("+import os"), 2000)
+        self.assertEqual(len(d.unreadable), 500)
+
+    def test_a_clean_snapshot_says_nothing(self):
+        snap = TreeSnapshot({"a.py": Entry("a.py", "file", b"x = 1\n")})
+        d = _diff(_base(), snap)
+        self.assertNotIn("could not be read", d.text)
+        self.assertEqual(d.unreadable, ())
+
+    def test_an_unreadable_path_cannot_forge_a_diff_header_either(self):
+        evil = "ok.py\n--- a/etc/shadow\n+++ b/etc/shadow"
+        snap = TreeSnapshot({}, (Unreadable(evil, "EACCES"),))
+        d = _diff(_base(), snap)
+        self.assertEqual(_starting(d.text, "--- "), [])
+        self.assertEqual(_starting(d.text, "+++ "), [])
+        for line in d.text.splitlines():
+            self.assertTrue(line == "" or line.startswith("coding_agent:"), repr(line))
+
+
+class DiffSizeCap(unittest.TestCase):
+    def test_binary_is_annotated_not_embedded(self):
+        snap = TreeSnapshot(
+            {
+                "blob.bin": Entry("blob.bin", "file", b"\x00\x01\x02" * 100),
+            }
+        )
+        d = _diff(_base(), snap)
+        self.assertIn("Binary files differ: blob.bin", d.text)
+        self.assertIn("300 bytes", d.text)
+        self.assertNotIn("\x00", d.text)
+
+    def test_large_text_truncates_with_a_spill_file(self):
+        big = b"x" * 5000
+        snap = TreeSnapshot({"big.txt": Entry("big.txt", "file", big)})
+        spill = tempfile.mkdtemp()
+        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=spill)
+        self.assertTrue(d.truncated)
+        self.assertIsNotNone(d.full_path)
+        self.assertGreater(os.path.getsize(d.full_path), 1000)
+
+    def test_truncation_cannot_hide_THAT_a_later_file_changed(self):
+        """This is the brief's size-cap test, split in two because the single
+        bundled version could not pass — and the reason it could not is a real
+        under-show, not a test artifact.
+
+        'big.txt' sorts before 'blob.bin', so 5000 bytes of `x` displaced the
+        binary annotation past a 1000-byte cap and the second file vanished
+        from the review entirely. One `dd` of an early-sorting file hides every
+        change after it. The cap now truncates DETAIL only: the complete list
+        of changed paths, with mode transitions, is appended after the marker.
+        """
+        snap = TreeSnapshot(
+            {
+                "blob.bin": Entry("blob.bin", "file", b"\x00\x01\x02" * 100),
+                "big.txt": Entry("big.txt", "file", b"x" * 5000),
+            }
+        )
+        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=tempfile.mkdtemp())
+        self.assertTrue(d.truncated)
+        self.assertEqual(d.changed_files, ["big.txt", "blob.bin"])
+        tail = d.text.split("[... diff truncated")[1]
+        self.assertIn("2 file(s) changed", tail)
+        self.assertIn("blob.bin", tail)
+        self.assertIn("- -> 100644", tail)
+        self.assertNotIn("\x00", d.text)
+
+    def test_the_appended_list_is_bounded_and_states_the_true_count(self):
+        """Bounded for the same reason it exists: an unbounded list of
+        sandbox-chosen names is itself a way to flood the reviewer."""
+        snap = TreeSnapshot(
+            {f"f{i:04d}.py": Entry(f"f{i:04d}.py", "file", b"x\n") for i in range(500)}
+        )
+        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=tempfile.mkdtemp())
+        self.assertIn("500 file(s) changed", d.text)
+        self.assertIn("and 400 more", d.text)
+        self.assertEqual(len(d.changed_files), 500)
+
+    def test_the_spill_file_holds_the_untruncated_diff(self):
+        snap = TreeSnapshot({"big.txt": Entry("big.txt", "file", b"line\n" * 400)})
+        d = _diff(_base(), snap, max_bytes=500)
+        self.assertTrue(d.truncated)
+        with open(d.full_path, encoding="utf-8") as fh:
+            full = fh.read()
+        self.assertEqual(full.count("+line"), 400)
+        self.assertIn("full diff at", d.text)
+        self.assertIn(d.full_path, d.text)
+
+    def test_an_untruncated_diff_writes_no_spill_file(self):
+        snap = TreeSnapshot({"a.py": Entry("a.py", "file", b"x = 1\n")})
+        d = _diff(_base(), snap)
+        self.assertFalse(d.truncated)
+        self.assertIsNone(d.full_path)
 
 
 if __name__ == "__main__":
