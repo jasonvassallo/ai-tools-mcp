@@ -165,7 +165,9 @@ _ARG_KEYS = 8
 _OUTPUT_TAIL = 2000
 # ...including the two structured path lists. Chosen to sit above
 # `walk._CHANGED_SHOWN` (100), so a result never names fewer paths than the
-# diff text itself already does.
+# diff text itself already does. WHICH 500 survive is the load-bearing half:
+# see `_capped_paths`, which fills both lists base-tree-first for the same
+# reason `walk` renders its body that way.
 _RESULT_PATHS = 500
 # One assistant turn may not queue unbounded work or unbounded transcript.
 _MAX_TOOL_CALLS_PER_TURN = 32
@@ -343,9 +345,37 @@ async def _teardown(
             out.diff = diff.text
             out.diff_truncated = diff.truncated
             out.diff_full_path = diff.full_path
-            out.changed_files = _capped_paths(list(diff.changed_files))
+            # Both lists are capped BASE-TREE-FIRST, the same asymmetry
+            # `walk.unified_diff` orders its body and its appended path list
+            # by: a path the sandbox created cannot evict one the host's own
+            # repository holds. Capping these by sort position alone would
+            # have left that hole open one layer above the diff text.
+            reaches = _base_reach(base)
+            out.changed_files = _capped_paths(
+                list(diff.changed_files),
+                where=(
+                    f"the complete diff is at {diff.full_path}"
+                    if diff.full_path is not None
+                    else "the diff text above names every changed path"
+                ),
+                keep_first=reaches,
+            )
             out.unreadable = _capped_paths(
-                [{"path": item.path, "reason": item.reason} for item in diff.unreadable]
+                [
+                    {"path": item.path, "reason": item.reason}
+                    for item in diff.unreadable
+                ],
+                # NOT the same sentence as above: the diff's warning block is
+                # itself bounded (`walk._UNREADABLE_SHOWN`), so an untruncated
+                # diff does NOT name every unreadable path the way it names
+                # every changed one. Only the spill file does.
+                where=(
+                    f"the complete list is in the diff at {diff.full_path}"
+                    if diff.full_path is not None
+                    else "the complete list is NOT in this response - the diff's "
+                    "own warning block is bounded too"
+                ),
+                keep_first=lambda rec: reaches(rec["path"]),
             )
         except Exception as exc:  # noqa: BLE001 — surfaced, never swallowed
             out.problems.append(
@@ -392,7 +422,36 @@ def _trim_conversation(messages: list[dict[str, Any]]) -> int:
     return elided
 
 
-def _capped_paths(items: list[_T]) -> list[_T]:
+def _base_reach(base: BaseTree) -> Callable[[str], bool]:
+    """True for a path whose fate the BASE TREE has a stake in.
+
+    The exact base paths, plus every directory an entry lives under, plus the
+    worktree root — because an `unreadable` record is not always a file. A
+    record for `src/` (or, when the classifying `lstat` is what failed, for
+    `src/deep`) is the thing hiding every tracked path beneath it, and losing
+    THAT record to a flood of sandbox-named ones is the same under-show as
+    losing the file itself.
+
+    The set is derived ONCE from `base.entries`, which `basetree` read from
+    the host's own repository with git; the sandbox cannot add a member to it
+    at any cost, which is the whole reason this is a usable priority signal
+    and a name-sort is not.
+    """
+    dirs = {p[:i] for p in base.entries for i, ch in enumerate(p) if ch == "/"}
+
+    def reaches(path: str) -> bool:
+        bare = path[:-1] if path.endswith("/") else path
+        return bare == "." or bare in base.entries or bare in dirs
+
+    return reaches
+
+
+def _capped_paths(
+    items: list[_T],
+    *,
+    where: str = "the remainder is not in this response",
+    keep_first: Callable[[_T], bool] | None = None,
+) -> list[_T]:
     """Bound a sandbox-sized list, keeping an EXACT count of what was dropped.
 
     Every other model-controlled field in the result is already bounded — the
@@ -404,6 +463,24 @@ def _capped_paths(items: list[_T]) -> list[_T]:
     DoS is accepted as an availability trade-off for host MEMORY; this is the
     other half of it, and it is the half that reaches a human.
 
+    WHICH items survive is a security question, not a formatting one, and the
+    pass-8 answer to it is `keep_first`. Truncating by position alone let 600
+    files named `!0000.txt`… evict a backdoored TRACKED path from
+    `changed_files` — measured, at the shipped `_RESULT_PATHS` — leaving the
+    path in no field of the response at all. Callers pass a predicate that is
+    true for paths the BASE TREE reaches; those are selected first, the rest
+    fill what is left, and the survivors are emitted in the caller's original
+    (sorted) order, so nothing but the choice of survivors changes.
+
+    `where` is the caller's statement of where the complete data really is,
+    and it is a parameter precisely because the honest answer differs per
+    field and per run: the untruncated diff names every changed path but only
+    a bounded HEAD of the unreadable list, and a spill file exists only when
+    the diff was truncated. The default assumes none of that. The marker used
+    to assert "the diff text and its spill file are complete", which was false
+    in both halves whenever the diff was truncated, and named a spill file
+    that does not exist when it was not.
+
     The overflow marker is a value of the same SHAPE as the list's elements,
     so a consumer iterating either field sees a well-formed entry rather than
     a type error — and the count is exact, which is the property that keeps
@@ -412,10 +489,13 @@ def _capped_paths(items: list[_T]) -> list[_T]:
     if len(items) <= _RESULT_PATHS:
         return items
     dropped = len(items) - _RESULT_PATHS
-    kept = items[:_RESULT_PATHS]
-    note = (
-        f"[... and {dropped} more; the diff text and its spill file are complete ...]"
-    )
+    if keep_first is None:
+        kept = items[:_RESULT_PATHS]
+    else:
+        first = [i for i, item in enumerate(items) if keep_first(item)]
+        rest = [i for i, item in enumerate(items) if not keep_first(item)]
+        kept = [items[i] for i in sorted([*first, *rest][:_RESULT_PATHS])]
+    note = f"[... and {dropped} more; {where} ...]"
     if kept and isinstance(kept[0], dict):
         return [*kept, cast("_T", {"path": note, "reason": "TRUNCATED"})]
     return [*kept, cast("_T", note)]
