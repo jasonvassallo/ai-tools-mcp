@@ -272,19 +272,15 @@ in — do not land a hostname whose `access` block is still a placeholder:
 
 Validate the edited config before restarting — as a **global tunnel flag
 before the subcommand** (`ingress validate --config ...` is rejected; flag
-position matters):
+position matters). Chain the validation, the rule check, and the restart
+(system daemon, per the one-tunnel-per-machine setup — installed via
+`cloudflared service install`, label `com.cloudflare.cloudflared`, running
+`/opt/homebrew/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run`)
+so a failed check stops before anything restarts:
 
 ```bash
-cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate
-cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule https://queue-mbp.djvassallo.com
-```
-
-Then restart the tunnel (system daemon, per the one-tunnel-per-machine
-setup — installed via `cloudflared service install`, label
-`com.cloudflare.cloudflared`, running
-`/opt/homebrew/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run`):
-
-```bash
+cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate && \
+cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule https://queue-mbp.djvassallo.com && \
 sudo launchctl kickstart -k system/com.cloudflare.cloudflared
 ```
 
