@@ -5,7 +5,16 @@ Every test here pins an attack that was DEMONSTRATED (not hypothesised)
 during adversarial review of the design spec, 2026-08-16. Read
 docs/superpowers/specs/2026-08-16-coding-agent-design.md §6.5/§6.6/§10.
 
-Run:  uv run --with pytest --with pathspec pytest test_coding_agent_security.py -q
+Run:  uv run --with pytest --with pytest-timeout --with pathspec pytest test_coding_agent_security.py -q
+
+`pytest-timeout` bounds the tests below whose regression signal is a HUNG
+process rather than a red assertion — most directly
+`test_file_swapped_for_fifo_after_classification_does_not_hang`, which pins
+`_FILE_FLAGS`'s `O_NONBLOCK` in `coding_agent/walk.py`. It is requested here,
+not required: absent the plugin, `@pytest.mark.timeout(...)` is an unknown
+mark pytest warns about and ignores, and every test still runs — it just
+loses that backstop. See `conftest.py` for the marker registration that
+silences the warning either way.
 """
 
 from __future__ import annotations
@@ -25,6 +34,8 @@ import time
 import unittest
 import unittest.mock
 from pathlib import Path
+
+import pytest
 
 from coding_agent import walk as walkmod
 from coding_agent.basetree import BaseTree, make_ignore, read_base_tree
@@ -77,7 +88,17 @@ class SymlinkExfiltration(unittest.TestCase):
         h3 = tree_hash(snapshot_tree(str(self.root), lambda p: False))
         self.assertNotEqual(h1, h3)
 
+    @pytest.mark.timeout(15)
     def test_special_files_are_skipped_not_read(self):
+        """Doubly guarded today: `_visit`'s `lstat` classifies the FIFO and
+        returns before `_read_regular` is ever called, and `_read_regular`'s
+        own `os.open` carries `O_NONBLOCK` besides. Losing EITHER guard alone
+        still leaves the other standing; losing both at once is exactly the
+        "a future maintainer simplifies away a defence-in-depth layer" shape
+        this build kept finding (see `DefenceInDepthLayersAreIndividuallyPinned`
+        below), so this still gets the same backstop as the tests that pin
+        each half on its own.
+        """
         os.mkfifo(self.root / "trap.fifo")  # open().read() here would block forever
         snap = snapshot_tree(str(self.root), lambda p: False)
         self.assertNotIn("trap.fifo", snap.entries)
@@ -249,6 +270,7 @@ class WalkRaceCannotDereference(unittest.TestCase):
             "the walk descended through a symlink swapped in after lstat",
         )
 
+    @pytest.mark.timeout(20)
     def test_file_swapped_for_fifo_after_classification_does_not_hang(self):
         """O_NOFOLLOW alone does not close the swap — it only refuses SYMLINKS.
 
@@ -261,6 +283,14 @@ class WalkRaceCannotDereference(unittest.TestCase):
         _FILE_FLAGS this test HANGS rather than failing red — the same property
         the original FIFO test has, and the reason the repo would want
         pytest-timeout before this suite runs unattended in CI.
+
+        The swap forces the walk PAST the classification-skip that would
+        otherwise catch a FIFO before ever opening it (see
+        `test_special_files_are_skipped_not_read`), so this is the one test
+        in the suite that isolates `O_NONBLOCK` as the SOLE guard — no
+        assertion below is reachable if it regresses; `os.open` blocks first.
+        `@pytest.mark.timeout` is the only thing that turns that into a red
+        failure naming this test rather than a hung, silent CI job.
         """
         victim = self.root / "victim.txt"
         victim.write_bytes(b"benign\n")
@@ -1114,7 +1144,20 @@ class NoHostSubprocessRunsOverTheWalkOrTheDiff(unittest.TestCase):
     reached, including from inside a dependency.
     """
 
+    @pytest.mark.timeout(30)
     def test_the_walk_hash_and_diff_spawn_no_subprocess_over_a_hostile_tree(self):
+        """The hostile tree below includes a FIFO (`pipe`), walked by a CHILD
+        interpreter through the exact `snapshot_tree` -> `tree_hash` ->
+        `unified_diff` pipeline the real loop uses. `subprocess.run` had no
+        `timeout=` at all until this pass: if that child ever blocked inside
+        the walk — a `_FILE_FLAGS`/`O_NONBLOCK` regression, or a classification
+        regression that stopped skipping the FIFO before opening it — this
+        test would hang the parent right along with it, silently, forever.
+        `timeout=` below turns that into `subprocess.TimeoutExpired`, caught
+        and re-raised as a named, informative failure; `@pytest.mark.timeout`
+        is the outer backstop in case the raise itself is somehow never
+        reached.
+        """
         tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         root = tmp / "work"
@@ -1135,18 +1178,27 @@ class NoHostSubprocessRunsOverTheWalkOrTheDiff(unittest.TestCase):
         nested.mkdir(parents=True)
         (nested / "config").write_text("[core]\n\tfsmonitor = /tmp/pwn.sh\n")
 
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                _NO_SPAWN_CHILD,
-                str(Path(__file__).parent),
-                str(root),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    _NO_SPAWN_CHILD,
+                    str(Path(__file__).parent),
+                    str(root),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+            )
+        except subprocess.TimeoutExpired as exc:
+            self.fail(
+                "the child walking the hostile tree (which includes a FIFO) "
+                "did not return within 20s -- this is what a blocking, "
+                "non-O_NONBLOCK open (or a lost FIFO classification-skip) "
+                f"looks like; partial stdout={exc.stdout!r} stderr={exc.stderr!r}"
+            )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         got = json.loads(proc.stdout.strip().splitlines()[-1])
 

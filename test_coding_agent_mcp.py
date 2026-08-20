@@ -15,7 +15,15 @@ No docker and no ollama: `run_coding_agent` is either driven with a fake
 `SandboxOps` or patched out entirely.
 
 Run:
-    uv run --with pytest --with pathspec pytest test_coding_agent_mcp.py -q
+    uv run --with pytest --with pytest-timeout --with pathspec pytest test_coding_agent_mcp.py -q
+
+`--with pytest-timeout` is requested for parity with the rest of the suite's
+`Run:` lines (see test_coding_agent_security.py and test_coding_agent_tools.py
+for the tests it actually bounds), not because anything in this file relies on
+it — the background-job tests below use `asyncio.sleep`/`asyncio.Event`, which
+is cancellable at every await point and cleaned up by `asyncio.run()` itself
+even if a test forgot to. It is optional here too: without the plugin this
+file runs exactly as before.
 """
 
 from __future__ import annotations

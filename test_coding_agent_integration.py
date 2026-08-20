@@ -3,7 +3,13 @@
 is down or the sandbox image is not built (never pulled: a test suite must not
 reach the network).
 
-Run:  uv run --with pytest --with pathspec pytest test_coding_agent_integration.py -q
+Run:  uv run --with pytest --with pytest-timeout --with pathspec pytest test_coding_agent_integration.py -q
+
+`--with pytest-timeout` is requested for parity with the rest of the suite's
+`Run:` lines (see test_coding_agent_security.py and test_coding_agent_tools.py
+for the tests it actually bounds), not because anything in this file relies on
+it. It is optional here too: without the plugin this file runs exactly as
+before.
 
 Everything here drives the REAL loop against a REAL git repo, a REAL throwaway
 worktree and a REAL container built from the real sandbox image. Only the model
