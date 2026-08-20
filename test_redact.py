@@ -1190,7 +1190,11 @@ class TestRenderGroundedAnswer(unittest.TestCase):
     def test_defaults_clear_the_measured_thinking_floor(self):
         # Live measurement put thoughtsTokenCount at 666-1851 on this model,
         # so any default at or below ~2048 is at the mercy of the thinking
-        # spend. Guard the floor rather than the exact numbers.
+        # spend. Pin the shipped values so accidental drift fails loudly, and
+        # keep the floor/ordering assertions so the REASON stays encoded —
+        # a deliberate retune updates this test on purpose.
+        self.assertEqual(mcp_server._QUICK_DEFAULT_MAX_TOKENS, 8192)
+        self.assertEqual(mcp_server._DEEP_DEFAULT_MAX_TOKENS, 16384)
         self.assertGreater(mcp_server._QUICK_DEFAULT_MAX_TOKENS, 2048)
         self.assertGreater(
             mcp_server._DEEP_DEFAULT_MAX_TOKENS,

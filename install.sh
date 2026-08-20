@@ -29,7 +29,7 @@ MCP_SERVER_KEY="ai-tools-mcp"
 KEYCHAIN_SERVICE="api_tokens"
 
 # API tokens offered at install: "account_name|display_name|description"
-# None are required as of v1.6 — the default research path (quick_research /
+# None are required as of 1.5.11 — the default research path (quick_research /
 # deep_research) authenticates via Google ADC, and the Perplexity key backs
 # only the explicit-invocation `agent_research` tool. Declining it leaves a
 # fully usable install.
@@ -254,7 +254,7 @@ for token_spec in "${OPTIONAL_TOKENS[@]}"; do
     if security find-generic-password -s "$KEYCHAIN_SERVICE" -a "$account" -w >/dev/null 2>&1; then
         print_ok "${display_name} found in Keychain"
     else
-        # Not an error since v1.6: agent_research is the only consumer and it
+        # Not an error since 1.5.11: agent_research is the only consumer and it
         # fails closed at call time. The default research path uses ADC.
         print_warn "${display_name} not in Keychain — agent_research unavailable; quick_research/deep_research unaffected"
     fi

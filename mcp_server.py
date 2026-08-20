@@ -513,7 +513,7 @@ def _report_cf_access_credentials() -> None:
 def run_check() -> None:
     """Validate configuration and exit. Used by install.sh to verify setup."""
     errors = 0
-    # Non-fatal since v1.6: the Perplexity key backs only `agent_research`,
+    # Non-fatal since 1.5.11: the Perplexity key backs only `agent_research`,
     # an explicit-invocation tool. The default research path (quick_research
     # / deep_research) runs on ADC-authenticated Vertex, so an install with
     # no Perplexity key is a perfectly usable deployment and must not be
