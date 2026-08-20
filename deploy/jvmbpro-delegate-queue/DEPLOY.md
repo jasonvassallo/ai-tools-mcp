@@ -260,11 +260,32 @@ in — do not land a hostname whose `access` block is still a placeholder:
           - <AUD_TAG>
 ```
 
-Then restart the tunnel (system daemon, per the one-tunnel-per-machine
-setup):
+> **Stale config warning:** a `~/.cloudflared/config.yml` can exist from an
+> earlier user-level setup and is never read by the daemon. Any bare
+> `cloudflared tunnel ...` invocation (no `--config`) silently validates or
+> reports against that stale file instead of the live one. The daemon's
+> authoritative config is whatever `--config` its LaunchDaemon plist names —
+> on JVMBPro that's `/etc/cloudflared/config.yml`, per the
+> `com.cloudflare.cloudflared` plist at
+> `/Library/LaunchDaemons/com.cloudflare.cloudflared.plist`. Always pass
+> `--config` explicitly.
+
+Validate the edited config before restarting — as a **global tunnel flag
+before the subcommand** (`ingress validate --config ...` is rejected; flag
+position matters):
 
 ```bash
-sudo launchctl kickstart -k system/homebrew.mxcl.cloudflared
+cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate
+cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule https://queue-mbp.djvassallo.com
+```
+
+Then restart the tunnel (system daemon, per the one-tunnel-per-machine
+setup — installed via `cloudflared service install`, label
+`com.cloudflare.cloudflared`, running
+`/opt/homebrew/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run`):
+
+```bash
+sudo launchctl kickstart -k system/com.cloudflare.cloudflared
 ```
 
 ## 5. DNS CNAME (Cloudflare API, token from Keychain) — do this LAST
