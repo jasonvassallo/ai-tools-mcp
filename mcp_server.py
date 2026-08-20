@@ -521,8 +521,18 @@ def run_check() -> None:
     # read this exit status. Same rule the Ollama block below already
     # applies, and `agent_research` still fails closed at call time.
     try:
-        _, source = _resolve_credential("api_tokens", "perplexity")
-        print(f"ok: perplexity key found ({source}) [agent_research only]")
+        # _resolve_credential returns a blank value unconditionally when the
+        # store holds one — it leaves the fail-closed decision to the caller.
+        # A blank key is unusable, so report it as unavailable rather than
+        # printing a reassuring "found".
+        value, source = _resolve_credential("api_tokens", "perplexity")
+        if value:
+            print(f"ok: perplexity key found ({source}) [agent_research only]")
+        else:
+            print(
+                f"warn: perplexity key is empty ({source}) — agent_research "
+                "unavailable; quick_research/deep_research are unaffected"
+            )
     except ValueError as e:
         print(
             f"warn: perplexity key not found — agent_research unavailable; "
