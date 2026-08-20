@@ -1478,6 +1478,16 @@ def _render_grounded_answer(data: dict[str, Any], heading: str) -> str:
             "(`finishReason: MAX_TOKENS`). Re-run with a larger `max_tokens` "
             "for the complete answer.",
         ]
+    elif finish and finish.upper() != "STOP":
+        # A partial answer can also arrive under SAFETY, RECITATION, or any
+        # reason Google adds later. The text is still worth returning, but it
+        # must not read as complete — the same rule as truncation, one level
+        # wider, so an unknown future reason fails visible rather than silent.
+        sections += [
+            "",
+            "> ⚠️ This answer may be incomplete: the model stopped for an "
+            f"abnormal reason (`finishReason: {redact_secrets(finish)}`).",
+        ]
     grounding = candidate.get("groundingMetadata")
     if not isinstance(grounding, dict):
         grounding = {}

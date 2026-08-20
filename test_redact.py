@@ -1158,6 +1158,25 @@ class TestRenderGroundedAnswer(unittest.TestCase):
         out = mcp_server._render_grounded_answer(data, "Quick Research")
         self.assertIn("returned an empty answer", out)
 
+    def test_abnormal_finish_with_text_is_flagged_not_passed_off_as_complete(self):
+        # Same defect class as the MAX_TOKENS case: a partial answer can also
+        # arrive under SAFETY / RECITATION / a reason Google adds later. The
+        # text is still returned, but it must not read as a complete answer.
+        for reason in ("SAFETY", "RECITATION", "SOME_FUTURE_REASON"):
+            with self.subTest(reason=reason):
+                data = {
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "Partial body"}]},
+                            "finishReason": reason,
+                        }
+                    ]
+                }
+                out = mcp_server._render_grounded_answer(data, "Quick Research")
+                self.assertIn("Partial body", out)
+                self.assertIn("may be incomplete", out)
+                self.assertIn(reason, out)
+
     def test_complete_answer_carries_no_truncation_warning(self):
         data = {
             "candidates": [

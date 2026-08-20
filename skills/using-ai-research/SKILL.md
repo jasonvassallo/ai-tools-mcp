@@ -64,7 +64,7 @@ Is the report itself the deliverable — a multi-page citation-dense document
 
 ## Anti-Patterns
 
-- **Don't** use `deep_research` when `quick_research` suffices — same metered backend, but its synthesis prompt produces a longer answer, so a typical call spends more tokens. (The larger `max_tokens` is a ceiling, not an allocation; it is the answer length that costs, not the budget.) Reach for it only when you actually need the multi-source synthesis.
+- **Don't** use `deep_research` when `quick_research` suffices — same metered backend, but its synthesis prompt produces a longer answer, so a typical call spends more tokens. (`max_tokens` is only a ceiling — what you pay for is the tokens actually produced, which on this model means the answer *plus* its internal reasoning. Raising the ceiling does not by itself cost anything.) Reach for it only when you actually need the multi-source synthesis.
 - **Don't** use `quick_research` (or `deep_research`) when `WebSearch` suffices — grounded requests are metered; don't spend them on cached factoids.
 - **Don't** use `agent_research` for a single research question — the per-container fee and orchestration latency are pure overhead there; `deep_research` is faster and cheaper. Reach for it only when the task enumerates items or needs computation.
 - **Don't** call `agent_research` (or `agent_research_result`) just because a task's shape matches "bulk/enumerable" — it is the only Perplexity-billed surface this server exposes and must never be selected implicitly. Surface the recommendation and get explicit user confirmation first.
