@@ -276,11 +276,16 @@ position matters). Chain the validation, the rule check, and the restart
 (system daemon, per the one-tunnel-per-machine setup — installed via
 `cloudflared service install`, label `com.cloudflare.cloudflared`, running
 `/opt/homebrew/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run`)
-so a failed check stops before anything restarts:
+so a failed check stops before anything restarts. Note `ingress rule`
+exits 0 as soon as ANY rule matches, including the catch-all
+`http_status:404` — a missing or mistyped hostname entry still "succeeds"
+by falling through to the catch-all, so grep the output for the expected
+service to actually catch that case:
 
 ```bash
 cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate && \
-cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule https://queue-mbp.djvassallo.com && \
+cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule https://queue-mbp.djvassallo.com \
+  | grep -q 'http://127.0.0.1:11438' && \
 sudo launchctl kickstart -k system/com.cloudflare.cloudflared
 ```
 
