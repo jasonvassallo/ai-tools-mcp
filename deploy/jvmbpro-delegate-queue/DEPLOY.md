@@ -260,11 +260,33 @@ in — do not land a hostname whose `access` block is still a placeholder:
           - <AUD_TAG>
 ```
 
-Then restart the tunnel (system daemon, per the one-tunnel-per-machine
-setup):
+> **Stale config warning:** a `~/.cloudflared/config.yml` can exist from an
+> earlier user-level setup and is never read by the daemon. Any bare
+> `cloudflared tunnel ...` invocation (no `--config`) silently validates or
+> reports against that stale file instead of the live one. The daemon's
+> authoritative config is whatever `--config` its LaunchDaemon plist names —
+> on JVMBPro that's `/etc/cloudflared/config.yml`, per the
+> `com.cloudflare.cloudflared` plist at
+> `/Library/LaunchDaemons/com.cloudflare.cloudflared.plist`. Always pass
+> `--config` explicitly.
+
+Validate the edited config before restarting — as a **global tunnel flag
+before the subcommand** (`ingress validate --config ...` is rejected; flag
+position matters). Chain the validation, the rule check, and the restart
+(system daemon, per the one-tunnel-per-machine setup — installed via
+`cloudflared service install`, label `com.cloudflare.cloudflared`, running
+`/opt/homebrew/bin/cloudflared tunnel --config /etc/cloudflared/config.yml run`)
+so a failed check stops before anything restarts. Note `ingress rule`
+exits 0 as soon as ANY rule matches, including the catch-all
+`http_status:404` — a missing or mistyped hostname entry still "succeeds"
+by falling through to the catch-all, so grep the output for the expected
+service to actually catch that case:
 
 ```bash
-sudo launchctl kickstart -k system/homebrew.mxcl.cloudflared
+cloudflared tunnel --config /etc/cloudflared/config.yml ingress validate && \
+cloudflared tunnel --config /etc/cloudflared/config.yml ingress rule https://queue-mbp.djvassallo.com \
+  | grep -q 'http://127.0.0.1:11438' && \
+sudo launchctl kickstart -k system/com.cloudflare.cloudflared
 ```
 
 ## 5. DNS CNAME (Cloudflare API, token from Keychain) — do this LAST
