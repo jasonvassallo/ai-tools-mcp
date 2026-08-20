@@ -183,9 +183,18 @@ class Entry:
 class Unreadable:
     """A path that EXISTS in the worktree but is absent from `entries`.
 
-    `path` carries a TRAILING SLASH when the object is a directory, so the gate
-    can tell "one file is hidden" from "a subtree of unknown size is hidden".
-    The root itself is named `.`.
+    `path` carries a TRAILING SLASH when the object is KNOWN to be a directory,
+    so the gate can tell "one file is hidden" from "a subtree of unknown size
+    is hidden". The root itself is named `.`.
+
+    The slash is a HINT, never a guarantee, and nothing may treat its absence
+    as proof of a file. The type comes from the `lstat` that classifies the
+    child, so a refusal recorded because THAT `lstat` failed carries no type at
+    all — `chmod 0644` on a parent directory is enough to produce one (read
+    without execute lists the names but denies `fstatat` on the children). Pass
+    8 demonstrated a whole tracked subtree rendered as deletions on the back of
+    reading an unslashed record as a single file; see `_not_compared`, which is
+    where that assumption lived and where it was removed.
 
     `reason` is an errno name (`EACCES`, `EMFILE`, ...) or one of the tokens
     `RACED`, `OVERSIZE`, `BUDGET`, `XDEV`. Some reasons are STABLE properties of
@@ -902,24 +911,65 @@ def _not_compared(unreadable: tuple[Unreadable, ...], base: BaseTree) -> dict[st
     for the cost of 33 sparse files and zero seconds — is that failure in its
     purest form.
 
-    A DIRECTORY record covers its whole subtree. `Unreadable.path` carries a
-    trailing slash for a directory precisely so this distinction survives, and
-    an unreadable directory hides every base path beneath it — the same defect
-    one level up, and the reason this is a prefix test and not a set lookup.
-    The root is spelled `.` and blocks everything.
+    A DIRECTORY record covers its whole subtree — an unreadable directory hides
+    every base path beneath it, the same defect one level up, and the reason
+    this is a prefix test and not a set lookup. The root is spelled `.` and
+    blocks everything.
+
+    EVERY record is treated as covering its subtree, slash or no slash. This is
+    the pass-8 fix and the whole point of the loop below. The slash is set from
+    the `lstat` that classifies a child, so a refusal recorded because that
+    same `lstat` failed has no type information behind it and the walk defaults
+    it to "file" — the fail-OPEN default for this test. One
+    `chmod 0644` on a parent (read without execute: `listdir` succeeds,
+    `fstatat` on each child does not) produced `('outer/inner', 'EACCES')`, the
+    old `elif` matched nothing, and three untouched tracked files rendered as
+    `deleted file mode` with `git apply --check` rc=0 — while the file the
+    model had actually backdoored was reported as deleted rather than edited.
+
+    Why this is fixed HERE and not in `_visit`. At record time the walk
+    genuinely does not know the type, so any slash `_visit` invented would
+    assert something it never observed and would make `Unreadable.path`'s
+    contract a lie for every consumer. Here the BASE TREE supplies exactly the
+    missing fact: the `p.startswith(prefix)` branch fires only when a committed
+    path really does live beneath that name, which is proof the name is a
+    directory rather than a guess that it is. Fixing the query also covers
+    every producer of an unslashed record at once — a permission bit, a
+    descriptor limit, an entry that vanished mid-walk, or the attempt loop
+    running out — with no list of causes that can go stale.
+
+    It cannot over-block. Nothing beneath a path whose `lstat` failed can be in
+    `snap.entries`: the walk never obtained a descriptor to it, so it read
+    nothing there. Blocking the `path + "/"` prefix therefore cannot suppress a
+    comparison the walk actually made, and it errs only in the direction §6.5
+    calls harmless. Pinned by test, not asserted.
 
     Returns each blocked base path mapped to the reason to show for it, which
     for a subtree names the directory that actually failed rather than
     implying the file itself was tried.
+
+    When two records cover the same base path the MOST SPECIFIC one wins, and
+    that falls out of the iteration order rather than needing a second pass:
+    `TreeSnapshot.unreadable` is sorted, and a covering ancestor is a proper
+    string prefix of everything beneath it, so it is always visited first and
+    anything more precise overwrites it. Only a synthetic snapshot can put an
+    ancestor and a descendant in the same tuple — the walk cannot, since a path
+    it failed to `lstat` is a path it never descended into — but `unified_diff`
+    is public and its output should not depend on which of two records the
+    caller happened to list first.
     """
     blocked: dict[str, str] = {}
     for u in unreadable:
         if u.path == _ROOT:
             return dict.fromkeys(base.entries, f"{u.reason} on the worktree root")
-        if u.path.endswith("/"):
-            under = f"{u.reason} under {_quote_path(u.path, force=True)}"
-            blocked.update((p, under) for p in base.entries if p.startswith(u.path))
-        elif u.path in base.entries:
+        # A record already known to be a directory carries the slash; one whose
+        # type was never learned gets it added, so both cover the same subtree.
+        # The separator is never optional: without it `outer` would also cover
+        # `outerly.py`, suppressing a comparison the walk really did make.
+        prefix = u.path if u.path.endswith("/") else u.path + "/"
+        under = f"{u.reason} under {_quote_path(prefix, force=True)}"
+        blocked.update((p, under) for p in base.entries if p.startswith(prefix))
+        if u.path in base.entries:
             blocked[u.path] = u.reason
     return blocked
 
