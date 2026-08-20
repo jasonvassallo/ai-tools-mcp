@@ -1271,7 +1271,16 @@ class TranscriptIsBounded(_LoopCase):
         self.assertEqual(len(result.changed_files), L._RESULT_PATHS + 1)
         overflow = result.changed_files[-1]
         self.assertIn(f"and {n - L._RESULT_PATHS} more", overflow)
-        self.assertIn("spill file are complete", overflow)
+        # The marker used to read "the diff text and its spill file are
+        # complete". In THIS state there is no spill file at all — 1000 tiny
+        # files do not reach the 512 KB cap — so the old wording named an
+        # artifact that does not exist, and asserted completeness for a diff
+        # text that had been truncated in the states where one does. Both
+        # halves are now stated from the run's actual state (F-2 / H-3).
+        self.assertFalse(result.diff_truncated)
+        self.assertIsNone(result.diff_full_path)
+        self.assertIn("names every changed path", overflow)
+        self.assertNotIn("spill", overflow)
         # The kept entries are still real paths, in order, not a summary.
         self.assertEqual(result.changed_files[0], "f00000.py")
 

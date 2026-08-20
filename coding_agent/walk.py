@@ -745,24 +745,65 @@ _BUDGET_EXHAUSTED = (
     "coding_agent: of what is shown below.\n\n"
 )
 
-# The footer a TRUNCATED diff carries. Truncation is the sandbox's to trigger
-# — one `dd` of a file that sorts early buys 5000 bytes of `xxxx` ahead of
-# every other section — so a cap that drops the tail also drops the EXISTENCE
-# of every change after it. (Found by the brief's own size-cap test: `big.txt`
-# sorts before `blob.bin`, and a 1000-byte cap removed the binary annotation
-# entirely.) The cap therefore truncates DETAIL only: every changed path is
-# named after the marker, with its mode transition, whatever the cap did to
-# the hunks. Bounded for the same reason the unreadable block is, and appended
-# AFTER the slice so the cap cannot eat it either.
+# The footer a TRUNCATED diff carries, and the ORDER the body is rendered in.
+# Truncation is the sandbox's to trigger — one `dd` of a file that sorts early
+# buys 5000 bytes of `xxxx` ahead of every other section — so a cap that drops
+# the tail also drops the EXISTENCE of every change after it. (Found by the
+# brief's own size-cap test: `big.txt` sorts before `blob.bin`, and a
+# 1000-byte cap removed the binary annotation entirely.) Naming every changed
+# path after the marker was the pass-4 answer to that, and it was purely
+# POSITIONAL: the first `_CHANGED_SHOWN` entries of one sorted list.
+#
+# Pass 8 demonstrated what a positional bound leaves open. 600 files named
+# `!0000.txt`… (`!` sorts before every letter), 720 KB of ordinary writes,
+# pushed a BACKDOORED TRACKED FILE out of the body AND off the appended list:
+# reproduced here at the shipped constants, `src.py` appeared NOWHERE in the
+# 528,870 bytes of text a human reads, and nowhere in `changed_files` after
+# `loop._RESULT_PATHS` either. That is precisely the failure the old
+# `_CHANGED_HEAD` wording claimed to make impossible.
+#
+# The fix is a trust asymmetry, not a bigger number. A decoy is by
+# construction a NEW path, while the change a reviewer must not lose is to a
+# path the BASE TREE already holds — and the base tree is read from the
+# HOST's repository by `basetree.read_base_tree`, so the sandbox cannot author
+# an entry in it at any price. Base-tree paths are therefore rendered FIRST in
+# the body and listed FIRST below, and created paths fill only what is left
+# over. Creating files can then displace nothing but other created files.
+# Raising the caps instead closes nothing (there is no N the sandbox cannot
+# exceed) and reopens the memory DoS they exist to bound.
+#
+# What is left is stated rather than papered over: a run that changes more
+# than `_CHANGED_SHOWN` TRACKED paths overruns even the prioritised list, and
+# `_CHANGED_TRACKED_CUT` says so in the loudest terms this block has. That
+# residue is bounded by the size of the human's own repository, which is the
+# one quantity the sandbox has no way to inflate.
 _CHANGED_HEAD = (
-    "coding_agent: {n} file(s) changed in total; the list below is complete "
-    "to {shown},\ncoding_agent: so a truncated diff cannot hide THAT a path "
-    "changed:\n"
+    "coding_agent: {n} file(s) changed in total. Paths TRACKED IN THE BASE TREE\n"
+    "coding_agent: are listed first, so no number of files this run created can\n"
+    "coding_agent: push one out of the list below:\n"
+)
+_CHANGED_TRACKED_CUT = (
+    "coding_agent: WARNING: {n} TRACKED path(s) changed, more than the {shown} this\n"
+    "coding_agent: list can hold, so {cut} changed tracked path(s) are NOT named\n"
+    "coding_agent: below. Read the complete diff at {path} before approving this run.\n"
 )
 _CHANGED_MORE = (
-    "coding_agent:   ... and {n} more (complete list on DiffResult.changed_files)\n"
+    "coding_agent:   ... and {n} more not listed above ({tracked} tracked in the\n"
+    "coding_agent:   base tree, {created} created by this run); complete diff at {path}\n"
 )
 _CHANGED_SHOWN = 100
+
+# The line separating the two body groups, emitted only when there is
+# something on both sides of it. Prefixed prose, like `_NOT_COMPARED`: it is
+# not patch structure and `git apply` skips it (pinned by test). Without it a
+# reviewer would see file sections out of sorted order with nothing saying
+# why, and "why" is the part that tells them what truncation can still cost.
+_CREATED_BOUNDARY = (
+    "coding_agent: ---- every section above is a path the BASE TREE holds; every\n"
+    "coding_agent: ---- section below is a path this run CREATED. Tracked paths are\n"
+    "coding_agent: ---- rendered first so that no number of created files can push\n"
+    "coding_agent: ---- one of them past the size cap.\n\n"
+)
 
 # C-style escapes for a quoted path, the same set a quoted path uses upstream.
 _ESCAPES = {
@@ -885,14 +926,49 @@ def _transition(b: Entry | None, s: Entry | None) -> str:
     return f"{was} -> {now}"
 
 
-def _changed_block(summary: list[str]) -> str:
-    if not summary:
+def _changed_block(tracked: list[str], created: list[str], spill: str) -> str:
+    """The path list appended after the truncation marker, tracked side first.
+
+    `tracked` and `created` are the already-rendered summary lines for changed
+    paths the base tree does and does not hold. They are kept apart all the
+    way from `unified_diff`'s loop rather than re-derived here, because the
+    split IS the security property: the caller knows which side of the trust
+    boundary each path came from, and a re-derivation would have to trust a
+    string again.
+
+    Every claim this block makes has to survive the state it is made in, which
+    is why the head no longer says "complete to N". It says only what the
+    ordering guarantees — created files cannot displace a tracked path — and
+    when the tracked list itself overruns the cap, `_CHANGED_TRACKED_CUT`
+    states that plainly instead. A control whose own text asserts a guarantee
+    it does not provide is worse than one that stays quiet, because the reader
+    stops looking.
+    """
+    total = len(tracked) + len(created)
+    if not total:
         return ""
-    shown = summary[:_CHANGED_SHOWN]
-    out = [_CHANGED_HEAD.format(n=len(summary), shown=len(shown))]
-    out.extend(shown)
-    if len(shown) != len(summary):
-        out.append(_CHANGED_MORE.format(n=len(summary) - len(shown)))
+    shown_tracked = tracked[:_CHANGED_SHOWN]
+    shown_created = created[: _CHANGED_SHOWN - len(shown_tracked)]
+    cut_tracked = len(tracked) - len(shown_tracked)
+    cut_created = len(created) - len(shown_created)
+    out = [_CHANGED_HEAD.format(n=total)]
+    if cut_tracked:
+        out.append(
+            _CHANGED_TRACKED_CUT.format(
+                n=len(tracked), shown=len(shown_tracked), cut=cut_tracked, path=spill
+            )
+        )
+    out.extend(shown_tracked)
+    out.extend(shown_created)
+    if cut_tracked or cut_created:
+        out.append(
+            _CHANGED_MORE.format(
+                n=cut_tracked + cut_created,
+                tracked=cut_tracked,
+                created=cut_created,
+                path=spill,
+            )
+        )
     return "".join(out)
 
 
@@ -1035,9 +1111,12 @@ def unified_diff(
     - binary content is ANNOTATED with its sizes, never embedded, so one
       `dd`-written blob cannot flood the reviewer's context;
     - the text is capped, with the untruncated diff spilled to a file, because
-      the length of the diff is the sandbox's to choose — and a truncated diff
-      still names every changed path, so the cap can cost the reviewer the
-      DETAIL of a change but never the knowledge that one happened;
+      the length of the diff is the sandbox's to choose — and BOTH the body
+      and the appended path list put base-tree paths ahead of paths this run
+      created, so no number of created files can push a changed tracked path
+      out of either (600 decoy files hid a backdoored tracked file completely
+      before that ordering landed). Where even the tracked side overruns the
+      cap the text says so, rather than claiming a completeness it lost;
     - paths the walk could not read are stated FIRST, so the cap cannot cut
       the warning off;
     - a base path the walk REFUSED to read is never rendered as a deletion —
@@ -1054,11 +1133,21 @@ def unified_diff(
     """
     blocked = _not_compared(snap.unreadable, base)
     paths = sorted(set(base.entries) | set(snap.entries))
-    body: list[str] = []
-    changed: list[str] = []
-    summary: list[str] = []
+    # Two bodies, not one, and the split is `b is not None` — the same test
+    # that already decides deletion-vs-creation, so it introduces no new
+    # notion of "tracked" that could drift from the one the diff renders.
+    # Every `NOT COMPARED` line lands in the first group by construction
+    # (`_not_compared` only ever returns base paths), which is also the answer
+    # to a known weakness of that marker: it lives in the body, so truncation
+    # could cut it, and the body now starts with the group it is in.
+    tracked_body: list[str] = []
+    created_body: list[str] = []
+    changed: list[str] = []  # stays sorted: `paths` is sorted and this is one pass
+    sum_tracked: list[str] = []
+    sum_created: list[str] = []
     for p in paths:
         b, s = base.entries.get(p), snap.entries.get(p)
+        body = tracked_body if b is not None else created_body
         if p in blocked:
             # NOT `changed`: a path nobody could read did not necessarily
             # change, and `changed_files` is a positive assertion consumed by
@@ -1073,7 +1162,7 @@ def unified_diff(
         if b is not None and s is not None and b.mode == s.mode and b.data == s.data:
             continue
         changed.append(p)
-        summary.append(
+        (sum_tracked if b is not None else sum_created).append(
             f"coding_agent:   {_quote_path(p, force=True)} ({_transition(b, s)})\n"
         )
         left, right = _quote_path("a/" + p), _quote_path("b/" + p)
@@ -1092,7 +1181,11 @@ def unified_diff(
             ),
             body,
         )
-    joined = "".join(body)
+    # The boundary is emitted only with something on both sides of it, so a
+    # diff with no base tree (or no created paths) is byte-identical to what
+    # it was before the ordering landed.
+    boundary = _CREATED_BOUNDARY if tracked_body and created_body else ""
+    joined = "".join(tracked_body) + boundary + "".join(created_body)
     in_base = frozenset(blocked)
     preamble = _budget_block(snap.unreadable) + _unreadable_block(
         snap.unreadable, _UNREADABLE_SHOWN, in_base
@@ -1117,7 +1210,7 @@ def unified_diff(
                 "utf-8", "ignore"
             )
             + _TRUNC.format(path=full_path)
-            + _changed_block(summary)
+            + _changed_block(sum_tracked, sum_created, full_path)
         )
         truncated = True
     return DiffResult(
