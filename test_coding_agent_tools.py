@@ -11,7 +11,15 @@ which is in `test_coding_agent_sandbox.py`.
 
 No docker and no git are needed by anything in this file.
 
-Run:  uv run --with pytest --with pathspec pytest test_coding_agent_tools.py -q
+Run:  uv run --with pytest --with pytest-timeout --with pathspec pytest test_coding_agent_tools.py -q
+
+`pytest-timeout` bounds the one test below whose regression signal is a HUNG
+process rather than a red assertion (`test_a_fifo_reports_an_error_and_does_not_hang`,
+which pins `_READ_FLAGS`'s `O_NONBLOCK`). It is requested here, not required:
+absent the plugin, `@pytest.mark.timeout(...)` is an unknown mark pytest warns
+about and ignores, and every test still runs — it just loses the backstop
+against that one hang. See `conftest.py` for the marker registration that
+silences the warning either way.
 """
 
 from __future__ import annotations
@@ -29,6 +37,8 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import pytest
 
 from coding_agent.tools import (
     MAX_DEPTH,
@@ -315,7 +325,18 @@ class ReadFileNeverLeavesTheTree(_Tree):
         self.assertIn("error:", out)
         self.assertNotIn("secret-but-in-tree", out)
 
+    @pytest.mark.timeout(20)
     def test_a_fifo_reports_an_error_and_does_not_hang(self) -> None:
+        """Regression signal, be warned: `tool_read_file` opens FIRST and
+        classifies from the open descriptor's `fstat` AFTER — unlike the
+        walk, there is no pre-open `lstat` to skip a FIFO before it is ever
+        opened. `_READ_FLAGS`'s `O_NONBLOCK` is the ONLY thing standing
+        between this open and a block with no writer ever attached, so the
+        `assertLess` below is dead code the instant that flag regresses: the
+        call blocks inside `os.open`, before this test reaches ANY assertion.
+        `@pytest.mark.timeout` is what turns that into a red failure naming
+        this test instead of a hung CI job with no useful output.
+        """
         os.mkfifo(self.root / "pipe")
         started = time.monotonic()
         out = tool_read_file(str(self.root), "pipe")

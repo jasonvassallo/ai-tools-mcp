@@ -5,7 +5,13 @@ The basetree cases DO run git, but only ever as `git -C <repo>` against a
 throwaway repository the test itself created — never with a worktree as cwd
 or gitdir (spec §6.5).
 
-Run:  uv run --with pytest --with pathspec pytest test_coding_agent_walk.py -q
+Run:  uv run --with pytest --with pytest-timeout --with pathspec pytest test_coding_agent_walk.py -q
+
+`pytest-timeout` bounds the two FIFO-touching tests below as a defence-in-depth
+backstop (see their docstrings). Requested, not required: absent the plugin,
+`@pytest.mark.timeout(...)` is an unknown mark pytest warns about and ignores,
+and every test still runs. See `conftest.py` for the marker registration that
+silences that warning either way.
 """
 
 from __future__ import annotations
@@ -17,6 +23,8 @@ import tempfile
 import unittest
 import unittest.mock
 from pathlib import Path
+
+import pytest
 
 from coding_agent.basetree import make_ignore, read_base_tree
 from coding_agent.walk import snapshot_tree, tree_hash, unified_diff
@@ -56,10 +64,18 @@ class SnapshotBasics(unittest.TestCase):
         self.assertEqual(snap.unreadable, ())
         self.assertEqual(sorted(snap.entries), ["a.py", "sub/b.txt"])
 
+    @pytest.mark.timeout(15)
     def test_special_files_are_skipped_without_being_called_unreadable(self):
         """A FIFO/socket/device is DELIBERATELY not in the diff (spec §6.5) —
         it is not a regular file and there is nothing to show. Reporting it as
-        unreadable would say "a change is hidden here" when none is."""
+        unreadable would say "a change is hidden here" when none is.
+
+        Doubly guarded today (classification skip in `_visit`, plus
+        `O_NONBLOCK` in `_FILE_FLAGS` if that skip is ever bypassed) — see
+        `test_coding_agent_security.py::test_special_files_are_skipped_not_read`
+        for the same reasoning. The timeout is a backstop against both guards
+        regressing together, not a claim that either alone is presently weak.
+        """
         os.mkfifo(self.root / "trap.fifo")
         snap = snapshot_tree(str(self.root), lambda p: False)
         self.assertNotIn("trap.fifo", snap.entries)
@@ -82,7 +98,14 @@ class DescriptorHygiene(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
 
+    @pytest.mark.timeout(20)
     def test_repeated_walks_leak_no_descriptors(self):
+        """Includes a `trap.fifo` among the 50 repeated walks below (same
+        double-guarded shape as `test_special_files_are_skipped_without_
+        being_called_unreadable` above) — bounded for the same reason: a
+        classification-skip AND `O_NONBLOCK` regressing together would hang
+        this on walk 1 of 50, not merely leak a descriptor.
+        """
         (self.root / "a.py").write_text("x = 1\n")
         (self.root / "sub").mkdir()
         (self.root / "sub" / "b.txt").write_text("hi\n")

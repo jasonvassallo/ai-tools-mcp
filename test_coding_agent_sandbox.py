@@ -4,7 +4,17 @@
 The git-only classes MUST pass everywhere. The docker classes skip when no
 daemon answers, so this file is still meaningful on a machine without Docker.
 
-Run:  uv run --with pytest --with pathspec pytest test_coding_agent_sandbox.py -q
+Run:  uv run --with pytest --with pytest-timeout --with pathspec pytest test_coding_agent_sandbox.py -q
+
+`--with pytest-timeout` is requested for parity with the rest of the suite's
+`Run:` lines (see test_coding_agent_security.py and test_coding_agent_tools.py
+for the tests it actually bounds), not because anything in this file relies on
+it — every `exec_in_container`/`asyncio.wait_for` call below already carries
+its own explicit `timeout_s`/deadline, deliberately (see
+`ShieldedCleanupSurvivesCancellation`). It is optional here too: without the
+plugin this file runs exactly as before. A slow-but-healthy real-docker test
+is intentionally NOT marked, so it can never be killed spuriously by a
+per-test bound sized for the git-only classes.
 """
 
 from __future__ import annotations
