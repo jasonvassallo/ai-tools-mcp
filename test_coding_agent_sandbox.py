@@ -383,6 +383,11 @@ class TeardownSurvivesHostileFilesystemStates(unittest.TestCase):
         shutil.rmtree(self.scratch, ignore_errors=True)
         shutil.rmtree(self.repo, ignore_errors=True)
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses the mode-000 directory check that plain rmtree relies "
+        "on failing, so the leak this fixture demonstrates cannot occur",
+    )
     def test_MECHANISM_a_plain_rmtree_leaks_a_mode_000_directory(self) -> None:
         """`chmod 000 somedir` inside the sandbox is enough to defeat a plain
         `rm -rf`, which would leak the entire worktree — including whatever
@@ -394,6 +399,12 @@ class TeardownSurvivesHostileFilesystemStates(unittest.TestCase):
         shutil.rmtree(victim, ignore_errors=True)
         self.assertTrue(victim.exists(), "rmtree coped; this fixture proves nothing")
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses the mode-000 directory check, so teardown succeeds "
+        "trivially without exercising the _chmod_tree_open recovery path "
+        "this test exists to pin",
+    )
     def test_teardown_removes_a_worktree_with_a_mode_000_directory(self) -> None:
         wt = create_worktree(str(self.repo), "HEAD")
         self.strays.append(wt)

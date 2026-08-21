@@ -187,6 +187,12 @@ class UntypableDirectoryDoesNotFabricateDeletions(_RealRepo):
     survives into the FINAL diff a human reviews.
     """
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses directory read/exec checks; a read-without-execute "
+        "directory stays fully traversable, so the untypable precondition "
+        "this fixture builds cannot occur",
+    )
     def test_a_read_without_execute_directory_deletes_nothing(self):
         """The headline defect, over every mode that reaches it.
 
@@ -219,6 +225,11 @@ class UntypableDirectoryDoesNotFabricateDeletions(_RealRepo):
                 # The readable sibling is untouched and correctly still read.
                 self.assertIn("top.py", snap.entries)
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses directory read/exec checks; the untypable precondition "
+        "cannot occur",
+    )
     def test_the_emitted_patch_cannot_delete_the_hidden_subtree(self):
         """The only honest test of "would it really delete them": ask git.
 
@@ -240,6 +251,11 @@ class UntypableDirectoryDoesNotFabricateDeletions(_RealRepo):
         for name in ("a", "b", "c"):
             self.assertNotIn(f"outer/inner/{name}.py", numstat)
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses directory read/exec checks; the untypable precondition "
+        "cannot occur",
+    )
     def test_the_backdoored_file_is_not_reported_as_deleted(self):
         """The consequence that matters, stated in its own right.
 
@@ -272,6 +288,11 @@ class UntypableDirectoryDoesNotFabricateDeletions(_RealRepo):
         self.assertEqual(len(marker), 1, d.text)
         self.assertIn("EACCES", marker[0])
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses directory read/exec checks; the unreadable record this "
+        "test pins never gets created",
+    )
     def test_the_hidden_subtree_stays_conspicuous(self):
         """Suppressing the deletion is only safe while the human is still told.
 
@@ -319,6 +340,11 @@ class UntypableDirectoryDoesNotFabricateDeletions(_RealRepo):
                 self.assertEqual(rc, 0, numstat)
                 self.assertIn("outer/inner/a.py", numstat)
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root reads a mode-000 directory anyway; the unreadable record this "
+        "control pins never gets created",
+    )
     def test_the_chmod_000_branch_is_unchanged(self):
         """CONTROL for the branch that already worked.
 
@@ -338,6 +364,11 @@ class UntypableDirectoryDoesNotFabricateDeletions(_RealRepo):
         self.assertEqual(d.changed_files, [])
         self.assertIn('EACCES under "outer/"', d.text)
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses directory read/exec checks; the untypable precondition "
+        "cannot occur",
+    )
     def test_nothing_under_an_untypable_record_was_ever_read(self):
         """PREMISE PIN, not a fix pin — it passes with or without the fix.
 
@@ -369,6 +400,11 @@ class UnreadableRootDoesNotFabricateDeletions(_RealRepo):
     whose records carry no slash and cover base paths beneath them.
     """
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses directory read/exec checks; the untypable precondition "
+        "cannot occur",
+    )
     def test_an_unreadable_root_deletes_nothing(self):
         (self.repo / "README.md").write_text("# hi\n")
         (self.repo / "src" / "deep").mkdir(parents=True)
@@ -391,7 +427,12 @@ class UnreadableRootDoesNotFabricateDeletions(_RealRepo):
         # All four tracked paths accounted for: one by exact match, three by
         # the two subtree prefixes.
         self.assertEqual(d.text.count("NOT COMPARED"), 4)
-        for path in ("README.md", "src/app.py", "src/deep/core.py", "tests/test_app.py"):
+        for path in (
+            "README.md",
+            "src/app.py",
+            "src/deep/core.py",
+            "tests/test_app.py",
+        ):
             self.assertIn(path, d.text)
         # The exact hit names the file itself; the covered ones name the
         # directory that failed. The second pass in `_not_compared` is what
@@ -405,6 +446,11 @@ class UnreadableRootDoesNotFabricateDeletions(_RealRepo):
         self.assertIn("(EACCES)", readme[0])
         self.assertNotIn("under", readme[0])
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses directory read/exec checks; a chmod 0444 root stays "
+        "fully traversable",
+    )
     def test_the_root_patch_cannot_delete_anything(self):
         (self.repo / "keep.py").write_text("k = 1\n")
         (self.repo / "src").mkdir()
@@ -430,6 +476,11 @@ class GenuineDeletionsSurvive(_RealRepo):
     fixture that never contained one.
     """
 
+    @unittest.skipIf(
+        os.geteuid() == 0,
+        "root bypasses directory read/exec checks; the untypable precondition "
+        "cannot occur",
+    )
     def test_a_real_deletion_still_renders_and_applies(self):
         (self.repo / "outer" / "inner").mkdir(parents=True)
         (self.repo / "outer" / "inner" / "hidden.py").write_text("h = 1\n")
