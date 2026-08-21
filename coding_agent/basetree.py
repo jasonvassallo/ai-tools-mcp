@@ -31,6 +31,12 @@ from .walk import Entry
 # sees in the review diff.
 _GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"}
 
+# A local object-store read should never take this long. Without a bound a
+# stalled git (held index.lock, a network filesystem gone away) hangs the
+# run before the turn loop's budget can apply to anything — sandbox.py's
+# `_git` carries the same bound for the same reason.
+_GIT_TIMEOUT_S = 120.0
+
 # `ls-tree -r` yields blobs (100644/100755 regular, 120000 symlink) and
 # 160000 gitlinks. A gitlink's sha names a COMMIT, so it must be filtered
 # out BEFORE `cat-file blob` is asked for it, or reading the base tree of
@@ -57,7 +63,11 @@ class BaseTree:
 
 def _git(repo: str, *args: str) -> bytes:
     return subprocess.run(
-        ["git", "-C", repo, *args], check=True, capture_output=True, env={**_GIT_ENV}
+        ["git", "-C", repo, *args],
+        check=True,
+        capture_output=True,
+        env={**_GIT_ENV},
+        timeout=_GIT_TIMEOUT_S,
     ).stdout
 
 
@@ -114,7 +124,7 @@ def _repo_local_excludes(repo: str) -> list[tuple[str, str]]:
         path = os.path.join(repo, rel.decode("utf-8", "surrogateescape").strip())
         with open(path, encoding="utf-8", errors="replace") as fh:
             return [("", fh.read())]
-    except (subprocess.CalledProcessError, OSError):
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
         return []
 
 

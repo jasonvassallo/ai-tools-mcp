@@ -67,6 +67,11 @@ _DESTROY_TIMEOUT_S = 30.0
 _KILL_GRACE_S = 5.0
 _START_TIMEOUT_S = 60.0
 _REAP_TIMEOUT_S = 10.0
+# A local git operation should never take this long. Without a bound, a
+# stalled git (held index.lock, a network filesystem gone away) hangs
+# create_worktree/teardown_worktree forever — every OTHER subprocess in this
+# module already carries an explicit timeout; this was the one that didn't.
+_GIT_TIMEOUT_S = 120.0
 
 # Every container this module starts carries this label, valued with a
 # per-call run_id. Its only reader is `_reap_labelled`: a container id is
@@ -150,6 +155,7 @@ def _git(repo: str, *args: str, check: bool = True) -> subprocess.CompletedProce
         capture_output=True,
         text=True,
         env={**_GIT_ENV},
+        timeout=_GIT_TIMEOUT_S,
     )
 
 
@@ -160,6 +166,13 @@ def _git_quiet(repo: str, *args: str) -> subprocess.CompletedProcess[str]:
     except OSError as exc:  # git missing, fork failure, ...
         return subprocess.CompletedProcess(
             args=["git", "-C", repo, *args], returncode=127, stdout="", stderr=str(exc)
+        )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(
+            args=["git", "-C", repo, *args],
+            returncode=124,
+            stdout="",
+            stderr=f"timed out after {_GIT_TIMEOUT_S:g}s: {exc}",
         )
 
 
@@ -191,6 +204,11 @@ def create_worktree(repo: str, base_ref: str) -> str:
         shutil.rmtree(parent, ignore_errors=True)
         raise RuntimeError(
             f"coding_agent: git worktree add failed: {exc.stderr.strip()}"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        shutil.rmtree(parent, ignore_errors=True)
+        raise RuntimeError(
+            f"coding_agent: git worktree add did not return within {_GIT_TIMEOUT_S:g}s"
         ) from exc
     except OSError as exc:
         shutil.rmtree(parent, ignore_errors=True)
