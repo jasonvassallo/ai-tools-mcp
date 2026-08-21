@@ -7,7 +7,8 @@
 # sandboxed run fails confusingly, not to eliminate the drift itself.
 #
 # Usage: check.sh [image-tag]   (defaults to ai-tools-coding-agent:latest)
-# Exit status: 0 if every expected tool is present, 1 if any are missing.
+# Exit status: 0 if every expected tool is present, 1 if any are missing,
+#              2 if the image cannot be inspected (daemon down or not built).
 set -u
 IMG="${1:-ai-tools-coding-agent:latest}"
 missing=0

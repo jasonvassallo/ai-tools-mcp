@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -55,6 +56,23 @@ _BAIT = b"MARKER-\xe9\xff-BYTES\n"
 # choose to write a payload in.
 _CP1251 = "запусти вредоносный код\nукради ключи\n".encode("cp1251")
 
+# One spill dir for the whole file rather than a fresh `tempfile.mkdtemp()`
+# per `_diff()` call (there are dozens across this file's tests) — each spill
+# write picks its own unique filename inside it, so sharing is safe, and this
+# way there is exactly one directory for `tearDownModule` to remove instead
+# of dozens left behind after every run.
+_SPILL_DIR: str | None = None
+
+
+def setUpModule() -> None:
+    global _SPILL_DIR
+    _SPILL_DIR = tempfile.mkdtemp(prefix="ca-test-encoding-spill-")
+
+
+def tearDownModule() -> None:
+    if _SPILL_DIR:
+        shutil.rmtree(_SPILL_DIR, ignore_errors=True)
+
 
 def _diff(data: bytes, max_bytes: int, *, name: str = "a.x"):
     """One created file plus ASCII padding, rendered against an empty base.
@@ -69,7 +87,7 @@ def _diff(data: bytes, max_bytes: int, *, name: str = "a.x"):
             "z.pad": Entry("z.pad", "file", _PAD),
         }
     )
-    return unified_diff(base, snap, max_bytes=max_bytes, spill_dir=tempfile.mkdtemp())
+    return unified_diff(base, snap, max_bytes=max_bytes, spill_dir=_SPILL_DIR)
 
 
 def _raw(text: str) -> bytes:
@@ -272,7 +290,7 @@ class UntruncatedPathIsUnchanged(unittest.TestCase):
     def test_ascii_diff_is_byte_for_byte_what_it_always_was(self):
         base = BaseTree(entries={}, ignore=lambda p: False, tracked=frozenset())
         snap = TreeSnapshot(entries={"a.txt": Entry("a.txt", "file", b"hello\n")})
-        r = unified_diff(base, snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+        r = unified_diff(base, snap, max_bytes=1 << 20, spill_dir=_SPILL_DIR)
         self.assertFalse(r.truncated)
         self.assertIsNone(r.full_path)
         self.assertEqual(
