@@ -3038,6 +3038,15 @@ class TestModelAllowlistOverride(unittest.TestCase):
                 mcp_server._OLLAMA_BUILTIN_DELEGATE_MODELS,
             )
 
+    def test_builtin_allowlist_reflects_installed_fleet(self):
+        models = mcp_server._OLLAMA_BUILTIN_DELEGATE_MODELS
+        self.assertIn("gemma4:12b-nvfp4", models)
+        self.assertIn("gemma4:31b-nvfp4", models)
+        self.assertIn("qwen3.8:27b-nvfp4", models)
+        for m in models:
+            self.assertNotIn("qwen3.6", m, f"retired tag still allowlisted: {m}")
+        self.assertEqual(models[0], "gemma4:12b-nvfp4")  # default preserved
+
 
 # ─── Durable queue client (v1.6) ──────────────────────────────────────
 
