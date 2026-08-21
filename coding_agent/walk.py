@@ -1116,7 +1116,11 @@ def unified_diff(
       created, so no number of created files can push a changed tracked path
       out of either (600 decoy files hid a backdoored tracked file completely
       before that ordering landed). Where even the tracked side overruns the
-      cap the text says so, rather than claiming a completeness it lost;
+      cap the text says so, rather than claiming a completeness it lost. The
+      cap is a BYTE PREFIX taken with the same `surrogateescape` handler the
+      spill file is written with, so content in a non-UTF-8 encoding survives
+      truncation as escaped bytes instead of disappearing into blank-looking
+      lines the way an `"ignore"` decode left it;
     - paths the walk could not read are stated FIRST, so the cap cannot cut
       the warning off;
     - a base path the walk REFUSED to read is never rendered as a deletion —
@@ -1193,7 +1197,10 @@ def unified_diff(
     text = preamble + joined
     full_path: str | None = None
     truncated = False
-    if len(text.encode("utf-8", "surrogateescape")) > max_bytes:
+    # Encoded ONCE: the same bytes decide whether the cap is overrun and, if
+    # it is, which prefix survives.
+    raw = text.encode("utf-8", "surrogateescape")
+    if len(raw) > max_bytes:
         fd, full_path = tempfile.mkstemp(
             prefix="coding-agent-diff-", suffix=".patch", dir=spill_dir
         )
@@ -1205,10 +1212,34 @@ def unified_diff(
                 + _unreadable_block(snap.unreadable, None, in_base)
                 + joined
             )
+        # `surrogateescape` on BOTH sides, so truncation is a byte PREFIX of
+        # the diff and nothing else — it changes how much a reviewer sees,
+        # never how any of it is spelled. The decode was `"ignore"`, which
+        # dropped every surrogate-escaped byte in the whole kept prefix rather
+        # than only at the cut, so file content in any non-UTF-8 encoding
+        # vanished from the artifact the human acts on: a file of CP1251
+        # source rendered as `+  ` and `+ ` under a hunk header still claiming
+        # two added lines. "Blank" reads as "there was nothing here"; the
+        # truth was "the bytes were removed". The sandbox chooses both the
+        # content's encoding and the diff's length, so it chooses whether this
+        # branch runs. It also silently undid `mcp_server._surrogate_safe`,
+        # which exists so an invalid byte "stays IN the review" as a visible
+        # `\xe9` — that guard ran on a string these bytes had already been
+        # deleted from, the recurring shape in this build where a later safety
+        # assumed a property an earlier layer had removed.
+        #
+        # The cut can land INSIDE a multi-byte character, and this handler is
+        # what makes that safe: every byte of a UTF-8 multi-byte sequence is
+        # >= 0x80, so a partial tail decodes to lone surrogates in the
+        # U+DC80-U+DCFF range `surrogateescape` owns, re-encodes to exactly
+        # those bytes, and reaches the human as `\xe4\xb8` via `_surrogate_safe`.
+        # It cannot raise, and it cannot eat the valid content before the cut.
+        # Backing the slice off to a character boundary was the other option
+        # and is rejected: it DROPS bytes, which is the under-showing
+        # direction §6.5 rules out, and it cannot tell a partial sequence from
+        # a genuinely invalid byte that happens to sit last.
         text = (
-            text.encode("utf-8", "surrogateescape")[:max_bytes].decode(
-                "utf-8", "ignore"
-            )
+            raw[:max_bytes].decode("utf-8", "surrogateescape")
             + _TRUNC.format(path=full_path)
             + _changed_block(sum_tracked, sum_created, full_path)
         )
