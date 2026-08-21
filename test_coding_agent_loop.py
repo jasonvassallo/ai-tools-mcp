@@ -1254,6 +1254,43 @@ class TranscriptIsBounded(_LoopCase):
         self.assertEqual(L._trim_conversation(messages), 0)
         self.assertEqual(len(messages[1]["content"]), 50_000)
 
+    def test_a_large_tool_call_argument_counts_toward_the_bound_and_gets_elided(self):
+        """The original ceiling analysis (`_MAX_CONVERSATION_CHARS`'s own
+        comment) sized the bound off tool RESULTS only. A `write_file` call
+        embeds its whole `content` argument as JSON in the assistant
+        message's `tool_calls`, which `content` never carries — so a model
+        that writes large files could grow the payload past the bound
+        without `_trim_conversation` ever noticing, let alone shrinking it."""
+        big_arg = "X" * (L._MAX_CONVERSATION_CHARS + 5000)
+        messages = [
+            {"role": "system", "content": "S"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": big_arg},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "recent"},
+        ]
+
+        elided = L._trim_conversation(messages)
+
+        self.assertEqual(elided, 1)
+        self.assertEqual(messages[1]["role"], "assistant")
+        self.assertEqual(len(messages[1]["tool_calls"]), 1)  # call itself intact
+        call = messages[1]["tool_calls"][0]
+        self.assertEqual(call["id"], "call_1")  # id/type/name untouched
+        self.assertEqual(call["function"]["name"], "write_file")
+        shrunk = call["function"]["arguments"]
+        self.assertLess(len(shrunk), len(big_arg))
+        self.assertIn("chars elided", shrunk)
+        self.assertEqual(messages[2]["content"], "recent")  # newest untouched
+
     def test_changed_files_and_unreadable_are_bounded_with_an_exact_count(self):
         """SF-3 / NF-4. Every other model-controlled field was bounded; these
         two were carried verbatim, and both are as long as the sandbox likes.

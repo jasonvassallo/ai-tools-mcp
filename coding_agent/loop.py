@@ -386,39 +386,82 @@ async def _teardown(
         _remove_worktree(ops, repo, worktree, out)
 
 
-def _trim_conversation(messages: list[dict[str, Any]]) -> int:
-    """Bound the in-flight conversation by shrinking the OLDEST tool results.
+def _tool_call_arg_chars(m: dict[str, Any]) -> int:
+    """Bytes an assistant message's `tool_calls` arguments add to the
+    payload — the request-side counterpart to `content`, which the original
+    ceiling analysis above missed: a single `write_file` call embeds its
+    whole `content` argument as a JSON string here, so a model that writes a
+    large file grows the conversation exactly like a large tool RESULT does,
+    through a field `_trim_conversation` used to never look at."""
+    calls = m.get("tool_calls")
+    if not isinstance(calls, list):
+        return 0
+    total = 0
+    for call in calls:
+        function = call.get("function") if isinstance(call, dict) else None
+        if isinstance(function, dict):
+            total += len(str(function.get("arguments") or ""))
+    return total
 
-    Returns the number of messages it elided.
+
+def _trim_conversation(messages: list[dict[str, Any]]) -> int:
+    """Bound the in-flight conversation by shrinking oversized tool results
+    and `tool_calls` arguments, oldest message first regardless of which
+    kind it is.
+
+    Returns the number of fields it elided.
 
     Shrinking content in place rather than dropping whole messages is
     deliberate: the assistant/tool message pairing is protocol, and evicting
     one side of a `tool_calls` pair is how a "memory fix" turns into a model
     backend rejecting the payload. This changes only bytes — never the message
-    count, the roles, or the `tool_calls` structure.
+    count, the roles, or the `tool_calls` array's shape (id/type/name/call
+    count are untouched; only an oversized `arguments` string is cut).
 
     Oldest first, because the recent turns are the ones the model is actually
     reasoning about; the early ones have already done their work.
     """
-    total = sum(len(str(m.get("content") or "")) for m in messages)
+    total = sum(
+        len(str(m.get("content") or "")) + _tool_call_arg_chars(m) for m in messages
+    )
     if total <= _MAX_CONVERSATION_CHARS:
         return 0
     elided = 0
     for m in messages:
         if total <= _MAX_CONVERSATION_CHARS:
             break
-        if m.get("role") != "tool":
-            continue  # never touch the system prompt, the task, or a tool_calls turn
-        content = str(m.get("content") or "")
-        if len(content) <= _ELIDED_TOOL_CHARS:
-            continue
-        cut = content[:_ELIDED_TOOL_CHARS] + (
-            f"\n[... {len(content) - _ELIDED_TOOL_CHARS} chars elided from an "
-            f"earlier tool result to bound this conversation ...]"
-        )
-        total -= len(content) - len(cut)
-        m["content"] = cut
-        elided += 1
+        role = m.get("role")
+        if role == "tool":
+            content = str(m.get("content") or "")
+            if len(content) <= _ELIDED_TOOL_CHARS:
+                continue
+            cut = content[:_ELIDED_TOOL_CHARS] + (
+                f"\n[... {len(content) - _ELIDED_TOOL_CHARS} chars elided from an "
+                f"earlier tool result to bound this conversation ...]"
+            )
+            total -= len(content) - len(cut)
+            m["content"] = cut
+            elided += 1
+        elif role == "assistant":
+            calls = m.get("tool_calls")
+            if not isinstance(calls, list):
+                continue  # the system prompt, the task, or a plain reply turn
+            for call in calls:
+                if total <= _MAX_CONVERSATION_CHARS:
+                    break
+                function = call.get("function") if isinstance(call, dict) else None
+                if not isinstance(function, dict):
+                    continue
+                args = str(function.get("arguments") or "")
+                if len(args) <= _ELIDED_TOOL_CHARS:
+                    continue
+                cut = args[:_ELIDED_TOOL_CHARS] + (
+                    f"...[{len(args) - _ELIDED_TOOL_CHARS} chars elided from an "
+                    f"earlier tool call to bound this conversation]"
+                )
+                total -= len(args) - len(cut)
+                function["arguments"] = cut
+                elided += 1
     return elided
 
 
