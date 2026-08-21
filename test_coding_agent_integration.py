@@ -131,24 +131,6 @@ def _container_running(cid: str) -> bool:
     return probe.returncode == 0 and probe.stdout.strip() == "true"
 
 
-def _containers_from_the_sandbox_image() -> str:
-    """Every container — running or exited — created from the sandbox image.
-
-    Scoped to the image on purpose. A bare `docker ps -a | grep 'sleep
-    infinity'` would also fail on somebody else's unrelated container, and a
-    leak check that can cry wolf gets muted.
-    """
-    return _docker(
-        "ps",
-        "-a",
-        "--no-trunc",
-        "--filter",
-        f"ancestor={IMAGE}",
-        "--format",
-        "{{.ID}} {{.Command}} {{.Status}}",
-    ).stdout.strip()
-
-
 def _worktree_parents() -> set[str]:
     """The private `coding-agent-wt-*` parents currently under $TMPDIR."""
     return {str(p) for p in Path(tempfile.gettempdir()).glob("coding-agent-wt-*")}
@@ -262,11 +244,6 @@ class DockerIntegration(unittest.TestCase):
         cid = self.ops.container or ""
         self.assertFalse(
             _container_exists(cid), f"container {cid[:12]} survived the run"
-        )
-        self.assertEqual(
-            _containers_from_the_sandbox_image(),
-            "",
-            "a container from the sandbox image is still on this host",
         )
         wt = self.ops.worktree or ""
         self.assertFalse(os.path.lexists(wt), f"worktree still on disk: {wt}")

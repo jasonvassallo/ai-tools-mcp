@@ -669,7 +669,7 @@ class BackgroundJobs(_McpCase):
         async def done():
             return _result()
 
-        job_id = os.urandom(16).hex
+        job_id = os.urandom(16).hex()
         task = loop.create_task(done())
         mcp_server._coding_jobs[job_id] = {"task": task, "started": started}
         return job_id

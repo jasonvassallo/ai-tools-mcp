@@ -134,7 +134,8 @@ _ENOMEM = "ENOMEM"  # the host ran out of memory listing this directory
 # these enter `tree_hash`; see its docstring for the measurement that settled
 # it. Exactly the reasons `_refuse` marks terminal, plus the caps.
 _STABLE_REASONS = frozenset(
-    {errno.errorcode[code] for code in _PERMANENT_ERRNOS} | {_OVERSIZE, _BUDGET, _XDEV}
+    {errno.errorcode[code] for code in _PERMANENT_ERRNOS}
+    | {_OVERSIZE, _BUDGET, _XDEV, _ENOMEM}
 )
 
 # The three modes a git tree can hold for something this walk records. git

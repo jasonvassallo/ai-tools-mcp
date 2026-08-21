@@ -12,6 +12,15 @@ set -u
 IMG="${1:-ai-tools-coding-agent:latest}"
 missing=0
 
+# Without this, a down daemon or a never-built image makes every tool below
+# report MISSING (the `docker run` itself fails, so `command -v` never runs)
+# -- indistinguishable from an image that's actually missing a tool.
+if ! docker image inspect "$IMG" >/dev/null 2>&1; then
+    echo "cannot inspect $IMG: is the daemon running and the image built?" >&2
+    echo "  build it with scripts/coding-agent-image/build.sh" >&2
+    exit 2
+fi
+
 for t in git python3 uv pytest ruff mypy node npm shellcheck; do
     result=$(docker run --rm --network=none "$IMG" sh -c "
         if command -v '$t' >/dev/null 2>&1; then

@@ -65,6 +65,7 @@ _WT_PREFIX = "coding-agent-wt-"
 
 _DESTROY_TIMEOUT_S = 30.0
 _KILL_GRACE_S = 5.0
+_START_TIMEOUT_S = 60.0
 
 # `sh -c SCRIPT name a b` sets $0=name, $1=a, $2=b. The model's command is
 # passed as its own argv element and is never interpolated into the script
@@ -281,12 +282,27 @@ def _docker_run_argv(
 async def start_container(
     worktree: str, image: str, *, cpus: str, memory: str, pids: int
 ) -> str:
+    """Bounded by `_START_TIMEOUT_S`, like every other await in this module
+    (§ file docstring intent: nothing here can hang the event loop
+    indefinitely). A wedged daemon otherwise leaves this coroutine waiting
+    forever with no way for the caller's own timeout machinery to reach it,
+    since it hasn't returned a container id yet for that machinery to act on.
+    """
     proc = await asyncio.create_subprocess_exec(
         *_docker_run_argv(worktree, image, cpus=cpus, memory=memory, pids=pids),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await proc.communicate()
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), _START_TIMEOUT_S)
+    except TimeoutError as exc:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), _KILL_GRACE_S)
+        raise RuntimeError(
+            f"docker run did not return within {_START_TIMEOUT_S:g}s"
+        ) from exc
     if proc.returncode != 0:
         raise RuntimeError(f"docker run failed: {err.decode(errors='replace').strip()}")
     return out.decode().strip()
