@@ -188,6 +188,20 @@ class NoHostGitEverRunsInTheWorktree(unittest.TestCase):
         even a read-only-looking `git status` rewrite the index and fire
         `post-index-change`, so the fixture is armed against the shape a
         teardown bug actually takes rather than only against `git commit`.
+
+        MEASURED (not assumed): backdating `f`'s mtime while also changing
+        its content is NOT reliable — content that actually differs from
+        what's staged makes git report "modified" without necessarily
+        rewriting the index (that rewrite, when it happens, comes from an
+        unrelated subsystem racing its own staleness check, e.g. the
+        untracked-cache extension). A standalone harness running that
+        content-changing variant repeatedly reproduced this test's flake
+        rate directly; the same harness ran the content-UNCHANGED variant
+        below 300/300 clean. The fix is to leave `f`'s content untouched and
+        only backdate its mtime: that puts git on the deterministic path —
+        recorded stat stale, content re-verified as UNCHANGED, so git must
+        persist a fixed-up stat into the index before it can trust the cache
+        next time, which is an unconditional index write.
         """
         hooks = self.scratch / "hooks"
         hooks.mkdir(exist_ok=True)
@@ -201,9 +215,8 @@ class NoHostGitEverRunsInTheWorktree(unittest.TestCase):
             ["git", "-C", wt, "config", "core.hooksPath", str(hooks)], check=True
         )
         subprocess.run(["git", "-C", wt, "add", "-A"], capture_output=True, check=False)
-        # Make the index stale so the next read refreshes (and rewrites) it.
-        with open(os.path.join(wt, "f"), "w") as fh:
-            fh.write("dirtied by the sandbox\n")
+        # Backdate the already-staged `f` (content untouched) so its recorded
+        # stat is stale; git must re-verify and rewrite the index unconditionally.
         os.utime(os.path.join(wt, "f"), (0, 0))
         self.marker.unlink(missing_ok=True)  # arming itself must not count
 
