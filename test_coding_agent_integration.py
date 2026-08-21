@@ -474,6 +474,70 @@ class DockerIntegration(unittest.TestCase):
         self.assertNothingLeaked()
         self.assertRepoUntouched()
 
+    def test_the_container_really_runs_with_no_capabilities_and_no_new_privs(
+        self,
+    ) -> None:
+        """SF-6 / NF-7, and the §6.2 argv AMENDMENT that closes it.
+
+        Read from `/proc/self/status` INSIDE the real container, because the
+        argv test one file over pins what we ASK for and this pins what the
+        kernel actually did. The two are different questions: a flag Docker
+        silently ignored would satisfy the first and not this.
+
+        Before the amendment, measured live: `NoNewPrivs: 0` and
+        `CapBnd: 00000000a80425fb` — Docker's full default bounding set —
+        while the image ships 11 setuid-root binaries the untrusted model can
+        execute. `--user` already produced an empty `CapEff`, so the effective
+        set alone proved nothing; an intact BOUNDING set is precisely what a
+        setuid-root binary uses to hand privileges back.
+
+        Escalation from there needs a separate CVE and stays inside the Linux
+        VM on Docker Desktop, so this is defence in depth. It was worth adding
+        because it costs nothing — which the toolchain assertion below is
+        here to keep true.
+        """
+        result = self.run_agent(
+            _script(
+                _call(
+                    "run_command",
+                    cmd="grep -E '^(NoNewPrivs|CapBnd|CapEff|CapPrm)' /proc/self/status",
+                ),
+                # The whole reason not to ship this blind: the sandbox exists
+                # to RUN this toolchain, and capabilities are exactly the kind
+                # of thing that breaks a build in a way nobody attributes to a
+                # docker flag six months later.
+                _call(
+                    "run_command",
+                    cmd="python3 -V && git --version && uv --version && "
+                    "ruff --version && mypy --version && node --version && "
+                    "npm --version && echo TOOLCHAIN-OK",
+                ),
+                _call(
+                    "run_command",
+                    cmd="mkdir -p /tmp/x && echo w > /tmp/x/f && cat /tmp/x/f && "
+                    'echo h > "$HOME/f" && cat "$HOME/f"',
+                ),
+                _say("done"),
+            )
+        )
+        status, toolchain, writes = self.commands(result)
+
+        self.assertIn("NoNewPrivs:\t1", status)
+        # Every capability dropped from the BOUNDING set, not just the
+        # effective one — the effective set was already empty before this fix.
+        self.assertIn("CapBnd:\t0000000000000000", status)
+        self.assertIn("CapEff:\t0000000000000000", status)
+        self.assertIn("CapPrm:\t0000000000000000", status)
+
+        # The flags cost nothing: the toolchain still runs, and the writable
+        # surfaces the sandbox needs are still writable.
+        self.assertIn("TOOLCHAIN-OK", toolchain)
+        self.assertEqual(writes, "[exit 0]\nw\nh\n")
+
+        self.assertEqual(result.cleanup_problems, [])
+        self.assertNothingLeaked()
+        self.assertRepoUntouched()
+
     def test_container_crash_midloop_still_cleans_up(self) -> None:
         """`docker rm -f` the sandbox out from under a running loop.
 

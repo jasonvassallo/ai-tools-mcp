@@ -199,6 +199,15 @@ mcp_server = _load_mcp_server()
 # ---------------------------------------------------------------------------
 
 
+def _reject_constant(name: str):
+    """What a STRICT RFC 8259 parser does with `NaN`/`Infinity`.
+
+    Python's `json.loads` accepts them by default, so a test that merely
+    round-trips through it would pass against the bug it is meant to catch.
+    """
+    raise AssertionError(f"response carries a non-JSON constant: {name}")
+
+
 def _result(**overrides) -> AgentResult:
     """An AgentResult with every field set, overridable per test."""
     fields: dict = {
@@ -532,6 +541,46 @@ class SurrogatesReachTheResponse(_McpCase):
             parsed = self.payload("coding_agent", self.args())
         self.assertEqual(parsed["diff"], "+café — naïve 日本語\n")
         self.assertEqual(parsed["changed_files"], ["café.py"])
+
+    def test_a_non_finite_float_cannot_poison_the_whole_response(self):
+        """SF-5 / NF-5. Same bug class as the lone surrogate, in the branch
+        that was missed.
+
+        `_as_dict` deliberately supports tool `arguments` arriving as a JSON
+        *string* and parses them with `json.loads`, which accepts
+        `NaN`/`Infinity` by default. `_summarize_args` passes floats through
+        untouched, `_json_safe` only walked str/dict/list, and `json.dumps`
+        then emitted a bare `NaN` — which a strict RFC 8259 parser rejects,
+        taking the ENTIRE payload with it. The human loses the diff, not just
+        the number.
+        """
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=bad):
+                with _returns(
+                    _result(
+                        transcript=[
+                            {"turn": 1, "tool": "read_file", "args": {"path": bad}}
+                        ]
+                    )
+                ):
+                    text = self.text("coding_agent", self.args())
+                # MECHANISM: a bare NaN/Infinity token is exactly what a
+                # strict parser refuses, so its absence is the property.
+                for token in ("NaN", "Infinity", "-Infinity"):
+                    self.assertNotIn(f": {token}", text)
+                parsed = json.loads(text, parse_constant=_reject_constant)
+                rendered = parsed["transcript"][0]["args"]["path"]
+                self.assertIsInstance(rendered, str)
+                self.assertIn("non-finite", rendered)
+
+    def test_ordinary_numbers_are_left_exactly_as_they_are(self):
+        """The coercion must not touch the numbers a normal result carries —
+        a stringified `turns` or `elapsed_seconds` would break every consumer."""
+        with _returns(_result(turns=7, elapsed_seconds=1.25)):
+            parsed = self.payload("coding_agent", self.args())
+        self.assertEqual(parsed["turns"], 7)
+        self.assertEqual(parsed["elapsed_seconds"], 1.25)
+        self.assertIsInstance(parsed["diff_truncated"], bool)
 
     def test_a_surrogate_outside_the_surrogateescape_range_is_handled(self):
         """surrogateescape only owns U+DC80-U+DCFF; a model can put any lone

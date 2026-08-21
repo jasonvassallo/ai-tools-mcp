@@ -206,7 +206,8 @@ reach at all.
 Per task:
 
 1. `git worktree add <tmp> <base_ref>` — throwaway, detached.
-2. `docker run --rm --init --network=none <USER-FLAG — see §6.7>`
+2. `docker run --rm --init --network=none`
+   `--cap-drop=ALL --security-opt=no-new-privileges <USER-FLAG — see §6.7>`
    `--read-only --tmpfs /tmp --tmpfs /home/agent -e HOME=/home/agent`
    `-e TMPDIR=/tmp --cpus <cap> --memory <cap> --pids-limit <cap>`
    `-v <worktree>:/work:rw -w /work <image> sleep infinity`
@@ -216,6 +217,28 @@ Per task:
    (`--init` runs tini as pid 1 so processes the model backgrounds — e.g. the
    re-tamper writer from the §6.5 TOCTOU — are reaped rather than lingering as
    zombies; `--pids-limit` bounds a fork bomb.)
+
+   **AMENDMENT, 2026-08-19 (final review, NF-7).** `--cap-drop=ALL` and
+   `--security-opt=no-new-privileges` were NOT in this spec's original argv
+   and were added after the final review measured a live container built from
+   it: `NoNewPrivs: 0`, `CapBnd: 00000000a80425fb` (Docker's full default
+   bounding set), with 11 setuid-root binaries reachable by the untrusted
+   model — `/usr/bin/{su,mount,umount,passwd,newgrp,chsh,chfn,gpasswd,expiry,
+   chage}` and `/usr/sbin/unix_chkpwd`. The `<USER-FLAG>` already produces an
+   unprivileged `CapEff`, so the effective set was never the gap; an intact
+   BOUNDING set is exactly what a setuid-root binary uses to hand privileges
+   back, and `no-new-privileges` is what stops that transition.
+
+   Escalation from there is **[hypothesised]** — it needs a separate CVE in
+   one of those binaries, and container-root on Docker Desktop/macOS is still
+   confined to the Linux VM — but the precondition was DEMONSTRATED and the
+   mitigation is two flags. Both were verified to cost nothing: python, git,
+   uv, ruff, mypy, node, npm and shellcheck were exercised in a real container
+   under both variants (a failing pytest, an edit, a passing pytest, a
+   `uv run` subprocess, tmpfs and `$HOME` writes) with identical results.
+   Pinned at argv level in `test_coding_agent_sandbox.py` and at kernel level,
+   from `/proc/self/status` inside a real container, in
+   `test_coding_agent_integration.py`.
    (a long-lived container per task; every `run_command` is a `docker exec`
    into it, avoiding per-command startup cost).
 

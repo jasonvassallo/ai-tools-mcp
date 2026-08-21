@@ -82,6 +82,7 @@ import functools
 import getpass
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -2998,13 +2999,29 @@ def _surrogate_safe(text: str) -> str:
 
 
 def _json_safe(value: Any) -> Any:
-    """`value` with every string surrogate-scrubbed, structure preserved."""
+    """`value` with every string surrogate-scrubbed and every non-finite float
+    rendered as text, structure preserved.
+
+    The float branch is the same bug class as the surrogate one, in the branch
+    that was missed. `_as_dict` deliberately supports tool `arguments` arriving
+    as a JSON *string* and parses them with `json.loads`, which accepts
+    `NaN`/`Infinity`/`-Infinity` by default; `_summarize_args` passes floats
+    through untouched; and `json.dumps` then emits a bare `NaN` token. That is
+    not valid JSON under RFC 8259, so a strict parser rejects the ENTIRE
+    payload — and with it the diff the human was supposed to review. Rendering
+    the value as a string keeps it visible instead of losing the response.
+
+    `bool` is checked first because it is a subclass of `int`, and `int` is
+    checked at all only to keep that ordering obvious to the next reader.
+    """
     if isinstance(value, str):
         return _surrogate_safe(value)
     if isinstance(value, dict):
         return {_json_safe(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return f"<non-finite number: {value}>"
     return value
 
 
