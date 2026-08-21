@@ -51,21 +51,29 @@ IMAGE = "ai-tools-coding-agent:latest"
 _BROKEN = "def add(a, b):\n    return a - b\n"
 _FIXED = (
     'def add(a, b):\n    """Return the sum of a and b."""\n    return a + b\n'
-    # A same-length replacement is a COIN FLIP, not a pass. CPython validates
-    # a cached .pyc against (int(source mtime), source size); a same-length
-    # rewrite that lands in the same integer second leaves both fields
-    # matching, so the second `python -m pytest` run imports the OLD bytecode
-    # and the "fixed" test still fails. Measured on this host, n=4 per cell:
+    # A same-length replacement USED TO BE a COIN FLIP, not a pass. CPython
+    # validates a cached .pyc against (int(source mtime), source size); a
+    # same-length rewrite that lands in the same integer second leaves both
+    # fields matching, so the second `python -m pytest` run imports the OLD
+    # bytecode and the "fixed" test still fails. Measured on this host, n=4
+    # per cell, before Task 12's fix below existed:
     #   same length, no delay  -> ['PASS','STALE','STALE','STALE']
     #   same length, 1.5s wait -> ['STALE','STALE','STALE','STALE']
     #   this fix,    no delay  -> ['PASS','PASS','PASS','PASS']
     #   this fix,    1.5s wait -> ['PASS','PASS','PASS','PASS']
     # (A wait does NOT help: it elapses after the write, so it cannot change
-    # which second the write landed in.) The size field is what makes this
-    # deterministic — it is compared regardless of any clock. Deliberately NOT
-    # fixed by adding PYTHONDONTWRITEBYTECODE to the §6.2 docker argv: that
-    # argv is pinned literally by test_coding_agent_sandbox.py and by the
-    # spec, and quietly editing it to make a test pass would decouple the two.
+    # which second the write landed in.) Task 12 closed the underlying bug at
+    # its root by adding PYTHONDONTWRITEBYTECODE=1 to the sandbox IMAGE
+    # (scripts/coding-agent-image/Dockerfile) — deliberately NOT to the §6.2
+    # docker argv, which stays pinned by test_coding_agent_sandbox.py and the
+    # spec. No .pyc is ever written now, so there is no stale cache left to
+    # read regardless of edit length or timing — see
+    # test_the_container_never_writes_pyc_bytecode_but_still_writes_pytest_cache
+    # below for the live regression check. The different-length fixture is
+    # kept anyway as a belt-and-suspenders regression guard for this test:
+    # it is still the more realistic fix to model, and it keeps this test
+    # meaningful even against a future image variant that reintroduces
+    # bytecode caching.
 )
 
 _TEST_FILE = "from calc import add\ndef test_add():\n    assert add(2, 3) == 5\n"
@@ -341,8 +349,11 @@ class DockerIntegration(unittest.TestCase):
         self.assertEqual(result.last_command["exit"], 0)
 
         # The review artifact. `changed_files` is asserted EXACTLY: the
-        # container writes __pycache__/ and .pytest_cache/ into the mount, and
-        # the point of the ignore predicate is that the human never sees them.
+        # container writes .pytest_cache/ into the mount, and the point of
+        # the ignore predicate is that the human never sees it. (Before Task
+        # 12 added PYTHONDONTWRITEBYTECODE=1 to the sandbox image, it wrote
+        # __pycache__/ too; that env var means .pyc is never written now, so
+        # __pycache__ never exists to filter — see the control test below.)
         self.assertEqual(result.changed_files, ["calc.py"])
         self.assertIn("+    return a + b", result.diff)
         self.assertIn('+    """Return the sum of a and b."""', result.diff)
@@ -351,17 +362,30 @@ class DockerIntegration(unittest.TestCase):
         self.assertFalse(result.diff_truncated)
         self.assertEqual(result.unreadable, [])
 
-        # ... and the bytecode really was there to be ignored, so the
-        # assertion above is about the filter and not about an empty dir.
+        # ... and .pytest_cache really was there to be ignored (proven by the
+        # control test below), so the assertion above is about the filter and
+        # not about an empty dir.
         self.assertEqual(result.cleanup_problems, [])
         self.assertNothingLeaked()
         self.assertRepoUntouched()
 
-    def test_the_container_really_wrote_bytecode_that_the_diff_left_out(self) -> None:
+    def test_the_container_never_writes_pyc_bytecode_but_still_writes_pytest_cache(
+        self,
+    ) -> None:
         """The other half of the assertion above, which can only be observed
-        while the worktree still exists: `python -m pytest` DOES create
-        __pycache__ in the mount. Read from inside the container, so it is the
-        sandbox's own view of the mount and not a host-side inference."""
+        while the worktree still exists. Read from inside the container, so
+        it is the sandbox's own view of the mount and not a host-side
+        inference. Two things at once:
+
+        1. `.pytest_cache` really IS created by `python -m pytest` — the
+           CONTROL proving the ignore-predicate assertion above is about a
+           real filter, not an already-empty dir.
+        2. `__pycache__` is never created at all, because Task 12 added
+           PYTHONDONTWRITEBYTECODE=1 to the sandbox image: this is the live
+           regression check for that fix, run against the real image and a
+           real `python -m pytest` invocation rather than inferred from the
+           Dockerfile text.
+        """
         result = self.run_agent(
             _script(
                 _call("run_command", cmd="python -m pytest -q"),
@@ -370,9 +394,14 @@ class DockerIntegration(unittest.TestCase):
             )
         )
         listing = self.commands(result)[1]
-        self.assertTrue(listing.startswith("[exit 0]"), listing)
-        self.assertIn("calc.cpython-312.pyc", listing)
-        # It existed in the mount, and it is still absent from the review.
+        # `ls` given one missing and one present path lists what it can and
+        # exits nonzero for the miss — exactly the mixed outcome here.
+        self.assertTrue(listing.startswith("[exit 2]"), listing)
+        self.assertIn("cannot access '__pycache__'", listing)
+        self.assertIn("No such file or directory", listing)
+        self.assertIn("CACHEDIR.TAG", listing)
+        # Neither existed in the review — .pytest_cache was filtered,
+        # __pycache__ was never written.
         self.assertEqual(result.changed_files, [])
         self.assertEqual(result.cleanup_problems, [])
         self.assertNothingLeaked()

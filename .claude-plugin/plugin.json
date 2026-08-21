@@ -1,7 +1,7 @@
 {
   "name": "ai-tools-mcp",
   "description": "Hosted-API research, local Ollama delegation, and session-management MCP server. Exposes Gemini Flash grounded search (quick and deep research, ADC-authenticated), Perplexity Agent API Search-as-Code (bulk, sandboxed), Google Gemini Deep Research (async, long-form), local Ollama for sensitive/private input and mechanical text work, and conversation-session persistence. Includes slash commands, routing skills, and a session-start preflight hook.",
-  "version": "1.5.10",
+  "version": "1.6.0",
   "author": {
     "name": "Jason Vassallo",
     "email": "jasonvassallo@mac.com"

@@ -6,9 +6,10 @@ This repository is intentionally narrow in scope:
 
 - It exposes hosted AI providers and the machine's local Ollama server behind one MCP surface.
 - No model weights live in this repo — the local family only calls an already-running Ollama.
-- It currently exposes thirteen tools across three families:
+- It currently exposes fifteen tools across four families:
   - Research: `quick_research` / `deep_research` (Gemini Flash on Vertex AI with Google Search grounding), `agent_research` / `agent_research_result` (Perplexity Agent API, Search-as-Code), `gemini_deep_research_start`, `gemini_deep_research_result`
   - Local delegate: `local_delegate` / `local_delegate_result` (Ollama, on-device)
+  - Coding agent: `coding_agent` / `coding_agent_result` (Ollama, sandboxed — see below)
   - Sessions: `list_sessions`, `save_session`, `load_session`, `update_session`, `delete_session`
 
 The same `mcp_server.py` is shipped three ways: standalone MCP server (installer registers it directly in `~/.claude/.mcp.json`), Claude Code plugin (`.claude-plugin/` + commands/skills/hooks), and Claude Desktop extension (`.mcpb` archive). Pick whichever fits your client.
@@ -28,6 +29,9 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - Tool names (local delegate):
   - `local_delegate`
   - `local_delegate_result`
+- Tool names (coding agent):
+  - `coding_agent`
+  - `coding_agent_result`
 - Tool names (sessions):
   - `list_sessions`
   - `save_session`
@@ -83,12 +87,32 @@ The following identifiers are meant to stay stable unless intentionally changed:
 - `think`: off by default (faster); set `true` only for reasoning-heavy asks. Keep it off for the gemma4 tags — with thinking on they put the generation in `message.thinking`, which the tool discards, so the call returns "Error: Ollama returned no content"; enable it only on a model whose content you have confirmed survives it
 - `keep_alive`: omitted, qwen tags default to `'0'`, and any `'0'` on a qwen tag (defaulted or explicit) also **evicts the runner before the call** — the mitigation for a measured cross-task contamination bug where a resident qwen runner returns other prompts' answers on repeat calls; the post-response TTL alone cannot protect the request carrying it. A failed eviction is surfaced as a warning banner on the answer and a one-line stderr record. Pass e.g. `'5m'` to deliberately keep one warm (skips the protection); other models inherit the server's `OLLAMA_KEEP_ALIVE`
 
+### `coding_agent` / `coding_agent_result`
+
+- Provider: **local Ollama model**, run autonomously (reads/writes files, runs shell commands and tests) inside a `--network=none`, `--read-only` Docker container over a **throwaway git worktree** of the repo you point it at
+- Purpose: hand off a bounded, mechanical coding task — a failing test to make pass, a rename to apply across the tree, a mechanical refactor — to a model that can iterate against a real test run without a human babysitting every turn
+- **Nothing the model does is ever applied.** `repo` is read, never written; the worktree is destroyed when the run ends. You get back a transcript and a unified diff, and Claude (you) is the gate that decides what — if anything — lands. Treat the diff review as mandatory, not optional
+- Latency: seconds to tens of minutes, bounded by `max_turns` (default 25, cap 60) and `max_seconds` (default 600, cap 1800) — the model cannot extend its own budget; `background=true` by default, poll `coding_agent_result`
+- One run at a time per host: a second concurrent call is rejected, not queued
+- Image: `AI_TOOLS_CODING_AGENT_IMAGE` overrides the sandbox image tag (default `ai-tools-coding-agent:latest`, built from `scripts/coding-agent-image/Dockerfile`)
+
+**Two things to know before relying on this tool** (spec §8):
+
+1. **Local models are measured-unreliable as defect gates.** This fleet's own benchmarks found that no local model caught planted critical credential-leak or injection regressions, and that they silently approve large diffs with zero findings. `coding_agent` is well-suited to mechanical, externally-verifiable work — where "done" is a test going green or a pattern applied consistently — and poorly suited to anything requiring judgment (security-sensitive changes, subtle logic, deciding whether a result is *right* rather than whether it *runs*). The diff review in your hands is the control that compensates for this, and it matters most exactly on the tasks where the local model is weakest.
+2. **Toolchain duplication is the real recurring operating cost.** The sandbox is `--network=none`, so nothing can be installed at runtime — every tool the model might need (Python, `uv`, `pytest`, `ruff`, `mypy`, Node, shell utilities) must already be baked into the image. That image is **~1 GB** (996 MB unpacked/on-disk — `docker image inspect .Size` reports ~196 MB, but that is compressed content on Docker Desktop's containerd store, not disk usage; a single apt layer alone is 438 MB). It **will** drift from whatever toolchain the host project actually uses. Run `scripts/coding-agent-image/check.sh` to see which expected tools are missing from a built image and what version of each present tool it's running, so drift shows up as a report instead of a confusing mid-run failure.
+
+Two more things worth knowing:
+
+- **`git` does not work inside the sandbox.** A linked worktree's `.git` is a file pointing at `<repo>/.git/worktrees/<name>`, and only the worktree itself — not that path inside the main repo — is mounted into the container, so every git command fails `fatal: not a git repository`. This is security-positive (the model cannot touch repo history, branches, or remotes), but don't expect `git` to work in `run_command`.
+- **The sandbox can learn the host repo's absolute path**, via `cat /work/.git` or any failing git command's error message (both reveal `<host-path>/.git/worktrees/<name>`). Low severity, and inherent to how `git worktree add` names its gitdir — documented here rather than fixed.
+
 Together these complement Claude's built-in `WebSearch`: use `WebSearch` for
 quick lookups, `deep_research` for thorough inline investigation,
 `agent_research` for bulk/enumerable tasks where coverage matters, the
-`gemini_deep_research_*` pair when the deliverable IS the report, and
+`gemini_deep_research_*` pair when the deliverable IS the report,
 `local_delegate` when the input must stay on-device or the task is cheap
-mechanical work.
+mechanical work, and `coding_agent` when that mechanical work needs to run
+its own autonomous edit/test loop inside a sandbox before you review it.
 
 ## How It Works
 
@@ -198,7 +222,7 @@ token (the preferred store there — see
 
    `--env GOOGLE_CLOUD_PROJECT=...` is baked into the registration because GUI-launched servers don't inherit your shell environment: user-credential ADC files carry no project id, and google-auth's fallback discovery (which consults the gcloud CLI) isn't reliable from a GUI-spawned process — pinning the project in the registration sidesteps both. Optional per-machine env (append more `--env` flags or set them alongside the credentials): `AI_TOOLS_OLLAMA_MODELS=qwen2.5-coder:14b,gemma4:12b-nvfp4,gemma4:31b-nvfp4` — the small model (the one step 1 pulled) serves locally; the gemma4 tags miss the local probe (the box is CPU-only — nvfp4 is Apple-silicon-served) and fall through the remote chain to ollama-mbp when the MBP is awake. Implicit calls still resolve to the local small model first by design; name gemma explicitly when quality matters more than locality.
 4. **Claude Desktop:** FIRST create the temp-redirect directory the manifest points at — `New-Item -ItemType Directory -Force "$env:USERPROFILE\.uvtmp"` — then install the `.mcpb` as in (C), and in the extension settings set `uv_path` to your `uv.exe` (find it with `where uv` — the default is a macOS Homebrew path) and `ollama_models` as above. The manifest redirects `TMP`/`TEMP` to `~/.uvtmp` (EDR software blocks some uv writes under the default `%TEMP%`, corrupting uv's cached script environment); uv hard-fails on a cold resolve if the directory is missing, which Claude Desktop surfaces only as "Could not attach to MCP server". The Claude Code plugin's session-start hook also creates it, so any machine that has run the CLI plugin once is already covered.
-5. **Platform note:** all 13 tools work on Windows. `update_session`/`delete_session` lock via `msvcrt.locking` byte-range locks there (`fcntl.flock` on POSIX) — same lockfile, same serialization guarantees.
+5. **Platform note:** all 15 tools work on Windows. `update_session`/`delete_session` lock via `msvcrt.locking` byte-range locks there (`fcntl.flock` on POSIX) — same lockfile, same serialization guarantees.
 6. **Verify:** `uv run C:\path\to\mcp_server.py --check` — hosted-tool credentials must pass; the Ollama line is non-fatal (`warn:` when the local server is down and calls will use the remote chain).
 
 ### Troubleshooting: "Server disconnected" in a desktop app
