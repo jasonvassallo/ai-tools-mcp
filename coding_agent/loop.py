@@ -386,6 +386,52 @@ async def _teardown(
         _remove_worktree(ops, repo, worktree, out)
 
 
+def _arg_text(value: Any) -> str:
+    """A tool call's `arguments` as the text the PAYLOAD actually carries.
+
+    `str()` is wrong for the common case. Ollama sends `arguments` as an
+    OBJECT (see `_as_dict`), and `str(dict)` renders a Python repr — single
+    quotes, `True`/`None` — which is neither what the request serializes nor
+    what a re-parse would accept. Measuring and cutting against the JSON
+    keeps the bound honest for both server shapes.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        # Arrived as JSON, so this should not happen; fall back rather than
+        # let a sizing helper be the thing that ends the run.
+        return str(value)
+
+
+def _elide_arg_object(args: dict[str, Any]) -> bool:
+    """Shrink the largest string VALUE inside an arguments object, in place.
+
+    Cutting the object's own rendering would replace it with a string and
+    change the `tool_calls` shape this module promises never to touch — and a
+    truncated repr is not re-parseable, so every argument would be lost if it
+    were read back. Cutting one oversized VALUE keeps `arguments` an object
+    with all of its keys, which is what both the protocol and `_as_dict`
+    expect. Returns whether anything was cut.
+    """
+    longest_key: str | None = None
+    longest = _ELIDED_TOOL_CHARS
+    for key, value in args.items():
+        if isinstance(value, str) and len(value) > longest:
+            longest_key, longest = key, len(value)
+    if longest_key is None:
+        return False  # oversize spread across many small values; leave it
+    value = args[longest_key]
+    args[longest_key] = value[:_ELIDED_TOOL_CHARS] + (
+        f"...[{len(value) - _ELIDED_TOOL_CHARS} chars elided from an "
+        f"earlier tool call to bound this conversation]"
+    )
+    return True
+
+
 def _tool_call_arg_chars(m: dict[str, Any]) -> int:
     """Bytes an assistant message's `tool_calls` arguments add to the
     payload — the request-side counterpart to `content`, which the original
@@ -400,7 +446,7 @@ def _tool_call_arg_chars(m: dict[str, Any]) -> int:
     for call in calls:
         function = call.get("function") if isinstance(call, dict) else None
         if isinstance(function, dict):
-            total += len(str(function.get("arguments") or ""))
+            total += len(_arg_text(function.get("arguments")))
     return total
 
 
@@ -416,7 +462,11 @@ def _trim_conversation(messages: list[dict[str, Any]]) -> int:
     one side of a `tool_calls` pair is how a "memory fix" turns into a model
     backend rejecting the payload. This changes only bytes — never the message
     count, the roles, or the `tool_calls` array's shape (id/type/name/call
-    count are untouched; only an oversized `arguments` string is cut).
+    count are untouched). That guarantee covers the `arguments` field's own
+    TYPE: a string is cut to a shorter string, and an object (Ollama's shape)
+    keeps every key and stays an object, with the cut taken inside its largest
+    string value. Replacing an object with its truncated rendering would be a
+    shape change, and the result would not survive a re-parse.
 
     Oldest first, because the recent turns are the ones the model is actually
     reasoning about; the early ones have already done their work.
@@ -452,15 +502,25 @@ def _trim_conversation(messages: list[dict[str, Any]]) -> int:
                 function = call.get("function") if isinstance(call, dict) else None
                 if not isinstance(function, dict):
                     continue
-                args = str(function.get("arguments") or "")
-                if len(args) <= _ELIDED_TOOL_CHARS:
+                raw = function.get("arguments")
+                before = len(_arg_text(raw))
+                if before <= _ELIDED_TOOL_CHARS:
                     continue
-                cut = args[:_ELIDED_TOOL_CHARS] + (
-                    f"...[{len(args) - _ELIDED_TOOL_CHARS} chars elided from an "
-                    f"earlier tool call to bound this conversation]"
-                )
-                total -= len(args) - len(cut)
-                function["arguments"] = cut
+                if isinstance(raw, dict):
+                    # Mutated in place: `function["arguments"]` stays this same
+                    # object, so the call's shape is untouched.
+                    if not _elide_arg_object(raw):
+                        continue
+                    after = len(_arg_text(raw))
+                else:
+                    args = _arg_text(raw)
+                    cut = args[:_ELIDED_TOOL_CHARS] + (
+                        f"...[{len(args) - _ELIDED_TOOL_CHARS} chars elided from an "
+                        f"earlier tool call to bound this conversation]"
+                    )
+                    function["arguments"] = cut
+                    after = len(cut)
+                total -= before - after
                 elided += 1
     return elided
 

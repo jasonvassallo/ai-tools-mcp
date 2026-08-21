@@ -1291,6 +1291,59 @@ class TranscriptIsBounded(_LoopCase):
         self.assertIn("chars elided", shrunk)
         self.assertEqual(messages[2]["content"], "recent")  # newest untouched
 
+    def test_an_object_valued_tool_call_argument_stays_an_object_when_elided(self):
+        """The sibling test above passes `arguments` as a STRING, which is the
+        OpenAI shape. Ollama — the only server this tool actually talks to —
+        sends an OBJECT (`_as_dict`'s own docstring says so), and that path was
+        untested: the trim rendered the dict with `str()` and assigned the
+        truncated result back, turning `arguments` into a Python repr. That is
+        a shape change `_trim_conversation` promises never to make, and the
+        repr does not survive a re-parse, so `_as_dict` would recover `{}` —
+        every argument silently lost. Pins the object shape, the surviving
+        keys, and that the value is still JSON."""
+        big = "X" * (L._MAX_CONVERSATION_CHARS + 5000)
+        messages = [
+            {"role": "system", "content": "S"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            # Ollama's real shape: a dict, not a JSON string.
+                            "arguments": {"path": "a.py", "content": big, "mode": "w"},
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "content": "recent"},
+        ]
+
+        elided = L._trim_conversation(messages)
+
+        self.assertEqual(elided, 1)
+        shrunk = messages[1]["tool_calls"][0]["function"]["arguments"]
+        # The shape guarantee: still an object, not a stringified repr.
+        self.assertIsInstance(shrunk, dict)
+        self.assertEqual(set(shrunk), {"path", "content", "mode"})
+        self.assertEqual(shrunk["path"], "a.py")  # untouched keys survive whole
+        self.assertEqual(shrunk["mode"], "w")  # including non-cut ones
+        # The cut lands INSIDE the largest value, and announces itself.
+        self.assertLess(len(shrunk["content"]), len(big))
+        self.assertIn("chars elided", shrunk["content"])
+        # Still round-trips, so `_as_dict` recovers every argument.
+        self.assertEqual(json.loads(json.dumps(shrunk))["path"], "a.py")
+        self.assertEqual(L._as_dict(shrunk)["path"], "a.py")
+        # And the bound it exists to enforce was actually reached.
+        total = sum(
+            len(str(m.get("content") or "")) + L._tool_call_arg_chars(m)
+            for m in messages
+        )
+        self.assertLessEqual(total, L._MAX_CONVERSATION_CHARS)
+
     def test_changed_files_and_unreadable_are_bounded_with_an_exact_count(self):
         """SF-3 / NF-4. Every other model-controlled field was bounded; these
         two were carried verbatim, and both are as long as the sandbox likes.
