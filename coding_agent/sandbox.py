@@ -66,6 +66,14 @@ _WT_PREFIX = "coding-agent-wt-"
 _DESTROY_TIMEOUT_S = 30.0
 _KILL_GRACE_S = 5.0
 _START_TIMEOUT_S = 60.0
+_REAP_TIMEOUT_S = 10.0
+
+# Every container this module starts carries this label, valued with a
+# per-call run_id. Its only reader is `_reap_labelled`: a container id is
+# ordinarily learned from `docker run`'s own stdout, but a client that timed
+# out waiting for that response never gets one. The label makes such a
+# container findable anyway.
+_RUN_LABEL_KEY = "com.jasonvassallo.ai-tools-mcp.coding-agent-run-id"
 
 # `sh -c SCRIPT name a b` sets $0=name, $1=a, $2=b. The model's command is
 # passed as its own argv element and is never interpolated into the script
@@ -204,7 +212,7 @@ def create_worktree(repo: str, base_ref: str) -> str:
 
 
 def _docker_run_argv(
-    worktree: str, image: str, *, cpus: str, memory: str, pids: int
+    worktree: str, image: str, *, cpus: str, memory: str, pids: int, run_id: str
 ) -> list[str]:
     """Spec §6.2 step 2. `--init` runs tini as pid 1 so processes the model
     backgrounds are reaped; `--read-only` needs a writable $HOME and not just
@@ -236,6 +244,12 @@ def _docker_run_argv(
 
     `test_coding_agent_integration.py` pins this argv literally; the two flags
     were added there in the same change.
+
+    `--label` (also not in §6.2's literal argv) exists so a container the
+    daemon created but whose id our client never received — it timed out
+    waiting on `docker run`'s own response, §6.7's `_START_TIMEOUT_S` case —
+    can still be found and reaped by `_reap_labelled`, without which that
+    container would run forever unrecognized by anything.
     """
     return [
         "docker",
@@ -247,6 +261,8 @@ def _docker_run_argv(
         # Not in §6.2's literal argv — see the docstring above.
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
+        "--label",
+        f"{_RUN_LABEL_KEY}={run_id}",
         *SANDBOX_USER_FLAG,
         "--read-only",
         "--tmpfs",
@@ -279,6 +295,35 @@ def _docker_run_argv(
     ]
 
 
+async def _reap_labelled(run_id: str) -> None:
+    """Best-effort cleanup for a container `start_container` never got an id
+    for. Deliberately silent and bounded, same contract as `destroy_container`
+    — this runs on an already-failing path and must never raise or hang it
+    further.
+    """
+    with contextlib.suppress(OSError):
+        lister = await asyncio.create_subprocess_exec(
+            "docker",
+            "ps",
+            "-a",
+            "--no-trunc",
+            "--filter",
+            f"label={_RUN_LABEL_KEY}={run_id}",
+            "--format",
+            "{{.ID}}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(lister.communicate(), _REAP_TIMEOUT_S)
+        except TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                lister.kill()
+            return
+        for cid in out.decode(errors="replace").split():
+            await destroy_container(cid, timeout_s=_REAP_TIMEOUT_S)
+
+
 async def start_container(
     worktree: str, image: str, *, cpus: str, memory: str, pids: int
 ) -> str:
@@ -287,9 +332,18 @@ async def start_container(
     indefinitely). A wedged daemon otherwise leaves this coroutine waiting
     forever with no way for the caller's own timeout machinery to reach it,
     since it hasn't returned a container id yet for that machinery to act on.
+
+    Both failure paths call `_reap_labelled`: the daemon can create and start
+    the container as part of handling `docker run`'s single API call before
+    responding, so a client that times out or otherwise never gets a usable
+    id can still leave one running. Labelling every run makes it findable
+    without that id.
     """
+    run_id = uuid.uuid4().hex
     proc = await asyncio.create_subprocess_exec(
-        *_docker_run_argv(worktree, image, cpus=cpus, memory=memory, pids=pids),
+        *_docker_run_argv(
+            worktree, image, cpus=cpus, memory=memory, pids=pids, run_id=run_id
+        ),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -300,10 +354,12 @@ async def start_container(
             proc.kill()
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(proc.wait(), _KILL_GRACE_S)
+        await _reap_labelled(run_id)
         raise RuntimeError(
             f"docker run did not return within {_START_TIMEOUT_S:g}s"
         ) from exc
     if proc.returncode != 0:
+        await _reap_labelled(run_id)
         raise RuntimeError(f"docker run failed: {err.decode(errors='replace').strip()}")
     return out.decode().strip()
 

@@ -27,6 +27,7 @@ import subprocess
 import tempfile
 import unittest
 import unittest.mock
+import uuid
 from pathlib import Path
 
 from coding_agent.sandbox import (
@@ -510,7 +511,14 @@ class DockerArgvIsExactlyTheSpec(unittest.TestCase):
     def test_docker_run_argv(self) -> None:
         shim = _Shim("echo deadbeefcafe\n")
         self.addCleanup(shim.cleanup)
-        with shim.patched():
+        fixed_run_id = "0" * 32
+        with (
+            shim.patched(),
+            unittest.mock.patch(
+                "coding_agent.sandbox.uuid.uuid4",
+                return_value=uuid.UUID(int=0),
+            ),
+        ):
             cid = asyncio.run(
                 start_container("/wt", "img:tag", cpus="2", memory="4g", pids=256)
             )
@@ -521,6 +529,7 @@ class DockerArgvIsExactlyTheSpec(unittest.TestCase):
             [
                 "run", "-d", "--rm", "--init", "--network=none",
                 "--cap-drop=ALL", "--security-opt=no-new-privileges",
+                "--label", f"com.jasonvassallo.ai-tools-mcp.coding-agent-run-id={fixed_run_id}",
                 "--user", f"{os.getuid()}:{os.getgid()}",
                 "--read-only", "--tmpfs", "/tmp", "--tmpfs", "/home/agent",
                 "-e", "HOME=/home/agent", "-e", "TMPDIR=/tmp",
