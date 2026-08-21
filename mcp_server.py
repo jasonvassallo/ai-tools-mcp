@@ -2762,8 +2762,10 @@ async def list_tools() -> list[Tool]:
                 "dependencies, linters); there is no network, so nothing can "
                 "be installed at runtime and a green test run in the sandbox "
                 "is evidence, not proof, for the host. One run at a time per "
-                "host — a second concurrent call is rejected, not queued. "
-                "background=true by default; poll coding_agent_result."
+                "host — a second concurrent call is rejected, not queued; "
+                "with background=true (the default) that rejection surfaces "
+                "when you poll coding_agent_result, not at dispatch — the "
+                "call still returns a job_id normally. Poll coding_agent_result."
             ),
             inputSchema={
                 "type": "object",

@@ -575,6 +575,7 @@ class UnreadablePathsAreVisibleToTheGate(unittest.TestCase):
     def _pairs(snap) -> list[tuple[str, str]]:
         return [(u.path, u.reason) for u in snap.unreadable]
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 path anyway")
     def test_a_mode_000_file_is_recorded_not_silently_dropped(self):
         (self.root / "innocent.py").write_text("print('hello')\n")
         victim = self.root / "backdoor.py"
@@ -587,6 +588,7 @@ class UnreadablePathsAreVisibleToTheGate(unittest.TestCase):
         self.assertNotIn("backdoor.py", snap.entries)
         self.assertEqual(self._pairs(snap), [("backdoor.py", "EACCES")])
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 path anyway")
     def test_a_mode_000_directory_says_a_whole_subtree_is_hidden(self):
         (self.root / "innocent.py").write_text("ok\n")
         (self.root / "src" / "deep").mkdir(parents=True)
@@ -598,6 +600,7 @@ class UnreadablePathsAreVisibleToTheGate(unittest.TestCase):
         # TRAILING SLASH: this is a whole subtree of unknown size, not one file.
         self.assertEqual(self._pairs(snap), [("src/", "EACCES")])
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 path anyway")
     def test_a_file_created_already_unreadable_moves_the_no_progress_hash(self):
         """`entries` alone cannot see this. A file that was NEVER readable never
         appears in `entries`, so a hash over `entries` is byte-identical before
@@ -618,6 +621,7 @@ class UnreadablePathsAreVisibleToTheGate(unittest.TestCase):
         self.assertEqual(sorted(first.entries), sorted(second.entries))
         self.assertNotEqual(before, tree_hash(second), "the hash ignored a change")
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 path anyway")
     def test_a_permanently_unreadable_path_does_not_flap_the_hash(self):
         """The other half of the ruling. A path that is permanently unreadable
         contributes the SAME (path, reason) every turn, so the hash is a
@@ -634,6 +638,7 @@ class UnreadablePathsAreVisibleToTheGate(unittest.TestCase):
         self.assertEqual(h1, h2)
         self.assertEqual(h2, h3)
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 path anyway")
     def test_an_unreadable_root_reports_itself_instead_of_looking_empty(self):
         """An empty snapshot makes every tracked path surface as a deletion.
         That is loud, but it does not say WHY. The root records itself as `.`
@@ -645,6 +650,7 @@ class UnreadablePathsAreVisibleToTheGate(unittest.TestCase):
         self.assertEqual(snap.entries, {})
         self.assertEqual(self._pairs(snap), [(".", "EACCES")])
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 path anyway")
     def test_unreadable_is_sorted_and_deterministic(self):
         for name in ("zeta.py", "alpha.py", "middle.py"):
             (self.root / name).write_text("x\n")
@@ -784,6 +790,7 @@ class UnreadablePathsAreVisibleToTheGate(unittest.TestCase):
         self.assertEqual(self._pairs(snap), [(".", "ENOMEM")])
         self.assertEqual(len(os.listdir("/dev/fd")), before, "descriptor leaked")
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 path anyway")
     def test_an_ignored_unreadable_path_is_not_reported(self):
         """`unreadable` must not become a second channel that leaks ignored
         paths into the gate's view. `lstat` succeeds on a 000 file — only the
@@ -1974,6 +1981,7 @@ class UnreadablePathsAreNeverRenderedAsDeletions(unittest.TestCase):
         self.assertEqual(rc, 0, numstat)
         self.assertIn("gone.py", numstat)  # the deletion is real and applies
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 directory anyway")
     def test_an_unreadable_directory_does_not_delete_its_whole_subtree(self):
         """The same defect one level up, and the reason the suppression is a
         PREFIX test. `Unreadable.path` carries a trailing slash for a

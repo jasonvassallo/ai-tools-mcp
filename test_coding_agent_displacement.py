@@ -168,6 +168,7 @@ class ADecoyFloodCannotHideAChangeToATrackedFile(_RealRepoCase):
             if "CREATED" in line or "BASE TREE holds" in line:
                 self.assertTrue(line.startswith("coding_agent:"), repr(line))
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file anyway")
     def test_a_flood_cannot_evict_the_not_compared_line_either(self) -> None:
         """`NOT COMPARED` lives in the BODY, so a flood that truncates the
         body could cut it and leave only the bounded head-block record — which
