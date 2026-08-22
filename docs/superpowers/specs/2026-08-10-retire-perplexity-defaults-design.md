@@ -56,9 +56,14 @@ Perplexity Agent research stays available on the user's key.
   `_get_bearer_token()` ADC path and the shared lazy `httpx.AsyncClient`.
   Location `global` per the verified-cheapest Vertex note.
 - `quick_research` and `deep_research` keep their names (AGENTS.md stable
-  surface) and their max_tokens defaults (1024 / 2048), both move to
-  `gemini-flash-latest`, differing by system prompt exactly as the
-  Sonar/Sonar-Pro split did. Responses render synthesized text plus a
+  surface), both move to `gemini-flash-latest`, differing by system prompt
+  exactly as the Sonar/Sonar-Pro split did. The defaults were planned as
+  1024 / 2048 (carried over from Sonar) but **shipped as 8192 / 16384**:
+  Stage 3 adversarial review demonstrated live that this model bills its
+  thinking tokens against `maxOutputTokens` (measured 666–1851), so the
+  carried-over budgets truncated ordinary answers mid-sentence. The
+  renderer now also reads `finishReason` so a truncated or otherwise
+  abnormal response is named rather than returned as a clean answer. Responses render synthesized text plus a
   Sources section from `groundingMetadata.groundingChunks`
   (title + URI) and `webSearchQueries`; all output passes
   `redact_secrets` as before.
@@ -71,7 +76,10 @@ Perplexity Agent research stays available on the user's key.
   own key fetch, not the OpenAI client).
 - Docs: module docstring, README, AGENTS.md tool descriptions.
 - Lockstep version bump: `.claude-plugin/plugin.json` and
-  `mcpb/manifest.json` 1.5.4 → 1.6.0.
+  `mcpb/manifest.json`. What actually shipped: PR #67 merged 1.5.9 → 1.5.10,
+  and the follow-up carrying the truncation fixes merged 1.5.10 → 1.5.11.
+  (A 1.6.0 was planned early on and never existed; `main` moved through
+  1.5.5–1.5.9 via PRs #65/#70/#61/#69 while this work was in review.)
 - Tests: new coverage for `_vertex_generate_content` (mocked transport,
   grounding-chunk rendering, empty-candidates fail-closed) and updated
   quick/deep tests; Perplexity-client tests removed with the client.

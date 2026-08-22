@@ -1105,6 +1105,114 @@ class TestRenderGroundedAnswer(unittest.TestCase):
         self.assertNotIn("No URI", out)
         self.assertNotIn("Bad URI", out)
 
+    def test_truncated_answer_is_flagged_not_passed_off_as_complete(self):
+        # PR #67 Stage 3 adversarial finding, reproduced live ~20 times:
+        # gemini-flash-latest bills THINKING tokens against maxOutputTokens,
+        # so ordinary multi-source queries hit finishReason=MAX_TOKENS and the
+        # partial answer was handed back as an unqualified success that simply
+        # stopped mid-sentence. A truncated answer must say so.
+        data = {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "Kafka scales by"}]},
+                    "finishReason": "MAX_TOKENS",
+                }
+            ]
+        }
+        out = mcp_server._render_grounded_answer(data, "Research Results")
+        self.assertIn("Kafka scales by", out)
+        self.assertIn("truncated", out.lower())
+        self.assertIn("max_tokens", out.lower())
+
+    def test_truncation_before_any_text_explains_the_budget(self):
+        # The thinking budget can swallow the entire allowance, leaving no
+        # answer text at all. That is a different failure from "the model
+        # returned nothing" and needs the actionable message, not the generic
+        # empty-answer one.
+        data = {
+            "candidates": [{"content": {"parts": []}, "finishReason": "MAX_TOKENS"}]
+        }
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("Error", out)
+        self.assertIn("budget", out.lower())
+        self.assertNotIn("returned an empty answer", out)
+
+    def test_other_abnormal_finish_reasons_are_named(self):
+        # Observed live: a budget too small for the model to emit a well-formed
+        # grounding call returns MALFORMED_FUNCTION_CALL, not MAX_TOKENS. Any
+        # abnormal reason should be named rather than flattened into a bare
+        # "empty answer" the caller cannot act on.
+        for reason in ("MALFORMED_FUNCTION_CALL", "SAFETY", "RECITATION"):
+            with self.subTest(reason=reason):
+                data = {
+                    "candidates": [
+                        {"content": {"role": "model"}, "finishReason": reason}
+                    ]
+                }
+                out = mcp_server._render_grounded_answer(data, "Quick Research")
+                self.assertIn("Error", out)
+                self.assertIn(reason, out)
+
+    def test_missing_finish_reason_keeps_the_generic_message(self):
+        data = {"candidates": [{"content": {"parts": []}}]}
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("returned an empty answer", out)
+
+    def test_abnormal_finish_with_text_is_flagged_not_passed_off_as_complete(self):
+        # Same defect class as the MAX_TOKENS case: a partial answer can also
+        # arrive under SAFETY / RECITATION / a reason Google adds later. The
+        # text is still returned, but it must not read as a complete answer.
+        for reason in ("SAFETY", "RECITATION", "SOME_FUTURE_REASON"):
+            with self.subTest(reason=reason):
+                data = {
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": "Partial body"}]},
+                            "finishReason": reason,
+                        }
+                    ]
+                }
+                out = mcp_server._render_grounded_answer(data, "Quick Research")
+                self.assertIn("Partial body", out)
+                self.assertIn("may be incomplete", out)
+                self.assertIn(reason, out)
+
+    def test_complete_answer_carries_no_truncation_warning(self):
+        data = {
+            "candidates": [
+                {"content": {"parts": [{"text": "Complete."}]}, "finishReason": "STOP"}
+            ]
+        }
+        out = mcp_server._render_grounded_answer(data, "Quick Research")
+        self.assertIn("Complete.", out)
+        self.assertNotIn("truncated", out.lower())
+
+    def test_defaults_clear_the_measured_thinking_floor(self):
+        # Live measurement put thoughtsTokenCount at 666-1851 on this model,
+        # so any default at or below ~2048 is at the mercy of the thinking
+        # spend. Pin the shipped values so accidental drift fails loudly, and
+        # keep the floor/ordering assertions so the REASON stays encoded —
+        # a deliberate retune updates this test on purpose.
+        self.assertEqual(mcp_server._QUICK_DEFAULT_MAX_TOKENS, 8192)
+        self.assertEqual(mcp_server._DEEP_DEFAULT_MAX_TOKENS, 16384)
+        self.assertGreater(mcp_server._QUICK_DEFAULT_MAX_TOKENS, 2048)
+        self.assertGreater(
+            mcp_server._DEEP_DEFAULT_MAX_TOKENS,
+            mcp_server._QUICK_DEFAULT_MAX_TOKENS,
+        )
+        self.assertLessEqual(
+            mcp_server._DEEP_DEFAULT_MAX_TOKENS, mcp_server._VERTEX_MAX_OUTPUT_TOKENS
+        )
+        # The validator must actually hand those defaults through.
+        self.assertEqual(
+            mcp_server._validate_research_arguments("quick_research", {"query": "q"}),
+            ("q", mcp_server._QUICK_DEFAULT_MAX_TOKENS),
+        )
+        self.assertEqual(
+            mcp_server._validate_research_arguments("deep_research", {"query": "q"}),
+            ("q", mcp_server._DEEP_DEFAULT_MAX_TOKENS),
+        )
+
     def test_empty_candidates_fail_closed(self):
         out = mcp_server._render_grounded_answer({}, "Quick Research")
         self.assertIn("Error", out)
