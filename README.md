@@ -431,7 +431,8 @@ For Claude Desktop (uses the legacy virtualenv launcher):
 Input schema:
 
 - `query`: required string
-- `max_tokens`: optional integer, default `2048`
+- `max_tokens`: optional integer, 1–65535, default `16384`
+  (`quick_research` defaults to `8192`)
 
 Output behavior:
 
@@ -439,6 +440,17 @@ Output behavior:
   section built from Google Search grounding metadata
 - response is routed through a redactor that masks secret-shape strings
   (Google API keys, OAuth tokens, JWTs, private-key blocks)
+- an answer cut short by the output budget carries an explicit truncation
+  warning, and any other abnormal `finishReason` (`SAFETY`,
+  `MALFORMED_FUNCTION_CALL`, …) is named in the error rather than reported
+  as an empty answer
+
+`max_tokens` is a shared budget: `gemini-flash-latest` is a thinking model
+and its reasoning tokens are billed against the same allowance as the
+answer. Measured live, reasoning alone ran 666–1851 tokens, which is why
+the defaults sit well above the answer length you actually expect. The
+budget is a ceiling, not an allocation — a short answer costs only what it
+uses.
 
 ### `agent_research`
 
