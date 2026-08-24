@@ -150,6 +150,43 @@ else
     print_ok "Installed to ${INSTALL_DIR}/${SCRIPT_NAME}"
 fi
 
+# The coding_agent package travels WITH the server, not instead of it:
+# mcp_server.py imports it lazily inside call_tool (to keep startup cheap),
+# so a standalone install missing this directory still advertises the
+# coding_agent tool and then raises ModuleNotFoundError when it is called.
+# Python puts the script's own directory on sys.path, so INSTALL_DIR is
+# exactly where the import resolves from. Its one runtime dependency,
+# pathspec, is already in mcp_server.py's PEP 723 block.
+PACKAGE_NAME="coding_agent"
+SOURCE_PACKAGE=""
+
+if [[ -d "${INSTALLER_DIR}/${PACKAGE_NAME}" ]]; then
+    SOURCE_PACKAGE="${INSTALLER_DIR}/${PACKAGE_NAME}"
+elif [[ -d "./${PACKAGE_NAME}" ]]; then
+    SOURCE_PACKAGE="$(pwd)/${PACKAGE_NAME}"
+fi
+
+if [[ -z "$SOURCE_PACKAGE" ]]; then
+    print_fail "${PACKAGE_NAME}/ not found next to installer or in current directory"
+    exit 1
+fi
+
+if [[ -d "${INSTALL_DIR}/${PACKAGE_NAME}" ]] &&
+    diff -rq -x '__pycache__' \
+        "$SOURCE_PACKAGE" "${INSTALL_DIR}/${PACKAGE_NAME}" >/dev/null 2>&1; then
+    print_skip "${PACKAGE_NAME}/ already installed and up to date"
+else
+    # Replaced wholesale rather than merged, so a module deleted upstream
+    # cannot survive here as a stale import target. `:?` aborts rather than
+    # expanding to `rm -rf /coding_agent` if INSTALL_DIR is ever unset.
+    rm -rf "${INSTALL_DIR:?}/${PACKAGE_NAME}"
+    mkdir -p "${INSTALL_DIR}/${PACKAGE_NAME}"
+    # Sources only: __pycache__ is build residue from whichever interpreter
+    # last ran in the source tree, and uv may resolve a different one here.
+    cp "${SOURCE_PACKAGE}"/*.py "${INSTALL_DIR}/${PACKAGE_NAME}/"
+    print_ok "Installed ${PACKAGE_NAME}/ to ${INSTALL_DIR}/${PACKAGE_NAME}"
+fi
+
 # ─── Step 3: API tokens ─────────────────────────────────────────
 
 print_step "Setting up API tokens (macOS Keychain)"
