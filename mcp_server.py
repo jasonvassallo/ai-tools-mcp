@@ -523,12 +523,31 @@ def _report_cf_access_credentials() -> None:
 def run_check() -> None:
     """Validate configuration and exit. Used by install.sh to verify setup."""
     errors = 0
+    # Non-fatal since 1.5.11: the Perplexity key backs only `agent_research`,
+    # an explicit-invocation tool. The default research path (quick_research
+    # / deep_research) runs on ADC-authenticated Vertex, so an install with
+    # no Perplexity key is a perfectly usable deployment and must not be
+    # reported as unhealthy — the installer and every SessionStart preflight
+    # read this exit status. Same rule the Ollama block below already
+    # applies, and `agent_research` still fails closed at call time.
     try:
-        _, source = _resolve_credential("api_tokens", "perplexity")
-        print(f"ok: perplexity key found ({source}) [agent_research only]")
+        # _resolve_credential returns a blank value unconditionally when the
+        # store holds one — it leaves the fail-closed decision to the caller.
+        # A blank key is unusable, so report it as unavailable rather than
+        # printing a reassuring "found".
+        value, source = _resolve_credential("api_tokens", "perplexity")
+        if value:
+            print(f"ok: perplexity key found ({source}) [agent_research only]")
+        else:
+            print(
+                f"warn: perplexity key is empty ({source}) — agent_research "
+                "unavailable; quick_research/deep_research are unaffected"
+            )
     except ValueError as e:
-        print(f"fail: {e}")
-        errors += 1
+        print(
+            f"warn: perplexity key not found — agent_research unavailable; "
+            f"quick_research/deep_research are unaffected. {e}"
+        )
 
     try:
         creds, project = _load_adc()
@@ -1304,6 +1323,19 @@ async def _get_gemini_interaction(interaction_id: str) -> dict[str, Any]:
 # validation and then fail at the API.
 _VERTEX_MAX_OUTPUT_TOKENS = 65535
 
+# Default answer budgets. These must clear the THINKING floor, not just the
+# expected answer length: gemini-flash-latest is a thinking model and its
+# thought tokens are billed against maxOutputTokens. Measured live on
+# 2026-08-10 across ~20 runs, thoughtsTokenCount ranged 666-1851 — so the
+# original 1024/2048 defaults were at or below the thinking spend alone and
+# produced finishReason=MAX_TOKENS on roughly a third of ordinary
+# multi-source queries, truncating answers mid-sentence. These budgets are
+# ceilings, not allocations: an answer that finishes early costs only what it
+# used, so raising them buys headroom without raising the price of a typical
+# call.
+_QUICK_DEFAULT_MAX_TOKENS = 8192
+_DEEP_DEFAULT_MAX_TOKENS = 16384
+
 
 def _validate_research_arguments(
     tool_name: str, arguments: dict
@@ -1317,7 +1349,10 @@ def _validate_research_arguments(
     if not isinstance(query, str) or not query.strip():
         return f"Error: {tool_name} requires a non-empty string 'query'"
     max_tokens = arguments.get(
-        "max_tokens", 1024 if tool_name == "quick_research" else 2048
+        "max_tokens",
+        _QUICK_DEFAULT_MAX_TOKENS
+        if tool_name == "quick_research"
+        else _DEEP_DEFAULT_MAX_TOKENS,
     )
     if (
         isinstance(max_tokens, bool)
@@ -1425,10 +1460,54 @@ def _render_grounded_answer(data: dict[str, Any], heading: str) -> str:
         for p in parts
         if isinstance(p, dict) and isinstance(p.get("text"), str)
     ).strip()
+
+    # finishReason distinguishes "the model said nothing" from "the model was
+    # cut off". Both arrive with thin or absent text, but they need opposite
+    # messages: the first is a failure, the second is a partial answer whose
+    # remedy is a bigger budget. Without this the caller was handed a truncated
+    # answer as an unqualified success — it simply stopped mid-sentence.
+    # Mirrors the agent_research renderer, which already surfaces a non-terminal
+    # upstream status for exactly this reason.
+    finish = candidate.get("finishReason")
+    finish = finish if isinstance(finish, str) else ""
+    truncated = finish.upper() == "MAX_TOKENS"
+
     if not text:
+        if truncated:
+            return (
+                f"Error: Vertex hit the output budget for {heading} before "
+                "producing any answer text — the model's internal reasoning "
+                "consumed the whole budget. Retry with a larger max_tokens."
+            )
+        if finish and finish.upper() != "STOP":
+            # Anything else abnormal (observed live: MALFORMED_FUNCTION_CALL
+            # when the budget is too small for the model to emit a well-formed
+            # grounding call; also SAFETY, RECITATION). Naming the reason beats
+            # a bare "empty answer" the caller cannot act on.
+            return (
+                f"Error: Vertex returned no answer text for {heading} "
+                f"(finishReason: {redact_secrets(finish)})"
+            )
         return f"Error: Vertex returned an empty answer for {heading}"
 
     sections = [f"## {heading}", "", text]
+    if truncated:
+        sections += [
+            "",
+            "> ⚠️ This answer was truncated: it reached the output budget "
+            "(`finishReason: MAX_TOKENS`). Re-run with a larger `max_tokens` "
+            "for the complete answer.",
+        ]
+    elif finish and finish.upper() != "STOP":
+        # A partial answer can also arrive under SAFETY, RECITATION, or any
+        # reason Google adds later. The text is still worth returning, but it
+        # must not read as complete — the same rule as truncation, one level
+        # wider, so an unknown future reason fails visible rather than silent.
+        sections += [
+            "",
+            "> ⚠️ This answer may be incomplete: the model stopped for an "
+            f"abnormal reason (`finishReason: {redact_secrets(finish)}`).",
+        ]
     grounding = candidate.get("groundingMetadata")
     if not isinstance(grounding, dict):
         grounding = {}
@@ -3177,8 +3256,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "max_tokens": {
                         "type": "integer",
-                        "description": "Maximum tokens for response (default: 1024)",
-                        "default": 1024,
+                        "description": (
+                            "Output budget, shared with the model's internal "
+                            f"reasoning (default: {_QUICK_DEFAULT_MAX_TOKENS}). "
+                            "Too small a value truncates the answer."
+                        ),
+                        "default": _QUICK_DEFAULT_MAX_TOKENS,
+                        "minimum": 1,
+                        "maximum": _VERTEX_MAX_OUTPUT_TOKENS,
                     },
                 },
                 "required": ["query"],
@@ -3208,8 +3293,14 @@ async def list_tools() -> list[Tool]:
                     },
                     "max_tokens": {
                         "type": "integer",
-                        "description": "Maximum tokens for response (default: 2048)",
-                        "default": 2048,
+                        "description": (
+                            "Output budget, shared with the model's internal "
+                            f"reasoning (default: {_DEEP_DEFAULT_MAX_TOKENS}). "
+                            "Too small a value truncates the answer."
+                        ),
+                        "default": _DEEP_DEFAULT_MAX_TOKENS,
+                        "minimum": 1,
+                        "maximum": _VERTEX_MAX_OUTPUT_TOKENS,
                     },
                 },
                 "required": ["query"],
