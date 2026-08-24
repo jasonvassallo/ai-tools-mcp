@@ -617,16 +617,22 @@ class TestResolveOllamaChain(unittest.TestCase):
         self.assertEqual(chain, ["http://localhost:11434"])
 
     def test_plain_http_remote_rejected(self):
-        with self.assertRaises(ValueError):
+        # The message reaches --check's print() verbatim (redact_secrets only
+        # strips secret-shaped substrings), so it must encode on cp932/cp949
+        # consoles too: an `http://` typo for a remote host must not crash
+        # the preflight that exists to report it.
+        with self.assertRaises(ValueError) as ctx:
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://remote.example:11434"})
+        str(ctx.exception).encode("ascii")
 
     def test_embedded_credentials_rejected(self):
         # Credentials in the endpoint URL are never legitimate here — remote
         # auth is CF Access headers from the Keychain, not URL userinfo.
         # Embedded creds would otherwise flow into error messages / --check
         # stdout, and redact_secrets has no generic userinfo pattern.
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://user:pw@localhost:11434"})
+        str(ctx.exception).encode("ascii")
 
     def test_embedded_credentials_password_not_leaked_in_error(self):
         # An arbitrary password has no secret "shape" redact_secrets can

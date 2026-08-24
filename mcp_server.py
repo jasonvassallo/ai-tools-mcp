@@ -1981,12 +1981,12 @@ def _validate_ollama_endpoint(url: str) -> str:
     if parsed.scheme == "http" and not _is_localhost_endpoint(url):
         raise ValueError(
             f"Refusing plain-http non-localhost Ollama endpoint "
-            f"{redact_secrets(display)!r} — remote endpoints must be https"
+            f"{redact_secrets(display)!r} - remote endpoints must be https"
         )
     if parsed.username is not None or parsed.password is not None:
         raise ValueError(
             f"Refusing Ollama endpoint with embedded credentials "
-            f"{redact_secrets(display)!r} — auth belongs in the Keychain "
+            f"{redact_secrets(display)!r} - auth belongs in the Keychain "
             "(CF Access service token), never in the URL"
         )
     return url.rstrip("/")
