@@ -33,7 +33,11 @@ Keep those tool names stable unless a change is explicitly requested.
 
 ## Packaging Formats
 
-The same `mcp_server.py` is wrapped three ways. When making changes, update all three:
+The same server payload is wrapped three ways. When making changes, update all
+three. The payload is `mcp_server.py` **plus the `coding_agent/` package** —
+`mcp_server.py` imports it lazily inside `call_tool`, so a format that ships
+only the single file still advertises the `coding_agent` tool and then raises
+`ModuleNotFoundError` when it is called:
 
 - Standalone: `install.sh` registers it directly in `~/.claude/.mcp.json`
 - Claude Code plugin: `.claude-plugin/plugin.json` + `.mcp.json` + `commands/` + `skills/` + `hooks/`

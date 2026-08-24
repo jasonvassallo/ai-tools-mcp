@@ -208,7 +208,11 @@ class SandboxOps(Protocol):
         self, worktree: str, image: str, *, cpus: str, memory: str, pids: int
     ) -> str: ...
 
-    async def destroy_container(self, container: str) -> None: ...
+    # Returns None once the removal is CONFIRMED, else one line saying why it
+    # could not be — see `sandbox.destroy_container`. `_teardown` turns that
+    # into a caveat on the diff, because §6.5 rule 3's ordering guarantee is
+    # exactly what an unconfirmed removal fails to deliver.
+    async def destroy_container(self, container: str) -> str | None: ...
 
     def teardown_worktree(self, repo: str, worktree: str) -> list[str]: ...
 
@@ -321,12 +325,24 @@ async def _teardown(
     try:
         try:
             if container is not None:
-                await ops.destroy_container(container)
+                # Two arms, because there are two ways the destroy can fail
+                # to hold: `sandbox.destroy_container` REPORTS an unconfirmed
+                # removal (a non-zero `docker rm -f`, a spawn error, a
+                # timeout) rather than raising, since `_reap_labelled` calls
+                # it in a loop; a different `SandboxOps` may still raise.
+                #
+                # Either way the diff below is still computed — losing it
+                # entirely on a docker hiccup would cost the human the only
+                # record of what the model did — but it is no longer
+                # race-free, and saying so is the difference between a
+                # caveated artifact and a quiet under-show.
+                unconfirmed = await ops.destroy_container(container)
+                if unconfirmed:
+                    out.problems.append(
+                        f"{unconfirmed} — container {container} may still be "
+                        f"running, so the diff may be incomplete"
+                    )
         except Exception as exc:  # noqa: BLE001 — a teardown step may not raise
-            # The diff below is still computed — losing it entirely on a
-            # docker hiccup would cost the human the only record of what the
-            # model did — but it is no longer race-free, and saying so is the
-            # difference between a caveated artifact and a quiet under-show.
             out.problems.append(
                 f"docker rm -f failed: {type(exc).__name__}: {exc} — container "
                 f"{container} may still be running, so the diff may be incomplete"
@@ -334,7 +350,22 @@ async def _teardown(
         # ---- the host read. Never before the line above. ----
         try:
             snap = await asyncio.to_thread(snapshot_tree, worktree, ignore)
-            diff = unified_diff(
+            # In a thread for the same reason `snapshot_tree` is, and more
+            # urgently: `unified_diff` holds two quadratic paths over input
+            # the SANDBOX chooses the size of. Measured with difflib over
+            # 150 distinct tokens, 0.50 MB took 3.03 s, 1.00 MB 12.17 s and
+            # 2.01 MB 50.61 s — a clean 4x per doubling against a
+            # `_MAX_FILE_BYTES` of 8 MiB. `_not_compared` is the second
+            # path (20,000 base paths x 200,000 unreadable: 59.44 s).
+            #
+            # On the loop that is not slowness, it is a stall of the WHOLE
+            # MCP server, including the `coding_agent_result` call the human
+            # polls to see this very diff — and no ceiling can preempt it
+            # (`wait_for(timeout=0.5)` measured returning after 3.00 s
+            # against a synchronous body). So the model would be choosing
+            # how long the server stops answering.
+            diff = await asyncio.to_thread(
+                unified_diff,
                 base,
                 snap,
                 max_bytes=_DIFF_MAX_BYTES,
@@ -463,10 +494,12 @@ def _trim_conversation(messages: list[dict[str, Any]]) -> int:
     backend rejecting the payload. This changes only bytes — never the message
     count, the roles, or the `tool_calls` array's shape (id/type/name/call
     count are untouched). That guarantee covers the `arguments` field's own
-    TYPE: a string is cut to a shorter string, and an object (Ollama's shape)
-    keeps every key and stays an object, with the cut taken inside its largest
-    string value. Replacing an object with its truncated rendering would be a
-    shape change, and the result would not survive a re-parse.
+    TYPE, for every shape `_as_dict` says can arrive: a string is cut to a
+    shorter string; an object (Ollama's shape) keeps every key and stays an
+    object, with the cut taken inside its largest string value; and a list or
+    bare scalar is left whole, because no in-place cut of one preserves its
+    type. Replacing any of them with its truncated rendering would be a shape
+    change, and the result would not survive a re-parse.
 
     Oldest first, because the recent turns are the ones the model is actually
     reasoning about; the early ones have already done their work.
@@ -512,14 +545,26 @@ def _trim_conversation(messages: list[dict[str, Any]]) -> int:
                     if not _elide_arg_object(raw):
                         continue
                     after = len(_arg_text(raw))
-                else:
-                    args = _arg_text(raw)
-                    cut = args[:_ELIDED_TOOL_CHARS] + (
-                        f"...[{len(args) - _ELIDED_TOOL_CHARS} chars elided from an "
+                elif isinstance(raw, str):
+                    cut = raw[:_ELIDED_TOOL_CHARS] + (
+                        f"...[{len(raw) - _ELIDED_TOOL_CHARS} chars elided from an "
                         f"earlier tool call to bound this conversation]"
                     )
                     function["arguments"] = cut
                     after = len(cut)
+                else:
+                    # A list or a bare scalar. `_as_dict` documents both as
+                    # shapes a non-Ollama server can send, and neither has an
+                    # in-place cut that preserves its type — so the previous
+                    # `else` stringified them, making this the one input that
+                    # still suffered the shape change the rest of this
+                    # function exists to prevent.
+                    #
+                    # Left whole instead. The bytes are the cheaper loss: a
+                    # call whose `arguments` is a list is already unusable
+                    # (`_as_dict` yields {} for it), whereas a rewritten type
+                    # would break the guarantee for every reader downstream.
+                    continue
                 total -= before - after
                 elided += 1
     return elided

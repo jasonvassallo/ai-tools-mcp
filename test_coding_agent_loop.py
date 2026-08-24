@@ -97,6 +97,10 @@ class _RecordingOps:
         *,
         destroy_delay: float = 0.0,
         destroy_exc: BaseException | None = None,
+        # What `sandbox.destroy_container` returns when it could not confirm
+        # the removal. None is the confirmed case, so every existing fake
+        # keeps meaning exactly what it meant before.
+        destroy_report: str | None = None,
         start_exc: BaseException | None = None,
         teardown_problems: tuple[str, ...] = (),
         teardown_exc: BaseException | None = None,
@@ -106,6 +110,7 @@ class _RecordingOps:
         self.container_alive = False
         self.destroy_delay = destroy_delay
         self.destroy_exc = destroy_exc
+        self.destroy_report = destroy_report
         self.start_exc = start_exc
         self.teardown_problems = teardown_problems
         self.teardown_exc = teardown_exc
@@ -127,8 +132,14 @@ class _RecordingOps:
             await asyncio.sleep(self.destroy_delay)
         if self.destroy_exc is not None:
             raise self.destroy_exc
+        if self.destroy_report is not None:
+            # An UNCONFIRMED removal: the container is deliberately left
+            # `alive`, because that is precisely what the report means.
+            self.calls.append("destroy:unconfirmed")
+            return self.destroy_report
         self.container_alive = False
         self.calls.append("destroy:done")
+        return None
 
     def teardown_worktree(self, repo, worktree):
         self.calls.append("teardown_worktree")
@@ -415,6 +426,29 @@ class CleanupIsUnconditional(_LoopCase):
         self.assertEqual(len(result.cleanup_problems), 1)
         self.assertIn("docker rm -f failed", result.cleanup_problems[0])
         self.assertIn("diff may be incomplete", result.cleanup_problems[0])
+
+    def test_an_UNCONFIRMED_docker_rm_is_caveated_on_the_result(self):
+        """`docker rm -f` reports failure by EXIT CODE far more often than by
+        raising, and the reported case is the dangerous one: §6.5 rule 3 says
+        the container is dead before the host read, so a removal that only
+        looked successful means the diff below it raced a live container. The
+        human has to be told, or they review an under-show believing it whole.
+        """
+        ops = _RecordingOps(self.wt, destroy_report="docker rm -f exited 1")
+        result, ops = self.run_loop([_say("done")], ops=ops)
+        self.assertIn("destroy:unconfirmed", ops.calls)
+        self.assertEqual(len(result.cleanup_problems), 1)
+        self.assertIn("docker rm -f exited 1", result.cleanup_problems[0])
+        self.assertIn("diff may be incomplete", result.cleanup_problems[0])
+        # Still unconditional: the worktree goes regardless (§6.6).
+        self.assertIn("teardown_worktree", ops.calls)
+
+    def test_a_CONFIRMED_docker_rm_caveats_nothing(self):
+        """The other half — otherwise the caveat above could be unconditional
+        and this suite could not tell the difference."""
+        result, ops = self.run_loop([_say("done")])
+        self.assertIn("destroy:done", ops.calls)
+        self.assertEqual(result.cleanup_problems, [])
 
     def test_a_failing_worktree_teardown_is_reported_not_raised(self):
         ops = _RecordingOps(self.wt, teardown_exc=OSError("EBUSY"))
@@ -1343,6 +1377,63 @@ class TranscriptIsBounded(_LoopCase):
             for m in messages
         )
         self.assertLessEqual(total, L._MAX_CONVERSATION_CHARS)
+
+    def test_a_list_valued_tool_call_argument_keeps_its_type_too(self):
+        """The third shape, and the one the object fix above did not reach.
+        `_as_dict`'s docstring names a JSON string, an OBJECT, a LIST and a
+        bare scalar as things a server can send. String and object each got a
+        type-preserving path; a list fell into the old `else` and came back a
+        `str` — the same shape change, one branch over.
+
+        Left whole now. That costs bytes on a call that is already unusable
+        (`_as_dict` yields `{}` for a list), and buys an unconditional type
+        guarantee, which is the only kind worth documenting.
+        """
+        big = ["Y" * (L._MAX_CONVERSATION_CHARS + 5000)]
+        messages = [
+            {"role": "system", "content": "S"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": big},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "recent"},
+        ]
+
+        L._trim_conversation(messages)
+
+        kept = messages[1]["tool_calls"][0]["function"]["arguments"]
+        self.assertIsInstance(kept, list)  # NOT a str, which is the whole point
+        self.assertEqual(kept, big)
+        self.assertNotIn("chars elided", json.dumps(kept))
+
+    def test_a_scalar_valued_tool_call_argument_keeps_its_type_too(self):
+        """The fourth shape `_as_dict` names. Bounded by construction — a
+        scalar cannot be oversized — so this pins the branch, not a cut."""
+        messages = [
+            {"role": "system", "content": "S" * (L._MAX_CONVERSATION_CHARS + 5000)},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": 12345},
+                    }
+                ],
+            },
+        ]
+
+        L._trim_conversation(messages)
+
+        self.assertEqual(messages[1]["tool_calls"][0]["function"]["arguments"], 12345)
 
     def test_changed_files_and_unreadable_are_bounded_with_an_exact_count(self):
         """SF-3 / NF-4. Every other model-controlled field was bounded; these

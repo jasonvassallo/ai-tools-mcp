@@ -2546,6 +2546,30 @@ async def _post_ollama_chat(
         }, evict_warning
 
 
+async def _coding_agent_chat(
+    payload: dict[str, Any], timeout_s: float
+) -> dict[str, Any]:
+    """`_post_ollama_chat`'s response body alone, for `coding_agent`'s seam.
+
+    `coding_agent.run_coding_agent` takes a `chat` that returns the body;
+    `_post_ollama_chat` returns `(body, evict_warning)`. Adapting HERE rather
+    than widening the package's contract keeps the eviction channel — which
+    exists for `_render_delegate_answer`'s banner — out of an API that has no
+    use for it: the warning is produced only under `pre_unload`, which the
+    coding agent never asks for, so it is invariably "" on this path.
+
+    The adapter is deliberately adjacent to `_post_ollama_chat`, because it
+    is that function's return shape it is pinned to, and `mcp_server` is
+    outside `mypy --strict`'s scope (which covers `coding_agent/` only). That
+    gap is why passing `_post_ollama_chat` directly type-checked clean while
+    failing every real run on turn 1 with `AttributeError: 'tuple' object has
+    no attribute 'get'`. `CodingAgentChatSeam` in test_coding_agent_mcp.py
+    exercises both sides against each other so the gap cannot silently reopen.
+    """
+    body, _evict_warning = await _post_ollama_chat(payload, timeout_s)
+    return body
+
+
 def _render_delegate_answer(
     data: dict[str, Any], prefix: str = "", evict_warning: str = ""
 ) -> list[TextContent]:
@@ -4392,7 +4416,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             max_turns=max_turns,
             max_seconds=float(max_seconds),
             image=_coding_agent_image(),
-            chat=_post_ollama_chat,
+            chat=_coding_agent_chat,
         )
         if background:
             return [
@@ -4438,7 +4462,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         # Render FIRST, retire the job SECOND. The old order deleted the entry
         # and then built the payload, so anything that failed in between lost
         # the result for good — and the worktree it describes is already gone.
-        text = json.dumps(outcome, default=str)
+        #
+        # `_json_safe` HERE rather than inside `_collect_coding_job`: only the
+        # success envelope was scrubbed there, so the `failed` and `cancelled`
+        # envelopes could still emit `"\udce9"` from an error string built out
+        # of a lone-surrogate `repo`/`base_ref` — valid for `json.dumps`,
+        # rejected by RFC 8259 and so by a strict parser. Applying it at the
+        # one point that serialises covers every envelope, including the next
+        # one somebody adds. It is idempotent, so the already-scrubbed success
+        # payload is unaffected.
+        text = json.dumps(_json_safe(outcome), default=str)
         commit()
         return [TextContent(type="text", text=text)]
 

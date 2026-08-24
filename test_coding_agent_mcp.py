@@ -711,6 +711,39 @@ class BackgroundJobs(_McpCase):
         self.assertEqual(body["status"], "running")
         self.assertIsInstance(body["elapsed_s"], int)
 
+    def test_the_failed_envelope_is_scrubbed_like_the_success_one(self):
+        """`_json_safe` used to run only on the SUCCESS payload, inside
+        `_collect_coding_job`. The `failed` and `cancelled` envelopes went out
+        raw — and their `error` is built from the exception text, which can
+        carry a lone surrogate straight from a `repo`/`base_ref` the client
+        chose. `json.dumps` does not raise on one: it emits `"\\udce9"`, which
+        RFC 8259 does not permit, so a strict parser rejects the WHOLE reply.
+        Scrubbing at the one point that serialises covers every envelope."""
+
+        async def scenario():
+            with _raises(RuntimeError("bad ref \udce9 here")):
+                out = await mcp_server.call_tool(
+                    "coding_agent", self.args(background=True)
+                )
+                job_id = json.loads(out[0].text)["job_id"]
+                with contextlib.suppress(Exception):
+                    await mcp_server._coding_jobs[job_id]["task"]
+                got = await mcp_server.call_tool(
+                    "coding_agent_result", {"job_id": job_id}
+                )
+            return got[0].text
+
+        text = asyncio.run(scenario())
+        # The wire text itself: `json.dumps` escapes a lone surrogate to the
+        # ASCII sequence `\udce9`, which encodes fine and is exactly what a
+        # strict parser refuses. So assert on the ESCAPE, not on encodability.
+        self.assertNotIn("\\udce9", text)
+        body = json.loads(text)  # Python's own parser is lenient about it
+        self.assertEqual(body["status"], "failed")
+        self.assertIn("RuntimeError", body["error"])
+        self.assertNotIn("\udce9", body["error"])  # the surrogate is gone
+        self.assertIn("bad ref", body["error"])  # the message is not
+
     def test_results_are_single_collect(self):
         async def scenario():
             with _returns(_result(turns=7)):
@@ -1126,8 +1159,12 @@ class DispatchWiring(_McpCase):
     def test_the_pinned_sandbox_image_is_wired(self):
         self.assertEqual(self._seen()["image"], "ai-tools-coding-agent:latest")
 
-    def test_the_chat_callable_is_the_ollama_poster(self):
-        self.assertIs(self._seen()["chat"], mcp_server._post_ollama_chat)
+    def test_the_chat_callable_is_the_ollama_poster_adapter(self):
+        """`_post_ollama_chat` itself must NOT be wired here: it returns
+        `(body, evict_warning)` and the loop calls `.get()` on what it gets
+        back. `CodingAgentChatSeam` below covers why identity alone is not
+        enough of a test."""
+        self.assertIs(self._seen()["chat"], mcp_server._coding_agent_chat)
 
     def test_an_explicit_allowlisted_model_wins(self):
         self.assertEqual(
@@ -1137,6 +1174,120 @@ class DispatchWiring(_McpCase):
     def test_no_sandbox_factory_is_injected(self):
         """The dispatch must not choose the sandbox; the package does."""
         self.assertNotIn("sandbox_factory", self._seen())
+
+
+# ---------------------------------------------------------------------------
+# The seam between the dispatch's chat callable and the loop that calls it
+# ---------------------------------------------------------------------------
+
+
+class _FakeChatResponse:
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict:
+        return self._body
+
+
+class _FakeChatClient:
+    def __init__(self, body: dict) -> None:
+        self._body = body
+
+    async def post(self, url, **kw):
+        return _FakeChatResponse(self._body)
+
+
+class CodingAgentChatSeam(unittest.TestCase):
+    """`mypy --strict` covers `coding_agent/` only, so nothing type-checked
+    `_post_ollama_chat`'s `(body, evict_warning)` against the dict-returning
+    `chat` the loop calls `.get()` on. Both sides were internally consistent
+    and every real run still died on turn 1.
+
+    So these exercise BOTH REAL SIDES against each other. A fake on either
+    side re-opens exactly the gap that hid the defect: a tuple-shaped loop
+    fake pins only what the loop expects, and cannot fail when the poster is
+    what drifts.
+    """
+
+    _EP = "http://127.0.0.1:11434"
+
+    def _no_endpoint(self):
+        return mock.patch.object(
+            mcp_server,
+            "_select_ollama_endpoint",
+            mock.AsyncMock(side_effect=ValueError("no endpoint serves m")),
+        )
+
+    def test_the_adapter_hands_the_loop_the_body_of_a_real_success(self):
+        body = {"model": "m", "message": {"role": "assistant", "content": "hi"}}
+        with (
+            mock.patch.object(
+                mcp_server,
+                "_select_ollama_endpoint",
+                mock.AsyncMock(return_value=self._EP),
+            ),
+            mock.patch.object(mcp_server, "_ollama_auth_headers", lambda ep: {}),
+            mock.patch.object(
+                mcp_server,
+                "_get_http_client",
+                mock.AsyncMock(return_value=_FakeChatClient(body)),
+            ),
+        ):
+            got = asyncio.run(mcp_server._coding_agent_chat({"model": "m"}, 5.0))
+        self.assertIsInstance(got, dict)  # a dict, not the poster's 2-tuple
+        self.assertEqual(got, body)
+
+    def test_the_adapter_hands_the_loop_the_body_of_a_real_failure(self):
+        with self._no_endpoint():
+            got = asyncio.run(mcp_server._coding_agent_chat({"model": "m"}, 5.0))
+        self.assertIsInstance(got, dict)
+        self.assertEqual(got["status"], "failed")
+
+    def test_the_poster_still_returns_the_two_channels_the_adapter_unpacks(self):
+        """The other half of the seam, asserted on the REAL poster. If
+        `_post_ollama_chat` ever drops its second channel the adapter's
+        unpack silently starts yielding a dict KEY, and no loop-side fake
+        could notice."""
+        with self._no_endpoint():
+            got = asyncio.run(mcp_server._post_ollama_chat({"model": "m"}, 5.0))
+        self.assertIsInstance(got, tuple)
+        self.assertEqual(len(got), 2)
+        body, warning = got
+        self.assertIsInstance(body, dict)
+        self.assertIsInstance(warning, str)
+
+    def test_the_real_loop_survives_a_turn_through_the_real_adapter(self):
+        """The regression itself, end to end. Before the fix this raised
+        `AttributeError: 'tuple' object has no attribute 'get'` on turn 1 —
+        for EVERY real run, not just this failing one. The model call here
+        fails for want of an endpoint, so the loop owes a model error and a
+        transcript, not an exception."""
+        worktree = tempfile.mkdtemp(prefix="ca-seam-wt-")
+        self.addCleanup(shutil.rmtree, worktree, ignore_errors=True)
+        with (
+            self._no_endpoint(),
+            mock.patch.object(L, "read_base_tree", return_value=_base_tree()),
+        ):
+            result = asyncio.run(
+                L.run_coding_agent(
+                    task="t",
+                    repo="/repo",
+                    base_ref="HEAD",
+                    model="m",
+                    max_turns=2,
+                    max_seconds=30.0,
+                    image="img",
+                    chat=mcp_server._coding_agent_chat,
+                    sandbox_factory=lambda: _Ops(worktree),
+                )
+            )
+        self.assertEqual(result.stop_reason, StopReason.error)
+        self.assertEqual(result.transcript[0]["turn"], 1)
+        self.assertIn("no endpoint serves m", result.transcript[0]["error"])
+        self.assertNotIn("AttributeError", result.transcript[0]["error"])
 
 
 class SandboxImageResolution(unittest.TestCase):

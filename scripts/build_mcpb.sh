@@ -2,7 +2,7 @@
 # Build the ai-tools-mcp Desktop Extension (.mcpb) archive.
 #
 # Output: dist/ai-tools-mcp.mcpb (a zip with manifest.json at the root +
-# server/mcp_server.py). Drag the resulting file into Claude Desktop →
+# server/mcp_server.py + the server/coding_agent/ package). Drag the file into Claude Desktop →
 # Settings → Extensions to install.
 #
 # Uses Anthropic's official @anthropic-ai/mcpb CLI via npx. Requires
@@ -30,6 +30,17 @@ fi
 echo "→ refreshing server payload"
 mkdir -p "${BUILD_DIR}/server"
 cp "${REPO_ROOT}/mcp_server.py" "${BUILD_DIR}/server/mcp_server.py"
+
+# The coding_agent package, under the same refresh-every-build rule and for
+# the same reason: mcp_server.py imports it lazily inside call_tool, so a
+# bundle without it advertises the coding_agent tool and then raises
+# ModuleNotFoundError when Desktop calls it. Python puts the server script's
+# own directory on sys.path, so server/ is where the import resolves from.
+# Replaced wholesale rather than merged, so a module deleted upstream cannot
+# survive in the bundle as a stale import target.
+rm -rf "${BUILD_DIR}/server/coding_agent"
+mkdir -p "${BUILD_DIR}/server/coding_agent"
+cp "${REPO_ROOT}"/coding_agent/*.py "${BUILD_DIR}/server/coding_agent/"
 
 mkdir -p "${DIST_DIR}"
 rm -f "${ARCHIVE}"

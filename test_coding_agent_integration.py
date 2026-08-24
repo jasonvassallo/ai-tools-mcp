@@ -200,8 +200,13 @@ class _RealOpsRecordingIds:
         self.container = await _sb.start_container(worktree, image, **kw)
         return self.container
 
-    async def destroy_container(self, container: str) -> None:
-        await _sb.destroy_container(container)
+    async def destroy_container(self, container: str) -> str | None:
+        # FORWARDS the report, rather than dropping it on the floor. This
+        # double exists to be indistinguishable from the real thing; a fake
+        # that quietly returns None where production returns a reason is the
+        # exact shape of the defect that let the `chat` contract break for
+        # every real run while the whole suite stayed green.
+        return await _sb.destroy_container(container)
 
     def teardown_worktree(self, repo: str, worktree: str) -> list[str]:
         return _sb.teardown_worktree(repo, worktree)

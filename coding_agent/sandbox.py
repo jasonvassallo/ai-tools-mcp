@@ -315,9 +315,10 @@ def _docker_run_argv(
 
 async def _reap_labelled(run_id: str) -> None:
     """Best-effort cleanup for a container `start_container` never got an id
-    for. Deliberately silent and bounded, same contract as `destroy_container`
-    — this runs on an already-failing path and must never raise or hang it
-    further.
+    for. Bounded, and silent by necessity rather than by preference: this
+    runs on an already-failing path with no result to attach a caveat to, so
+    `destroy_container`'s report is deliberately dropped here. It must never
+    raise or hang that path further.
     """
     with contextlib.suppress(OSError):
         lister = await asyncio.create_subprocess_exec(
@@ -452,12 +453,25 @@ async def exec_in_container(
 
 async def destroy_container(
     container: str, *, timeout_s: float = _DESTROY_TIMEOUT_S
-) -> None:
+) -> str | None:
     """`docker rm -f`, bounded so a wedged daemon cannot hold teardown open.
 
-    Deliberately silent: teardown runs in a `finally` and must never raise.
+    Still never raises — teardown runs in a `finally`, and a teardown step
+    that can raise is a teardown step that can be skipped. It REPORTS
+    instead: `None` once the daemon has confirmed the removal, otherwise one
+    line saying why the removal could not be confirmed.
+
+    Reporting rather than raising is also what `_reap_labelled` needs: it
+    calls this in a loop on an already-failing path, where an exception
+    raised for one container would abandon every container after it.
+
+    The return value is load-bearing, not decorative. §6.5 rule 3 puts the
+    destroy BEFORE the host read precisely so a live container cannot race
+    the diff a human is about to trust; when the removal is unconfirmed that
+    ordering did not hold, and the caller owes the human a caveat rather
+    than a diff presented as race-free.
     """
-    with contextlib.suppress(OSError):
+    try:
         proc = await asyncio.create_subprocess_exec(
             "docker",
             "rm",
@@ -466,13 +480,22 @@ async def destroy_container(
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=timeout_s)
-        except TimeoutError:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(proc.wait(), _KILL_GRACE_S)
+    except OSError as exc:
+        return f"docker rm -f could not start: {type(exc).__name__}: {exc}"
+    try:
+        rc = await asyncio.wait_for(proc.wait(), timeout=timeout_s)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(proc.wait(), _KILL_GRACE_S)
+        # Killing the CLIENT settles nothing about the DAEMON: the removal
+        # may still be in flight, may have failed, or may never have been
+        # accepted. Unknown is reported as unknown.
+        return f"docker rm -f did not finish within {timeout_s:g}s"
+    if rc != 0:
+        return f"docker rm -f exited {rc}"
+    return None
 
 
 def _force_writable(root: str) -> None:

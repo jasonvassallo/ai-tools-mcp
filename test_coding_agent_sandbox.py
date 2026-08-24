@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 import unittest.mock
 import uuid
@@ -728,6 +729,55 @@ class ShieldedCleanupSurvivesCancellation(unittest.TestCase):
         asyncio.run(scenario())
         self.assertTrue(os.path.exists(wt), "unshielded cleanup happened to survive")
         self.assertEqual(teardown_worktree(str(self.repo), wt), [])
+
+
+class DestroyContainerReportsAnUnconfirmedRemoval(unittest.TestCase):
+    """§6.5 rule 3 puts `docker rm -f` BEFORE the host read so a live
+    container cannot race the diff a human is about to trust. That ordering
+    is worth nothing unless a removal that did NOT happen is distinguishable
+    from one that did: otherwise `_teardown` snapshots regardless and hands
+    back an uncaveated diff. So every outcome is reported, and pinned here.
+    """
+
+    def _shim(self, body: str) -> _Shim:
+        shim = _Shim(body)
+        self.addCleanup(shim.cleanup)
+        return shim
+
+    def _destroy(self, shim: _Shim, **kw: object) -> str | None:
+        with shim.patched():
+            return asyncio.run(destroy_container("cid", **kw))  # type: ignore[arg-type]
+
+    def test_a_confirmed_removal_reports_nothing(self) -> None:
+        self.assertIsNone(self._destroy(self._shim("exit 0\n")))
+
+    def test_a_nonzero_rm_is_reported(self) -> None:
+        problem = self._destroy(self._shim("exit 1\n"))
+        self.assertIsNotNone(problem, "a failed `docker rm -f` looked like success")
+        self.assertIn("exited 1", problem or "")
+
+    def test_a_timed_out_rm_is_reported_and_still_bounded(self) -> None:
+        started = time.monotonic()
+        problem = self._destroy(self._shim("sleep 5\n"), timeout_s=0.2)
+        elapsed = time.monotonic() - started
+        self.assertIn("did not finish", problem or "")
+        # Killing the docker CLIENT proves nothing about the daemon, so the
+        # timeout is reported — but it is still bounded, not merely noticed.
+        self.assertLess(elapsed, 4.0, "destroy_container outran its own bound")
+
+    def test_a_docker_that_cannot_be_SPAWNED_is_reported(self) -> None:
+        empty = tempfile.mkdtemp(prefix="ca-test-nobin-")
+        self.addCleanup(shutil.rmtree, empty, ignore_errors=True)
+        with unittest.mock.patch.dict(os.environ, {"PATH": empty}):
+            problem = asyncio.run(destroy_container("cid"))
+        self.assertIn("could not start", problem or "")
+
+    def test_the_argv_is_still_exactly_rm_dash_f(self) -> None:
+        """The report is added; the command is not changed."""
+        shim = self._shim("exit 1\n")
+        with shim.patched():
+            asyncio.run(destroy_container("cid"))
+        self.assertEqual(shim.invocations(), [["rm", "-f", "cid"]])
 
 
 _TEST_IMAGE = os.environ.get("AI_TOOLS_CODING_AGENT_TEST_IMAGE", "alpine:3")

@@ -22,14 +22,23 @@ name: Tests
 # O_NOFOLLOW, os.geteuid) and portable by construction, so it runs on the
 # same runner with no extra work.
 #
-# coding_agent test files EXCLUDED here on purpose:
-# - test_coding_agent_integration.py and test_coding_agent_sandbox.py need a
-#   built `ai-tools-coding-agent:latest` Docker image (git/python/uv/pytest
-#   baked in) that no GitHub runner has. Both files self-skip cleanly without
-#   it (a module-level `docker image inspect`/`docker version` probe sets a
-#   skip reason consumed by a class-level `@unittest.skipIf`), verified by
-#   running them here with no daemon reachable: 0 failures, all Docker-gated
-#   tests reported skipped. They stay local/manual-CI-image-build work.
+# Every coding_agent test file runs here, including the two whose names
+# suggest they cannot. What needs a built `ai-tools-coding-agent:latest`
+# image (git/python/uv/pytest baked in), which no GitHub runner has, is not
+# either FILE but two CLASSES: test_coding_agent_sandbox.py's
+# RealContainerLifecycle and test_coding_agent_integration.py's
+# DockerIntegration. Each carries a class-level `@unittest.skipIf` fed by a
+# module-level `docker version` / `docker image inspect` probe, so both skip
+# cleanly on a runner with no daemon.
+#
+# Those classes are NOT the whole of either file, which is why both files are
+# in the pytest list below. Measured with no daemon reachable: 26 passed,
+# 14 skipped. Among the 26 are DockerArgvIsExactlyTheSpec — which pins the
+# container's confinement flags (`--network=none`, `--read-only`, `--user`,
+# `--cap-drop=ALL`) argument for argument — and NoHostGitEverRunsInTheWorktree,
+# the §6.5 host-RCE control. The safety case for this tool rests on exactly
+# those assertions, so they run in CI rather than only on a developer machine
+# that happens to have Docker up.
 #
 # Permission-dependent coding_agent tests (chmod-000/0644 preconditions in
 # test_coding_agent_security.py and test_coding_agent_walk_dirrefusal.py) are
@@ -109,7 +118,7 @@ jobs:
         # test_coding_agent_sandbox.py); pytest-timeout turns that hang into
         # a red failure instead of a stuck CI job. Everything else in this
         # command runs exactly as before without either package.
-        run: uv run --with pytest --with cryptography --with pathspec --with pytest-timeout pytest test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py test_queue_server.py test_coding_agent_displacement.py test_coding_agent_encoding.py test_coding_agent_loop.py test_coding_agent_mcp.py test_coding_agent_security.py test_coding_agent_tools.py test_coding_agent_walk.py test_coding_agent_walk_dirrefusal.py -q
+        run: uv run --with pytest --with cryptography --with pathspec --with pytest-timeout pytest test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py test_queue_server.py test_coding_agent_displacement.py test_coding_agent_encoding.py test_coding_agent_integration.py test_coding_agent_loop.py test_coding_agent_mcp.py test_coding_agent_sandbox.py test_coding_agent_security.py test_coding_agent_tools.py test_coding_agent_walk.py test_coding_agent_walk_dirrefusal.py -q
 
       - name: Ruff format check
         run: uv tool run --from ruff==0.16.1 ruff format --check mcp_server.py queue_server.py test_redact.py test_session_mgmt.py test_agent_research.py test_local_delegate.py test_queue_server.py coding_agent/*.py test_coding_agent_displacement.py test_coding_agent_encoding.py test_coding_agent_integration.py test_coding_agent_loop.py test_coding_agent_mcp.py test_coding_agent_sandbox.py test_coding_agent_security.py test_coding_agent_tools.py test_coding_agent_walk.py test_coding_agent_walk_dirrefusal.py
