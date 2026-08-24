@@ -617,16 +617,22 @@ class TestResolveOllamaChain(unittest.TestCase):
         self.assertEqual(chain, ["http://localhost:11434"])
 
     def test_plain_http_remote_rejected(self):
-        with self.assertRaises(ValueError):
+        # The message reaches --check's print() verbatim (redact_secrets only
+        # strips secret-shaped substrings), so it must encode on cp932/cp949
+        # consoles too: an `http://` typo for a remote host must not crash
+        # the preflight that exists to report it.
+        with self.assertRaises(ValueError) as ctx:
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://remote.example:11434"})
+        str(ctx.exception).encode("ascii")
 
     def test_embedded_credentials_rejected(self):
         # Credentials in the endpoint URL are never legitimate here — remote
         # auth is CF Access headers from the Keychain, not URL userinfo.
         # Embedded creds would otherwise flow into error messages / --check
         # stdout, and redact_secrets has no generic userinfo pattern.
-        with self.assertRaises(ValueError):
+        with self.assertRaises(ValueError) as ctx:
             self._chain({"AI_TOOLS_OLLAMA_URLS": "http://user:pw@localhost:11434"})
+        str(ctx.exception).encode("ascii")
 
     def test_embedded_credentials_password_not_leaked_in_error(self):
         # An arbitrary password has no secret "shape" redact_secrets can
@@ -2614,6 +2620,47 @@ class TestRunCheckOllamaLine(unittest.TestCase):
         self.assertEqual(self._last_fake_get.call_count, 1)
         _, kwargs = self._last_fake_get.call_args
         self.assertEqual(kwargs.get("allow_redirects"), False)
+
+    def _assert_ascii_only(self, out: str) -> None:
+        # The --check surface reaches a Windows console through a redirected
+        # stdout whose encoding is the OEM/ANSI code page. cp1252 happens to
+        # encode an em dash, but cp932/cp949 (Japanese/Korean Windows) do
+        # not: print() raises UnicodeEncodeError, --check crashes, and the
+        # installer reports a false unhealthy install. Every emitted line
+        # must therefore be pure ASCII, not merely cp1252-safe.
+        for line in out.splitlines():
+            try:
+                line.encode("ascii")
+            except UnicodeEncodeError as exc:
+                self.fail(f"non-ASCII --check output: {line!r} ({exc})")
+
+    def test_perplexity_missing_warn_is_ascii(self):
+        def resolver(service, account):
+            if service in ("OLLAMA_URL", "api_tokens"):
+                raise ValueError("not found")
+            return "k", "env"
+
+        out, code = self._run_check_output(resolver=resolver)
+        self.assertIn("warn: perplexity key not found", out)
+        self._assert_ascii_only(out)
+        self.assertEqual(code, 1)  # missing Perplexity key stays non-fatal
+
+    def test_perplexity_empty_warn_is_ascii(self):
+        def resolver(service, account):
+            if service == "OLLAMA_URL":
+                raise ValueError("not found")
+            if service == "api_tokens":
+                return "", "keychain"
+            return "k", "env"
+
+        out, code = self._run_check_output(resolver=resolver)
+        self.assertIn("warn: perplexity key is empty", out)
+        self._assert_ascii_only(out)
+        self.assertEqual(code, 1)
+
+    def test_check_output_is_ascii_on_happy_path(self):
+        out, _ = self._run_check_output(get_side_effect=Exception("refused"))
+        self._assert_ascii_only(out)
 
 
 class TestLoadADC(unittest.TestCase):

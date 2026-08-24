@@ -540,12 +540,12 @@ def run_check() -> None:
             print(f"ok: perplexity key found ({source}) [agent_research only]")
         else:
             print(
-                f"warn: perplexity key is empty ({source}) — agent_research "
+                f"warn: perplexity key is empty ({source}) - agent_research "
                 "unavailable; quick_research/deep_research are unaffected"
             )
     except ValueError as e:
         print(
-            f"warn: perplexity key not found — agent_research unavailable; "
+            f"warn: perplexity key not found - agent_research unavailable; "
             f"quick_research/deep_research are unaffected. {e}"
         )
 
@@ -1981,12 +1981,12 @@ def _validate_ollama_endpoint(url: str) -> str:
     if parsed.scheme == "http" and not _is_localhost_endpoint(url):
         raise ValueError(
             f"Refusing plain-http non-localhost Ollama endpoint "
-            f"{redact_secrets(display)!r} — remote endpoints must be https"
+            f"{redact_secrets(display)!r} - remote endpoints must be https"
         )
     if parsed.username is not None or parsed.password is not None:
         raise ValueError(
             f"Refusing Ollama endpoint with embedded credentials "
-            f"{redact_secrets(display)!r} — auth belongs in the Keychain "
+            f"{redact_secrets(display)!r} - auth belongs in the Keychain "
             "(CF Access service token), never in the URL"
         )
     return url.rstrip("/")
