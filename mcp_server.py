@@ -540,12 +540,12 @@ def run_check() -> None:
             print(f"ok: perplexity key found ({source}) [agent_research only]")
         else:
             print(
-                f"warn: perplexity key is empty ({source}) — agent_research "
+                f"warn: perplexity key is empty ({source}) - agent_research "
                 "unavailable; quick_research/deep_research are unaffected"
             )
     except ValueError as e:
         print(
-            f"warn: perplexity key not found — agent_research unavailable; "
+            f"warn: perplexity key not found - agent_research unavailable; "
             f"quick_research/deep_research are unaffected. {e}"
         )
 

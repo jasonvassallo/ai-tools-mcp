@@ -2615,6 +2615,47 @@ class TestRunCheckOllamaLine(unittest.TestCase):
         _, kwargs = self._last_fake_get.call_args
         self.assertEqual(kwargs.get("allow_redirects"), False)
 
+    def _assert_ascii_only(self, out: str) -> None:
+        # The --check surface reaches a Windows console through a redirected
+        # stdout whose encoding is the OEM/ANSI code page. cp1252 happens to
+        # encode an em dash, but cp932/cp949 (Japanese/Korean Windows) do
+        # not: print() raises UnicodeEncodeError, --check crashes, and the
+        # installer reports a false unhealthy install. Every emitted line
+        # must therefore be pure ASCII, not merely cp1252-safe.
+        for line in out.splitlines():
+            try:
+                line.encode("ascii")
+            except UnicodeEncodeError as exc:
+                self.fail(f"non-ASCII --check output: {line!r} ({exc})")
+
+    def test_perplexity_missing_warn_is_ascii(self):
+        def resolver(service, account):
+            if service in ("OLLAMA_URL", "api_tokens"):
+                raise ValueError("not found")
+            return "k", "env"
+
+        out, code = self._run_check_output(resolver=resolver)
+        self.assertIn("warn: perplexity key not found", out)
+        self._assert_ascii_only(out)
+        self.assertEqual(code, 1)  # missing Perplexity key stays non-fatal
+
+    def test_perplexity_empty_warn_is_ascii(self):
+        def resolver(service, account):
+            if service == "OLLAMA_URL":
+                raise ValueError("not found")
+            if service == "api_tokens":
+                return "", "keychain"
+            return "k", "env"
+
+        out, code = self._run_check_output(resolver=resolver)
+        self.assertIn("warn: perplexity key is empty", out)
+        self._assert_ascii_only(out)
+        self.assertEqual(code, 1)
+
+    def test_check_output_is_ascii_on_happy_path(self):
+        out, _ = self._run_check_output(get_side_effect=Exception("refused"))
+        self._assert_ascii_only(out)
+
 
 class TestLoadADC(unittest.TestCase):
     def test_uses_credential_quota_project_when_default_project_is_missing(self):
