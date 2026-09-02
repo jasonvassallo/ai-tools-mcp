@@ -536,9 +536,7 @@ class ModeIsConsistentAcrossBothSides(unittest.TestCase):
         spill_dir = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, spill_dir, ignore_errors=True)
         snap = snapshot_tree(str(self.work), make_ignore(self.base))
-        return unified_diff(
-            self.base, snap, max_bytes=1 << 20, spill_dir=spill_dir
-        )
+        return unified_diff(self.base, snap, max_bytes=1 << 20, spill_dir=spill_dir)
 
     def test_the_base_tree_carries_gits_own_mode(self):
         self.assertEqual(self.base.entries["tool.sh"].mode, "100755")
