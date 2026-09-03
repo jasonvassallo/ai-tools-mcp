@@ -38,6 +38,47 @@ from coding_agent.basetree import BaseTree
 from coding_agent.loop import ProgressTracker
 from coding_agent.walk import Entry
 
+# ---------------------------------------------------------------------------
+# $TMPDIR hygiene (issue #79 follow-through, not the reaper itself — that is
+# covered end-to-end in test_coding_agent_reap.py against per-test dirs).
+#
+# `run_coding_agent` spills over-cap diffs to the REAL host temp dir by
+# design (`spill_dir=tempfile.gettempdir()` is pinned by
+# `test_the_loop_ships_its_own_diff_cap_and_spills_outside_the_worktree`), so
+# a test in THIS file cannot redirect it without changing the thing #79
+# reported. Before the fix here, an unmodified run of this file left two
+# `coding-agent-diff-*.patch` files (~1.6 MB) behind — the tests that hit the
+# over-cap path elsewhere in the suite have no `addCleanup` of their own.
+# Rather than chase down every call site, account for the module as a whole:
+# snapshot what already matches the pattern before any test runs, and remove
+# whatever this module added by the time it is done.
+# ---------------------------------------------------------------------------
+
+
+def _diff_spill_names() -> set[str]:
+    try:
+        return {
+            e.name
+            for e in os.scandir(tempfile.gettempdir())
+            if e.name.startswith("coding-agent-diff-") and e.name.endswith(".patch")
+        }
+    except OSError:
+        return set()
+
+
+_PRE_EXISTING_DIFF_SPILLS: set[str] = set()
+
+
+def setUpModule() -> None:
+    global _PRE_EXISTING_DIFF_SPILLS
+    _PRE_EXISTING_DIFF_SPILLS = _diff_spill_names()
+
+
+def tearDownModule() -> None:
+    for name in _diff_spill_names() - _PRE_EXISTING_DIFF_SPILLS:
+        with contextlib.suppress(OSError):
+            os.unlink(os.path.join(tempfile.gettempdir(), name))
+
 
 class NoProgressDetector(unittest.TestCase):
     """Spec §7: stalls after N turns with no walk-hash change, no
@@ -195,6 +236,16 @@ class _LoopCase(unittest.TestCase):
         # binds its arguments NOW, so that form asserts the state at setUp and
         # can never fail. The slot has to be read when the cleanup runs.
         self.addCleanup(self._assert_slot_free)
+        # issue #79: `run_coding_agent` now sweeps the REAL host temp dir
+        # (`reap.sweep`'s default target) at the top of every run. Patched
+        # to a no-op here so the hundreds of `run_loop` calls in this file
+        # never touch the developer's actual $TMPDIR; `reap.py`'s own
+        # behavior is covered end-to-end in test_coding_agent_reap.py
+        # against per-test dirs, and `ReaperRunsBeforeTheSandbox` below
+        # restores the real thing just long enough to prove the call site.
+        self.reap_patcher = mock.patch.object(L._reap, "sweep", autospec=True)
+        self.reap_mock = self.reap_patcher.start()
+        self.addCleanup(self.reap_patcher.stop)
 
     def _assert_slot_free(self) -> None:
         self.assertFalse(L._SLOT.locked(), "the single slot leaked")
@@ -223,6 +274,35 @@ class _LoopCase(unittest.TestCase):
                 )
             )
         return result, ops
+
+
+# ---------------------------------------------------------------------------
+# The reaper is actually invoked (issue #79)
+# ---------------------------------------------------------------------------
+
+
+class ReaperRunsBeforeTheSandbox(_LoopCase):
+    """`run_coding_agent` sweeps host temp-dir litter from earlier runs
+    before it creates its OWN worktree — a crash on run N must not compound
+    across run N+1, N+2, ... `reap.py`'s own sweep logic is exercised
+    end-to-end in test_coding_agent_reap.py; this only pins that `loop.py`
+    actually calls it, and calls it before `ops.create_worktree`."""
+
+    def test_the_loop_invokes_the_reaper_before_create_worktree(self):
+        ops = _RecordingOps(self.wt)
+        seen_ops_calls_at_reap_time: list[list[str]] = []
+        self.reap_mock.side_effect = lambda *a, **kw: (
+            seen_ops_calls_at_reap_time.append(list(ops.calls))
+        )
+
+        self.run_loop([_say("done")], ops=ops)
+
+        self.reap_mock.assert_called_once()
+        # `ops.calls` had nothing in it yet when the reaper ran — proof the
+        # sweep happened strictly before `create_worktree`, not just
+        # somewhere in the run.
+        self.assertEqual(seen_ops_calls_at_reap_time, [[]])
+        self.assertIn("create_worktree", ops.calls)
 
 
 # ---------------------------------------------------------------------------

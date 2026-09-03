@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol, TypeVar, cast
 
+from . import reap as _reap
 from . import sandbox as _sb
 from .basetree import BaseTree, make_ignore, read_base_tree
 from .tools import (
@@ -224,6 +225,10 @@ class AgentResult:
     elapsed_seconds: float
     diff: str
     diff_truncated: bool
+    # A host path outside the worktree (see `unified_diff`'s `spill_dir`),
+    # NOT permanent: `reap.sweep` removes it (and anything else it can
+    # confirm is host litter from this feature) after `reap._TTL_SECONDS`
+    # (24h by default) — read it before then.
     diff_full_path: str | None
     changed_files: list[str]
     # Paths that EXIST in the worktree but the walk could not read, as
@@ -385,7 +390,8 @@ async def _teardown(
             out.changed_files = _capped_paths(
                 list(diff.changed_files),
                 where=(
-                    f"the complete diff is at {diff.full_path}"
+                    f"the complete diff is at {diff.full_path} "
+                    "(reaped ~24h after it is written; read it soon)"
                     if diff.full_path is not None
                     else "the diff text above names every changed path"
                 ),
@@ -401,7 +407,8 @@ async def _teardown(
                 # diff does NOT name every unreadable path the way it names
                 # every changed one. Only the spill file does.
                 where=(
-                    f"the complete list is in the diff at {diff.full_path}"
+                    f"the complete list is in the diff at {diff.full_path} "
+                    "(reaped ~24h after it is written; read it soon)"
                     if diff.full_path is not None
                     else "the complete list is NOT in this response - the diff's "
                     "own warning block is bounded too"
@@ -781,6 +788,14 @@ async def run_coding_agent(
         ops = (sandbox_factory or _default_ops)()
         started = time.monotonic()
         budget = Budget(max_turns=max_turns, max_seconds=max_seconds, started=started)
+        # Litter sweep (issue #79), before this run adds any of its own: a
+        # crash on an earlier run's teardown left a `coding-agent-diff-*` or
+        # `coding-agent-wt-*` entry with nothing left to remove it, and
+        # nothing else ever revisits the host temp dir between runs. OFF THE
+        # EVENT LOOP like every other host call here — see `reap.sweep`'s
+        # docstring — and best-effort: `sweep` never raises, so this can
+        # never turn into a reason THIS run fails to start.
+        await asyncio.to_thread(_reap.sweep)
         # The REAL repo, before anything exists to clean up. Trusted side.
         #
         # OFF THE EVENT LOOP, like every other blocking host call here. This

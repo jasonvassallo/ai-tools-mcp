@@ -688,7 +688,10 @@ def tree_hash(snap: TreeSnapshot) -> str:
 # still surfaces, as a deletion rather than as silence.
 # ---------------------------------------------------------------------------
 
-_TRUNC = "\n[... diff truncated by coding_agent size cap; full diff at {path} ...]\n"
+_TRUNC = (
+    "\n[... diff truncated by coding_agent size cap; full diff at {path} "
+    "(reaped ~24h after it is written by coding_agent.reap; read it soon) ...]\n"
+)
 
 # The marker for a final line with no newline, spelled as git spells it.
 # Without it that line runs straight into the NEXT file's header, taking the
@@ -825,7 +828,10 @@ class DiffResult:
     text: str  # unified diff, possibly truncated
     truncated: bool
     changed_files: list[str]  # sorted; RAW paths, never quoted
-    full_path: str | None  # where the untruncated diff was written
+    # Where the untruncated diff was written. Not permanent: `coding_agent.
+    # reap.sweep` removes it ~24h after `mkstemp` writes it, so a caller
+    # that wants the full diff should read it soon, not treat it as durable.
+    full_path: str | None
     # The snapshot's unreadable records, verbatim. `text` states them too, but
     # a gate that must fail closed should not have to parse prose to do it.
     unreadable: tuple[Unreadable, ...] = ()
@@ -1134,7 +1140,11 @@ def unified_diff(
       rather than by one named file.
 
     `max_bytes` bounds the RETURNED text only; `spill_dir` must be a host
-    directory the sandbox cannot reach.
+    directory the sandbox cannot reach. Outliving THIS call's sandbox
+    teardown is intentional — the spill is not deleted here — but it is not
+    permanent either: `coding_agent.reap.sweep` removes it ~24h after it is
+    written (see that module's docstring), so a caller must read the spilled
+    path soon rather than treat it as durable storage.
     """
     blocked = _not_compared(snap.unreadable, base)
     paths = sorted(set(base.entries) | set(snap.entries))

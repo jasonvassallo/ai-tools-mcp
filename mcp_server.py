@@ -3731,7 +3731,9 @@ async def list_tools() -> list[Tool]:
                 "`unreadable` and `cleanup_problems` as well as the diff — an "
                 "unreadable path is a file the review could NOT see. Results "
                 "are single-collect: once retrieved the job is gone, and jobs "
-                "do not survive an MCP server restart."
+                "do not survive an MCP server restart. `diff_full_path`, when "
+                "present, is NOT permanent — it is reaped ~24h after the run "
+                "writes it, so fetch it soon if the diff was truncated."
             ),
             inputSchema={
                 "type": "object",
@@ -4725,6 +4727,15 @@ def _raise_nofile_limit() -> tuple[int, int] | None:
 async def main():
     """Run the MCP server."""
     _raise_nofile_limit()
+    # coding_agent litter sweep (issue #79): a long-lived server accumulates
+    # spilled diffs and, on a crash, orphaned worktree parents in the host
+    # temp dir with nothing else to clean them up between runs. Best-effort
+    # and OFF THE EVENT LOOP before it starts answering; `reap.sweep` never
+    # raises (see its docstring), so this can never block startup on a
+    # temp-dir problem.
+    from coding_agent import reap as _coding_agent_reap  # local: keeps import cheap
+
+    await asyncio.to_thread(_coding_agent_reap.sweep)
     async with stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream, write_stream, server.create_initialization_options()
