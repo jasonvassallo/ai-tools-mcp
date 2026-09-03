@@ -56,6 +56,7 @@ class SymlinkExfiltration(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.secret = Path(self.tmp) / "outside" / "id_ed25519"
         self.secret.parent.mkdir()
         self.secret.write_bytes(b"-----BEGIN OPENSSH PRIVATE KEY-----\nSECRETBYTES\n")
@@ -224,6 +225,7 @@ class WalkRaceCannotDereference(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.secret_dir = Path(self.tmp) / "outside"
         self.secret_dir.mkdir()
         self.secret = self.secret_dir / "HOST_SECRET"
@@ -1091,7 +1093,7 @@ An audit hook cannot be REMOVED once installed, so this cannot run inside the
 pytest process without slowing and perturbing every later test. It also must
 not run in a thread of one: the counter has to see the whole interpreter.
 """
-import json, os, subprocess, sys, tempfile
+import json, os, shutil, subprocess, sys, tempfile
 
 SPAWN_EVENTS = (
     "subprocess.Popen", "os.exec", "os.posix_spawn", "os.posix_spawnp",
@@ -1115,7 +1117,11 @@ base = BaseTree(
 )
 snap = snapshot_tree(root, lambda p: False)
 digest = tree_hash(snap)
-diff = unified_diff(base, snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+spill_dir = tempfile.mkdtemp()
+try:
+    diff = unified_diff(base, snap, max_bytes=1 << 20, spill_dir=spill_dir)
+finally:
+    shutil.rmtree(spill_dir, ignore_errors=True)
 during = len(seen)
 
 # CONTROL: the hook must be able to COUNT. Without this, "0 spawns" is
@@ -1569,6 +1575,24 @@ class DefenceInDepthLayersAreIndividuallyPinned(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+# One spill dir for the whole file rather than a fresh `tempfile.mkdtemp()`
+# per `_diff()`/`unified_diff()` call (there are dozens across this file's
+# tests) — each spill write picks its own unique filename inside it, so
+# sharing is safe, and this way there is exactly one directory for
+# `tearDownModule` to remove instead of dozens left behind after every run.
+_SPILL_DIR: str | None = None
+
+
+def setUpModule() -> None:
+    global _SPILL_DIR
+    _SPILL_DIR = tempfile.mkdtemp(prefix="ca-test-security-spill-")
+
+
+def tearDownModule() -> None:
+    if _SPILL_DIR:
+        shutil.rmtree(_SPILL_DIR, ignore_errors=True)
+
+
 def _base(**files: bytes) -> BaseTree:
     ents = {p: Entry(p, "file", d) for p, d in files.items()}
     return BaseTree(entries=ents, ignore=lambda p: False, tracked=frozenset(ents))
@@ -1580,7 +1604,7 @@ def _base_of(*entries: Entry) -> BaseTree:
 
 
 def _diff(base: BaseTree, snap: TreeSnapshot, max_bytes: int = 1 << 20) -> DiffResult:
-    return unified_diff(base, snap, max_bytes=max_bytes, spill_dir=tempfile.mkdtemp())
+    return unified_diff(base, snap, max_bytes=max_bytes, spill_dir=_SPILL_DIR)
 
 
 def _starting(text: str, prefix: str) -> list[str]:
@@ -1595,7 +1619,7 @@ class DiffStructureInjection(unittest.TestCase):
     def test_forged_header_in_symlink_target_cannot_reach_column_zero(self):
         forged = "harmless\n--- a/etc/shadow\n+++ b/etc/shadow\n@@ -0,0 +1 @@\n+root:INJECTED"
         snap = TreeSnapshot({"leak": Entry("leak", "symlink", forged.encode())})
-        d = unified_diff(_base(), snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+        d = unified_diff(_base(), snap, max_bytes=1 << 20, spill_dir=_SPILL_DIR)
         for line in d.text.splitlines():
             if line.startswith(("--- ", "+++ ", "@@ ")):
                 # only OUR headers may appear at column 0
@@ -1718,7 +1742,7 @@ class GateCannotBeBlinded(unittest.TestCase):
     def test_tracked_file_replaced_by_special_file_surfaces_as_deletion(self):
         base = _base(**{"foo.py": b"print(1)\n"})
         snap = TreeSnapshot({})  # walk skipped the FIFO that replaced foo.py
-        d = unified_diff(base, snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+        d = unified_diff(base, snap, max_bytes=1 << 20, spill_dir=_SPILL_DIR)
         self.assertIn("foo.py", d.changed_files)
         self.assertIn("--- a/foo.py", d.text)
         self.assertIn("+++ /dev/null", d.text)
@@ -1731,7 +1755,7 @@ class GateCannotBeBlinded(unittest.TestCase):
                 )
             }
         )
-        d = unified_diff(_base(), snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp())
+        d = unified_diff(_base(), snap, max_bytes=1 << 20, spill_dir=_SPILL_DIR)
         self.assertIn("tests/test_new.py", d.changed_files)
         self.assertIn("+def test_x(): pass", d.text)
 
@@ -2118,8 +2142,7 @@ class DiffSizeCap(unittest.TestCase):
     def test_large_text_truncates_with_a_spill_file(self):
         big = b"x" * 5000
         snap = TreeSnapshot({"big.txt": Entry("big.txt", "file", big)})
-        spill = tempfile.mkdtemp()
-        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=spill)
+        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=_SPILL_DIR)
         self.assertTrue(d.truncated)
         self.assertIsNotNone(d.full_path)
         self.assertGreater(os.path.getsize(d.full_path), 1000)
@@ -2141,7 +2164,7 @@ class DiffSizeCap(unittest.TestCase):
                 "big.txt": Entry("big.txt", "file", b"x" * 5000),
             }
         )
-        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=tempfile.mkdtemp())
+        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=_SPILL_DIR)
         self.assertTrue(d.truncated)
         self.assertEqual(d.changed_files, ["big.txt", "blob.bin"])
         tail = d.text.split("[... diff truncated")[1]
@@ -2156,7 +2179,7 @@ class DiffSizeCap(unittest.TestCase):
         snap = TreeSnapshot(
             {f"f{i:04d}.py": Entry(f"f{i:04d}.py", "file", b"x\n") for i in range(500)}
         )
-        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=tempfile.mkdtemp())
+        d = unified_diff(_base(), snap, max_bytes=1000, spill_dir=_SPILL_DIR)
         self.assertIn("500 file(s) changed", d.text)
         self.assertIn("and 400 more", d.text)
         self.assertEqual(len(d.changed_files), 500)

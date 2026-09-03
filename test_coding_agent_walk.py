@@ -33,6 +33,7 @@ from coding_agent.walk import snapshot_tree, tree_hash, unified_diff
 class SnapshotBasics(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         (self.root / "a.py").write_text("x = 1\n")
         (self.root / "sub").mkdir()
         (self.root / "sub" / "b.txt").write_text("hi\n")
@@ -97,6 +98,7 @@ class DescriptorHygiene(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
 
     @pytest.mark.timeout(20)
     def test_repeated_walks_leak_no_descriptors(self):
@@ -200,6 +202,7 @@ class RootResolution(unittest.TestCase):
         unaffected.
         """
         tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
         real = tmp / "real"
         real.mkdir()
         (real / "a.py").write_text("x = 1\n")
@@ -307,6 +310,7 @@ class BaseTreeGitArgvIsAnchoredToTheRealRepo(unittest.TestCase):
 class BaseTreeRead(unittest.TestCase):
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
         _mkrepo(self.repo)
         (self.repo / ".gitignore").write_text("*.secret\nignored-dir/\n")
         (self.repo / "pkg").mkdir()
@@ -395,6 +399,7 @@ class IgnorePrecedence(unittest.TestCase):
 
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
         _mkrepo(self.repo)
         (self.repo / ".git" / "info").mkdir(parents=True, exist_ok=True)
         (self.repo / ".git" / "info" / "exclude").write_text("*.md\n")
@@ -426,6 +431,7 @@ class IgnoreComposesWithWalk(unittest.TestCase):
 
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
         _mkrepo(self.repo)
         (self.repo / ".gitignore").write_text("ignored-dir/\n")
         (self.repo / "app.py").write_text("print(1)\n")
@@ -435,6 +441,7 @@ class IgnoreComposesWithWalk(unittest.TestCase):
         _commit(self.repo, "base")
         # What the sandbox sees: the same checkout, plus the model's edits.
         self.work = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
         (self.work / ".gitignore").write_text("ignored-dir/\n")
         (self.work / "app.py").write_text("print(1)\n")
         (self.work / "ignored-dir").mkdir()
@@ -463,6 +470,7 @@ class ExecutableBitIsRecordedByTheWalk(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         (self.root / "plain.txt").write_text("hi\n")
         (self.root / "tool.sh").write_text("#!/bin/sh\n")
         os.chmod(self.root / "tool.sh", 0o755)
@@ -506,6 +514,7 @@ class ModeIsConsistentAcrossBothSides(unittest.TestCase):
 
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
         _mkrepo(self.repo)
         (self.repo / "plain.txt").write_text("hi\n")
         (self.repo / "tool.sh").write_text("#!/bin/sh\necho hi\n")
@@ -516,16 +525,18 @@ class ModeIsConsistentAcrossBothSides(unittest.TestCase):
         self.base = read_base_tree(str(self.repo), "HEAD")
         # What the sandbox is handed: the same content, no repo metadata.
         # copytree's copy2 preserves the mode bits, which is the point.
-        self.work = Path(tempfile.mkdtemp()) / "work"
+        work_parent = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work_parent, ignore_errors=True)
+        self.work = work_parent / "work"
         shutil.copytree(
             self.repo, self.work, symlinks=True, ignore=shutil.ignore_patterns(".git")
         )
 
     def _diff(self):
+        spill_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, spill_dir, ignore_errors=True)
         snap = snapshot_tree(str(self.work), make_ignore(self.base))
-        return unified_diff(
-            self.base, snap, max_bytes=1 << 20, spill_dir=tempfile.mkdtemp()
-        )
+        return unified_diff(self.base, snap, max_bytes=1 << 20, spill_dir=spill_dir)
 
     def test_the_base_tree_carries_gits_own_mode(self):
         self.assertEqual(self.base.entries["tool.sh"].mode, "100755")

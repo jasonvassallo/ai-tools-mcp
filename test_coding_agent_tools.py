@@ -614,6 +614,12 @@ class ListFiles(_Tree):
         self.assertEqual(out, ["pkg/b.py"])
 
     def test_the_listing_is_capped(self) -> None:
+        self.assertLess(
+            MAX_LIST,
+            10_000,
+            "refusing to build a fixture this large — MAX_LIST is not a sane"
+            " test bound",
+        )
         many = self.root / "many"
         many.mkdir()
         for i in range(MAX_LIST + 20):
@@ -627,6 +633,12 @@ class ListFiles(_Tree):
         companion to `MAX_LIST`: one bounds a wide tree, this bounds a deep
         one, and the sandbox chooses both. `mkdir -p a/a/a/...` is cheap.
         """
+        self.assertLess(
+            MAX_DEPTH,
+            1_000,
+            "refusing to build a fixture this deep — MAX_DEPTH is not a sane"
+            " test bound",
+        )
         deep = self.root
         for _ in range(MAX_DEPTH + 6):
             deep = deep / "d"
