@@ -325,6 +325,83 @@ def _init_repo() -> str:
     return repo
 
 
+class WorktreeLivenessParsing(unittest.TestCase):
+    """`_porcelain_worktrees` and `_repo_from_gitdir` in isolation — pure
+    string parsing, no filesystem or git involved."""
+
+    def test_a_plain_entry_is_not_locked(self):
+        out = (
+            "worktree /r\nHEAD abc\nbranch refs/heads/main\n\n"
+            "worktree /r/wt1\nHEAD abc\ndetached\n"
+        )
+        self.assertEqual(R._porcelain_worktrees(out), {"/r": False, "/r/wt1": False})
+
+    def test_a_locked_entry_with_a_reason_is_locked(self):
+        out = "worktree /r/wt1\nHEAD abc\ndetached\nlocked some reason\n"
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": True})
+
+    def test_a_locked_entry_with_no_reason_is_locked(self):
+        out = "worktree /r/wt1\nHEAD abc\ndetached\nlocked\n"
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": True})
+
+    def test_a_prunable_but_unlocked_entry_is_not_locked(self):
+        out = (
+            "worktree /r/wt1\nHEAD abc\ndetached\n"
+            "prunable gitdir file points to non-existent location\n"
+        )
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": False})
+
+    def test_a_well_shaped_gitdir_yields_its_repo(self):
+        self.assertEqual(R._repo_from_gitdir("/r/.git/worktrees/wt-abc"), "/r")
+
+    def test_a_gitdir_missing_the_worktrees_segment_is_rejected(self):
+        self.assertIsNone(R._repo_from_gitdir("/r/.git/wt-abc"))
+
+    def test_a_gitdir_missing_the_dot_git_segment_is_rejected(self):
+        self.assertIsNone(R._repo_from_gitdir("/r/worktrees/wt-abc"))
+
+    def test_a_gitdir_with_no_repo_component_is_rejected(self):
+        self.assertIsNone(R._repo_from_gitdir("/.git/worktrees/wt-abc"))
+
+
+class WorktreeLivenessUnreadableRepo(_ScratchCase):
+    """The liveness path's own conservatism: any git-call failure keeps
+    the directory, and never raises."""
+
+    def test_a_gitdir_whose_repo_is_not_a_real_git_repo_is_kept(self):
+        """`gitdir` exists on disk (so `_wt_child_with_live_gitdir` finds
+        it) but the derived repo is not an actual git repository, so
+        `git -C <repo> worktree list` fails. That failure must keep the
+        directory, not raise."""
+        parent = _wt_parent(self.dir)
+        child = _wt_child(parent)
+        bogus_repo = os.path.join(self.dir, "not-a-repo")
+        gitdir = os.path.join(bogus_repo, ".git", "worktrees", "wt-abc")
+        os.makedirs(gitdir)
+        _git_marker(child, gitdir)
+        _set_mtime(parent, self.now - 25 * _HOUR)
+
+        stats = R.sweep(self.dir, now=self.now, git_timeout_s=5)
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertEqual(stats["worktrees_removed"], 0)
+
+    def test_a_gitdir_with_no_derivable_repo_is_kept(self):
+        """`gitdir` exists but is not shaped like `<repo>/.git/worktrees/
+        <name>`, so no git call is even attempted."""
+        parent = _wt_parent(self.dir)
+        child = _wt_child(parent)
+        gitdir = os.path.join(self.dir, "just-some-directory")
+        os.mkdir(gitdir)
+        _git_marker(child, gitdir)
+        _set_mtime(parent, self.now - 25 * _HOUR)
+
+        stats = R.sweep(self.dir, now=self.now)
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertEqual(stats["worktrees_removed"], 0)
+
+
 class RealWorktreeShape(unittest.TestCase):
     """`_worktree_is_stale`'s parsing is exercised against a real
     `git worktree add` layout, not just hand-built fixtures — the same
@@ -377,6 +454,80 @@ class RealWorktreeShape(unittest.TestCase):
 
         self.assertFalse(os.path.lexists(parent))
         self.assertGreaterEqual(stats["worktrees_removed"], 1)
+
+
+class RealWorktreeLiveness(unittest.TestCase):
+    """The gap this follow-up closes: an orphaned worktree whose `.git`
+    marker AND recorded `gitdir` are both still fully intact — exactly
+    what a crash (kill the process, not the git metadata) leaves behind,
+    and exactly the shape `_worktree_is_stale` correctly calls NOT stale.
+    Built against a real `git worktree add`/`lock`, like
+    `RealWorktreeShape` above, so the porcelain parsing is exercised
+    against git's actual output rather than hand-written fixtures.
+    """
+
+    def setUp(self) -> None:
+        self.repo = _init_repo()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.strays: list[str] = []
+
+    def tearDown(self) -> None:
+        for path in self.strays:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _listed_paths(self) -> set[str]:
+        out = subprocess.run(
+            ["git", "-C", self.repo, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return set(R._porcelain_worktrees(out))
+
+    def test_an_intact_orphaned_worktree_past_the_ttl_is_reaped(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        self.assertFalse(R._worktree_is_stale(parent), "test assumption: NOT stale")
+        self.assertIn(wt, self._listed_paths())
+        _set_mtime(parent, time.time() - 25 * _HOUR)
+
+        stats = R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertFalse(os.path.lexists(parent))
+        self.assertGreaterEqual(stats["worktrees_removed"], 1)
+        self.assertNotIn(wt, self._listed_paths())
+
+    def test_a_git_worktree_lock_ed_orphan_is_kept(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        subprocess.run(
+            ["git", "-C", self.repo, "worktree", "lock", wt, "--reason", "in use"],
+            check=True,
+        )
+        _set_mtime(parent, time.time() - 25 * _HOUR)
+
+        R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertIn(wt, self._listed_paths())
+
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
+        teardown_worktree(self.repo, wt)
+
+    def test_an_intact_orphan_younger_than_the_ttl_is_kept(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        _set_mtime(parent, time.time() - 1 * _HOUR)
+
+        R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertIn(wt, self._listed_paths())
+
+        teardown_worktree(self.repo, wt)
 
 
 # ---------------------------------------------------------------------------
