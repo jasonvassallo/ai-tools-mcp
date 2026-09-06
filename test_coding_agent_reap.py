@@ -485,9 +485,15 @@ class RealWorktreeLiveness(unittest.TestCase):
         return set(R._porcelain_worktrees(out))
 
     def test_an_intact_orphaned_worktree_past_the_ttl_is_reaped(self):
+        """`create_worktree` now locks its own worktree by default (issue
+        #79 follow-up, below) — unlocked here to isolate the case this
+        test is actually about: an intact-but-UNLOCKED orphan (e.g. the
+        best-effort lock call itself failed) is still reaped once past the
+        TTL. The locked case is `RealWorktreeLockedByDefault` below."""
         wt = create_worktree(self.repo, "HEAD")
         self.strays.append(wt)
         parent = os.path.dirname(wt)
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
         self.assertFalse(R._worktree_is_stale(parent), "test assumption: NOT stale")
         self.assertIn(wt, self._listed_paths())
         _set_mtime(parent, time.time() - 25 * _HOUR)
@@ -499,9 +505,14 @@ class RealWorktreeLiveness(unittest.TestCase):
         self.assertNotIn(wt, self._listed_paths())
 
     def test_a_git_worktree_lock_ed_orphan_is_kept(self):
+        """Locked with a custom reason here (rather than relying on
+        `create_worktree`'s own default lock) to cover `locked` parsing
+        for an arbitrary reason string, independent of what this codebase
+        happens to write into it."""
         wt = create_worktree(self.repo, "HEAD")
         self.strays.append(wt)
         parent = os.path.dirname(wt)
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
         subprocess.run(
             ["git", "-C", self.repo, "worktree", "lock", wt, "--reason", "in use"],
             check=True,
@@ -528,6 +539,65 @@ class RealWorktreeLiveness(unittest.TestCase):
         self.assertIn(wt, self._listed_paths())
 
         teardown_worktree(self.repo, wt)
+
+
+class RealWorktreeLockedByDefault(unittest.TestCase):
+    """`create_worktree` itself now locks the worktree it returns for the
+    life of a run, and `teardown_worktree` unlocks it before removal (issue
+    #79 follow-up to close the gap `RealWorktreeLiveness` above flags in
+    its own module docstring: a run still alive right at the TTL boundary
+    used to have no protection beyond the TTL itself). No test-applied
+    `git worktree lock` anywhere below — this exercises the production
+    path exactly as `loop.py` calls it."""
+
+    def setUp(self) -> None:
+        self.repo = _init_repo()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.strays: list[str] = []
+
+    def tearDown(self) -> None:
+        for path in self.strays:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _listed(self) -> dict[str, bool]:
+        out = subprocess.run(
+            ["git", "-C", self.repo, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return R._porcelain_worktrees(out)
+
+    def test_a_freshly_created_worktree_is_locked_while_the_run_is_open(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        self.assertTrue(self._listed().get(wt), "not locked by create_worktree")
+        teardown_worktree(self.repo, wt)
+
+    def test_it_is_never_reaped_by_sweep_no_matter_how_old(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        self.assertTrue(self._listed().get(wt), "test assumption: locked")
+        _set_mtime(parent, time.time() - 1000 * _HOUR)  # far past the TTL
+
+        R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertTrue(self._listed().get(wt), "still locked and registered")
+
+        teardown_worktree(self.repo, wt)
+
+    def test_teardown_removes_it_and_it_disappears_from_git_worktree_list(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+
+        problems = teardown_worktree(self.repo, wt)
+
+        self.assertEqual(problems, [])
+        self.assertFalse(os.path.lexists(parent))
+        self.assertNotIn(wt, self._listed())
 
 
 # ---------------------------------------------------------------------------

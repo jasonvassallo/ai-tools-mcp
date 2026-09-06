@@ -43,12 +43,16 @@ unconditional `shutil.rmtree` + `git worktree prune` so a stale registration
 is always dropped even if the `remove` step itself failed); a locked one, or
 one this module cannot confirm either way (the repo is gone, the git call
 fails or times out, the path is not listed at all), is left alone — same
-conservative default as `_worktree_is_stale`. `sandbox.py` writes no PID or
-lock file of its own for a live worktree (the only pidfiles it writes are
-per-`docker exec`, live inside the container, and unrelated to host worktree
-liveness), so `git worktree lock` is the only signal this module has for
-"still in use" beyond the TTL itself. Every git call here is best-effort and
-bounded by `_GIT_TIMEOUT_S` via `subprocess.run(timeout=...)` — macOS has no
+conservative default as `_worktree_is_stale`. `sandbox.create_worktree`
+`git worktree lock`s the worktree it makes for the life of a run, and
+`sandbox.teardown_worktree` unlocks it again before removal (also an issue
+#79 follow-up) — precisely so this liveness check can never reap one still
+in use: `git worktree lock` is the ONLY "still in use" signal this module
+needs beyond the TTL itself, and sandbox.py writes no separate PID or lock
+FILE for a worktree (the only pidfiles it writes anywhere are
+per-`docker exec`, live inside the container, and unrelated to host
+worktree liveness). Every git call here is best-effort and bounded by
+`_GIT_TIMEOUT_S` via `subprocess.run(timeout=...)` — macOS has no
 `/usr/bin/timeout` to wrap these in — and none of it can raise into
 `sweep()`.
 """
