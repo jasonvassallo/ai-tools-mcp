@@ -44,23 +44,41 @@ is always dropped even if the `remove` step itself failed); a locked one, or
 one this module cannot confirm either way (the repo is gone, the git call
 fails or times out, the path is not listed at all), is left alone — same
 conservative default as `_worktree_is_stale`. `sandbox.create_worktree`
-`git worktree lock`s the worktree it makes for the life of a run, and
-`sandbox.teardown_worktree` unlocks it again before removal (also an issue
-#79 follow-up) — precisely so this liveness check can never reap one still
-in use: `git worktree lock` is the ONLY "still in use" signal this module
-needs beyond the TTL itself, and sandbox.py writes no separate PID or lock
-FILE for a worktree (the only pidfiles it writes anywhere are
-per-`docker exec`, live inside the container, and unrelated to host
-worktree liveness). Every git call here is best-effort and bounded by
-`_GIT_TIMEOUT_S` via `subprocess.run(timeout=...)` — macOS has no
-`/usr/bin/timeout` to wrap these in — and none of it can raise into
-`sweep()`.
+`git worktree lock`s the worktree it makes for the life of a run, with a
+reason recording the owning process's pid (`coding-agent run pid=<n>
+at=<n>`, matched here by `_LOCK_REASON_RE`), and `sandbox.teardown_worktree`
+unlocks it again before removal (also an issue #79 follow-up).
+
+A bare `locked` check alone would defeat the whole point of this module,
+though: a run that crashes AFTER its lock was applied — effectively every
+crash, since the lock is applied immediately at creation — would stay
+`locked` forever with nothing left alive to ever unlock it, recreating
+exactly the unbounded-accumulation problem this module exists to fix, just
+one layer further out. So a `locked` entry is not automatically kept: when
+its reason matches this module's own format, `_pid_is_alive` probes the
+embedded pid with `os.kill(pid, 0)` (no signal sent) — `ProcessLookupError`
+means the owning process is gone and the lock is stale, so the worktree is
+still reapable (once past the TTL, like every other case here); anything
+else (still running, or a permission error / unexpected OSError this
+module cannot use to confirm death) keeps it. PID reuse is a known,
+deliberately-not-solved gap in this: if the OS has recycled the pid for an
+unrelated process by the time this check runs, the worktree reads as
+"alive" and stays locked until that unrelated process also exits or some
+other path catches it — the TTL is already this module's backstop for
+every other unconfirmable case, and this is no different. A `locked` entry
+whose reason does NOT match this module's format (a human ran `git
+worktree lock` by hand, or some other tool did) is kept UNCONDITIONALLY —
+this module never second-guesses a lock it did not apply itself. Every git
+call here is best-effort and bounded by `_GIT_TIMEOUT_S` via
+`subprocess.run(timeout=...)` — macOS has no `/usr/bin/timeout` to wrap
+these in — and none of it can raise into `sweep()`.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -102,6 +120,14 @@ _GIT_ENV = {"GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C
 # the top of every `coding_agent` run, so a wedged git must not turn a
 # "cheap and often" sweep into a slow one.
 _GIT_TIMEOUT_S = 10.0
+
+# Must match `sandbox.create_worktree`'s lock-reason f-string EXACTLY
+# (`f"coding-agent run pid={os.getpid()} at={time.time():.0f}"`): this is
+# the only way `_lock_reason_pid` can trust an embedded pid enough to run a
+# liveness probe against it. A `locked` entry whose reason does not match
+# this — a human's `git worktree lock --reason ...`, or some other tool's
+# — is never treated as a pid to check; see `_git_confirms_removable`.
+_LOCK_REASON_RE = re.compile(r"^coding-agent run pid=(\d+) at=\d+$")
 
 
 def _remove_file(path: str) -> bool:
@@ -310,32 +336,90 @@ def _git_worktree_list(repo: str, timeout_s: float) -> str | None:
     return result.stdout
 
 
-def _porcelain_worktrees(output: str) -> dict[str, bool]:
-    """Map each `worktree <path>` line's value to whether that block also
-    carries a `locked` line. Parses the exact shape `git worktree list
-    --porcelain` uses: blank-line-separated blocks, each headed by a
-    `worktree <path>` line, with `locked` (optionally followed by a
-    reason) appearing later in the same block when set."""
-    result: dict[str, bool] = {}
+def _porcelain_worktrees(output: str) -> dict[str, str | None]:
+    """Map each `worktree <path>` line's value to its lock reason: `None`
+    when the block carries no `locked` line at all, or the reason text
+    (the empty string when `locked` has none) when it does. Parses the
+    exact shape `git worktree list --porcelain` uses: blank-line-separated
+    blocks, each headed by a `worktree <path>` line, with `locked`
+    (optionally followed by a reason) appearing later in the same block
+    when set."""
+    result: dict[str, str | None] = {}
     current: str | None = None
     for line in output.splitlines():
         if line.startswith("worktree "):
             current = line[len("worktree ") :]
-            result[current] = False
+            result[current] = None
         elif line == "":
             current = None
-        elif current is not None and (line == "locked" or line.startswith("locked ")):
-            result[current] = True
+        elif current is not None and line == "locked":
+            result[current] = ""
+        elif current is not None and line.startswith("locked "):
+            result[current] = line[len("locked ") :]
     return result
+
+
+def _lock_reason_pid(reason: str) -> int | None:
+    """The pid embedded in a lock `reason`, but ONLY when it is written in
+    exactly the shape `sandbox.create_worktree` uses (`_LOCK_REASON_RE`).
+    None for anything else, including a hand-written reason from a `git
+    worktree lock` run by something other than this codebase — such a
+    reason is never trusted for a liveness decision; see
+    `_git_confirms_removable`."""
+    m = _LOCK_REASON_RE.match(reason)
+    if m is None:
+        return None
+    pid = int(m.group(1))
+    return pid if pid > 0 else None
+
+
+def _pid_is_alive(pid: int) -> bool:
+    """Best-effort process-liveness probe: `os.kill(pid, 0)` sends no
+    signal, it only checks existence/permission. `ProcessLookupError` is
+    the ONLY outcome this treats as dead. A `PermissionError` (the pid
+    exists but is owned by someone else) counts as alive, and so does any
+    other unexpected `OSError` OR an `OverflowError` (a pid value outside
+    the platform's representable range — `_lock_reason_pid`'s `\\d+` could
+    in principle hand this an arbitrarily large integer) — conservative in
+    the same spirit as everything else in this module: an unconfirmed
+    state is never treated as dead, and this must never raise into
+    `_git_confirms_removable`/`sweep()` over a merely-unusual pid value.
+
+    PID-REUSE CAVEAT, deliberately not solved here: if the pid that
+    created this worktree has already exited AND the OS has recycled its
+    number for an unrelated process by the time this runs, this reports
+    "alive" for a worktree that is actually long dead. That worktree keeps
+    its `locked` protection until either the unrelated process also exits
+    or some other path catches it — the TTL is already this module's
+    backstop for every other case it cannot fully confirm, and a single
+    `os.kill` probe can never fully rule out reuse.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (OSError, OverflowError):
+        return True
+    return True
 
 
 def _git_confirms_removable(repo: str, worktree_path: str, timeout_s: float) -> bool:
     """True only when git's OWN worktree list, asked against the real
-    repo, shows this exact path registered and NOT `locked`. False (keep)
-    for every other outcome — the git call itself failing or timing out,
-    the path missing from the listing entirely, or the path present but
-    locked — same conservative default as `_worktree_is_stale`: an
-    unconfirmed state is never treated as removable.
+    repo, shows this exact path as safely removable:
+
+    - not registered at all -> False (keep; nothing to confirm);
+    - registered and NOT `locked` -> True;
+    - registered and `locked` with a reason in exactly this module's own
+      format (`_LOCK_REASON_RE`) -> True only when `_pid_is_alive` reports
+      that pid as DEAD (a crashed run whose lock outlived it); alive, or
+      unconfirmable, keeps it;
+    - registered and `locked` with any OTHER reason (a human or another
+      tool applied that lock) -> False, UNCONDITIONALLY — this module
+      never second-guesses a lock it did not apply itself.
+
+    Every other outcome — the git call itself failing or timing out, or a
+    non-zero exit — is also False: an unconfirmed state is never treated
+    as removable.
     """
     output = _git_worktree_list(repo, timeout_s)
     if output is None:
@@ -343,7 +427,33 @@ def _git_confirms_removable(repo: str, worktree_path: str, timeout_s: float) -> 
     worktrees = _porcelain_worktrees(output)
     if worktree_path not in worktrees:
         return False
-    return not worktrees[worktree_path]
+    reason = worktrees[worktree_path]
+    if reason is None:
+        return True
+    pid = _lock_reason_pid(reason)
+    if pid is None:
+        return False
+    return not _pid_is_alive(pid)
+
+
+def _git_unlock_worktree(repo: str, worktree_path: str, timeout_s: float) -> None:
+    """Best-effort `git -C repo worktree unlock <path>`, tried before
+    `_git_remove_worktree`: a single `--force` does NOT override a lock
+    (verified directly against this git — it demands `-f -f` or an unlock
+    first), so a worktree this module just confirmed removable via a dead
+    pid (`_git_confirms_removable`) would otherwise survive the `remove`
+    step below. Harmless when the worktree was never locked or is already
+    unlocked. Same pattern as `sandbox.teardown_worktree`'s own first
+    step, deliberately."""
+    with contextlib.suppress(OSError, subprocess.TimeoutExpired, ValueError):
+        subprocess.run(
+            ["git", "-C", repo, "worktree", "unlock", worktree_path],
+            capture_output=True,
+            text=True,
+            env=dict(_GIT_ENV),
+            timeout=timeout_s,
+            check=False,
+        )
 
 
 def _git_remove_worktree(repo: str, worktree_path: str, timeout_s: float) -> None:
@@ -393,6 +503,7 @@ def _reap_via_git_liveness(parent_path: str, timeout_s: float) -> bool:
         return False
     if not _git_confirms_removable(repo, child_path, timeout_s):
         return False
+    _git_unlock_worktree(repo, child_path, timeout_s)
     _git_remove_worktree(repo, child_path, timeout_s)
     shutil.rmtree(parent_path, ignore_errors=True)
     _git_prune_worktrees(repo, timeout_s)

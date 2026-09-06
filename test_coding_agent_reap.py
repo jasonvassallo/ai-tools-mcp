@@ -334,22 +334,69 @@ class WorktreeLivenessParsing(unittest.TestCase):
             "worktree /r\nHEAD abc\nbranch refs/heads/main\n\n"
             "worktree /r/wt1\nHEAD abc\ndetached\n"
         )
-        self.assertEqual(R._porcelain_worktrees(out), {"/r": False, "/r/wt1": False})
+        self.assertEqual(R._porcelain_worktrees(out), {"/r": None, "/r/wt1": None})
 
-    def test_a_locked_entry_with_a_reason_is_locked(self):
+    def test_a_locked_entry_with_a_reason_carries_that_reason(self):
         out = "worktree /r/wt1\nHEAD abc\ndetached\nlocked some reason\n"
-        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": True})
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": "some reason"})
 
-    def test_a_locked_entry_with_no_reason_is_locked(self):
+    def test_a_locked_entry_with_no_reason_carries_the_empty_string(self):
         out = "worktree /r/wt1\nHEAD abc\ndetached\nlocked\n"
-        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": True})
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": ""})
 
     def test_a_prunable_but_unlocked_entry_is_not_locked(self):
         out = (
             "worktree /r/wt1\nHEAD abc\ndetached\n"
             "prunable gitdir file points to non-existent location\n"
         )
-        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": False})
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": None})
+
+    def test_a_reason_in_the_sandbox_format_yields_its_pid(self):
+        self.assertEqual(
+            R._lock_reason_pid("coding-agent run pid=4242 at=1788600000"), 4242
+        )
+
+    def test_a_hand_written_reason_yields_no_pid(self):
+        self.assertIsNone(R._lock_reason_pid("in use"))
+
+    def test_a_reason_that_merely_contains_pid_equals_is_not_matched_loosely(self):
+        """Only the EXACT sandbox shape is trusted; a superficially similar
+        hand-written reason must not be mistaken for it."""
+        self.assertIsNone(R._lock_reason_pid("pid=4242 at=1788600000"))
+        self.assertIsNone(R._lock_reason_pid("coding-agent run pid=4242"))
+        self.assertIsNone(R._lock_reason_pid("coding-agent run pid=4242 at=abc"))
+
+    def test_a_zero_pid_in_an_otherwise_matching_reason_yields_no_pid(self):
+        """`\\d+` would match a literal "0"; os.kill(0, ...) signals the
+        caller's own process GROUP, so this is refused rather than acted
+        on even though it can never occur from a real `os.getpid()`."""
+        self.assertIsNone(R._lock_reason_pid("coding-agent run pid=0 at=123"))
+
+    def test_this_process_own_pid_is_alive(self):
+        self.assertTrue(R._pid_is_alive(os.getpid()))
+
+    def test_an_impossible_pid_is_not_alive(self):
+        # INT32_MAX: representable (unlike 2**31, which os.kill itself
+        # rejects with OverflowError — a different case, covered below)
+        # but well past any real PID on this platform. `os.kill` must
+        # raise ProcessLookupError for it, which the assertion below pins
+        # rather than assumes — if this ever fails, the test itself is
+        # wrong for this OS, not `_pid_is_alive`.
+        impossible_pid = 2**31 - 1
+        with self.assertRaises(ProcessLookupError):
+            os.kill(impossible_pid, 0)
+        self.assertFalse(R._pid_is_alive(impossible_pid))
+
+    def test_a_pid_outside_os_kill_s_representable_range_is_treated_as_alive(self):
+        """`_lock_reason_pid`'s `\\d+` could hand `_pid_is_alive` an
+        integer `os.kill` itself cannot even represent (`OverflowError`,
+        not `ProcessLookupError`) — this must be swallowed the same
+        conservative way as any other unconfirmable outcome, never raised
+        into `_git_confirms_removable`/`sweep()`."""
+        unrepresentable_pid = 2**31
+        with self.assertRaises(OverflowError):
+            os.kill(unrepresentable_pid, 0)
+        self.assertTrue(R._pid_is_alive(unrepresentable_pid))
 
     def test_a_well_shaped_gitdir_yields_its_repo(self):
         self.assertEqual(R._repo_from_gitdir("/r/.git/worktrees/wt-abc"), "/r")
@@ -559,7 +606,7 @@ class RealWorktreeLockedByDefault(unittest.TestCase):
         for path in self.strays:
             shutil.rmtree(path, ignore_errors=True)
 
-    def _listed(self) -> dict[str, bool]:
+    def _listed(self) -> dict[str, str | None]:
         out = subprocess.run(
             ["git", "-C", self.repo, "worktree", "list", "--porcelain"],
             capture_output=True,
@@ -598,6 +645,89 @@ class RealWorktreeLockedByDefault(unittest.TestCase):
         self.assertEqual(problems, [])
         self.assertFalse(os.path.lexists(parent))
         self.assertNotIn(wt, self._listed())
+
+
+class RealWorktreeLockedWithADeadPid(unittest.TestCase):
+    """Closes the gap a bare lock check would leave open: a run that
+    crashes AFTER `create_worktree` applies its lock stays `locked`
+    forever with nothing left alive to unlock it, which would otherwise
+    make every crash orphan unreapable — defeating the whole point of
+    this follow-up. `_git_confirms_removable` only trusts a `locked`
+    reason for a liveness decision when it is in exactly the sandbox's
+    own format; here that reason names a pid confirmed dead, against real
+    git, real `os.kill`, and the real TTL/sweep path together."""
+
+    _DEAD_PID = 2**31 - 1  # INT32_MAX; confirmed dead below, not assumed
+
+    def setUp(self) -> None:
+        self.repo = _init_repo()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.strays: list[str] = []
+        # Confirms the fixture's own premise before either test relies on
+        # it — if this platform ever recycled such a pid, these tests
+        # would need a different one, not a silent false pass.
+        with self.assertRaises(ProcessLookupError):
+            os.kill(self._DEAD_PID, 0)
+
+    def tearDown(self) -> None:
+        for path in self.strays:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _relock_as_dead(self, wt: str) -> None:
+        """Replace `create_worktree`'s own (live) lock with one in the
+        same format but naming a pid that is confirmed dead — simulating
+        a crash that happened after the real lock was applied."""
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                self.repo,
+                "worktree",
+                "lock",
+                wt,
+                "--reason",
+                f"coding-agent run pid={self._DEAD_PID} at={int(time.time())}",
+            ],
+            check=True,
+        )
+
+    def _listed(self) -> dict[str, str | None]:
+        out = subprocess.run(
+            ["git", "-C", self.repo, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return R._porcelain_worktrees(out)
+
+    def test_locked_with_a_dead_pid_and_past_the_ttl_is_reaped(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        self._relock_as_dead(wt)
+        _set_mtime(parent, time.time() - 25 * _HOUR)
+
+        stats = R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertFalse(os.path.lexists(parent))
+        self.assertGreaterEqual(stats["worktrees_removed"], 1)
+        self.assertNotIn(wt, self._listed())
+
+    def test_locked_with_a_dead_pid_but_younger_than_the_ttl_is_kept(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        self._relock_as_dead(wt)
+        _set_mtime(parent, time.time() - 1 * _HOUR)
+
+        R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertIn(wt, self._listed())
+
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
+        teardown_worktree(self.repo, wt)
 
 
 # ---------------------------------------------------------------------------
