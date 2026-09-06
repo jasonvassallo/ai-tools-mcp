@@ -325,6 +325,130 @@ def _init_repo() -> str:
     return repo
 
 
+class WorktreeLivenessParsing(unittest.TestCase):
+    """`_porcelain_worktrees` and `_repo_from_gitdir` in isolation — pure
+    string parsing, no filesystem or git involved."""
+
+    def test_a_plain_entry_is_not_locked(self):
+        out = (
+            "worktree /r\nHEAD abc\nbranch refs/heads/main\n\n"
+            "worktree /r/wt1\nHEAD abc\ndetached\n"
+        )
+        self.assertEqual(R._porcelain_worktrees(out), {"/r": None, "/r/wt1": None})
+
+    def test_a_locked_entry_with_a_reason_carries_that_reason(self):
+        out = "worktree /r/wt1\nHEAD abc\ndetached\nlocked some reason\n"
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": "some reason"})
+
+    def test_a_locked_entry_with_no_reason_carries_the_empty_string(self):
+        out = "worktree /r/wt1\nHEAD abc\ndetached\nlocked\n"
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": ""})
+
+    def test_a_prunable_but_unlocked_entry_is_not_locked(self):
+        out = (
+            "worktree /r/wt1\nHEAD abc\ndetached\n"
+            "prunable gitdir file points to non-existent location\n"
+        )
+        self.assertEqual(R._porcelain_worktrees(out), {"/r/wt1": None})
+
+    def test_a_reason_in_the_sandbox_format_yields_its_pid(self):
+        self.assertEqual(
+            R._lock_reason_pid("coding-agent run pid=4242 at=1788600000"), 4242
+        )
+
+    def test_a_hand_written_reason_yields_no_pid(self):
+        self.assertIsNone(R._lock_reason_pid("in use"))
+
+    def test_a_reason_that_merely_contains_pid_equals_is_not_matched_loosely(self):
+        """Only the EXACT sandbox shape is trusted; a superficially similar
+        hand-written reason must not be mistaken for it."""
+        self.assertIsNone(R._lock_reason_pid("pid=4242 at=1788600000"))
+        self.assertIsNone(R._lock_reason_pid("coding-agent run pid=4242"))
+        self.assertIsNone(R._lock_reason_pid("coding-agent run pid=4242 at=abc"))
+
+    def test_a_zero_pid_in_an_otherwise_matching_reason_yields_no_pid(self):
+        """`\\d+` would match a literal "0"; os.kill(0, ...) signals the
+        caller's own process GROUP, so this is refused rather than acted
+        on even though it can never occur from a real `os.getpid()`."""
+        self.assertIsNone(R._lock_reason_pid("coding-agent run pid=0 at=123"))
+
+    def test_this_process_own_pid_is_alive(self):
+        self.assertTrue(R._pid_is_alive(os.getpid()))
+
+    def test_an_impossible_pid_is_not_alive(self):
+        # INT32_MAX: representable (unlike 2**31, which os.kill itself
+        # rejects with OverflowError — a different case, covered below)
+        # but well past any real PID on this platform. `os.kill` must
+        # raise ProcessLookupError for it, which the assertion below pins
+        # rather than assumes — if this ever fails, the test itself is
+        # wrong for this OS, not `_pid_is_alive`.
+        impossible_pid = 2**31 - 1
+        with self.assertRaises(ProcessLookupError):
+            os.kill(impossible_pid, 0)
+        self.assertFalse(R._pid_is_alive(impossible_pid))
+
+    def test_a_pid_outside_os_kill_s_representable_range_is_treated_as_alive(self):
+        """`_lock_reason_pid`'s `\\d+` could hand `_pid_is_alive` an
+        integer `os.kill` itself cannot even represent (`OverflowError`,
+        not `ProcessLookupError`) — this must be swallowed the same
+        conservative way as any other unconfirmable outcome, never raised
+        into `_git_confirms_removable`/`sweep()`."""
+        unrepresentable_pid = 2**31
+        with self.assertRaises(OverflowError):
+            os.kill(unrepresentable_pid, 0)
+        self.assertTrue(R._pid_is_alive(unrepresentable_pid))
+
+    def test_a_well_shaped_gitdir_yields_its_repo(self):
+        self.assertEqual(R._repo_from_gitdir("/r/.git/worktrees/wt-abc"), "/r")
+
+    def test_a_gitdir_missing_the_worktrees_segment_is_rejected(self):
+        self.assertIsNone(R._repo_from_gitdir("/r/.git/wt-abc"))
+
+    def test_a_gitdir_missing_the_dot_git_segment_is_rejected(self):
+        self.assertIsNone(R._repo_from_gitdir("/r/worktrees/wt-abc"))
+
+    def test_a_gitdir_with_no_repo_component_is_rejected(self):
+        self.assertIsNone(R._repo_from_gitdir("/.git/worktrees/wt-abc"))
+
+
+class WorktreeLivenessUnreadableRepo(_ScratchCase):
+    """The liveness path's own conservatism: any git-call failure keeps
+    the directory, and never raises."""
+
+    def test_a_gitdir_whose_repo_is_not_a_real_git_repo_is_kept(self):
+        """`gitdir` exists on disk (so `_wt_child_with_live_gitdir` finds
+        it) but the derived repo is not an actual git repository, so
+        `git -C <repo> worktree list` fails. That failure must keep the
+        directory, not raise."""
+        parent = _wt_parent(self.dir)
+        child = _wt_child(parent)
+        bogus_repo = os.path.join(self.dir, "not-a-repo")
+        gitdir = os.path.join(bogus_repo, ".git", "worktrees", "wt-abc")
+        os.makedirs(gitdir)
+        _git_marker(child, gitdir)
+        _set_mtime(parent, self.now - 25 * _HOUR)
+
+        stats = R.sweep(self.dir, now=self.now, git_timeout_s=5)
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertEqual(stats["worktrees_removed"], 0)
+
+    def test_a_gitdir_with_no_derivable_repo_is_kept(self):
+        """`gitdir` exists but is not shaped like `<repo>/.git/worktrees/
+        <name>`, so no git call is even attempted."""
+        parent = _wt_parent(self.dir)
+        child = _wt_child(parent)
+        gitdir = os.path.join(self.dir, "just-some-directory")
+        os.mkdir(gitdir)
+        _git_marker(child, gitdir)
+        _set_mtime(parent, self.now - 25 * _HOUR)
+
+        stats = R.sweep(self.dir, now=self.now)
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertEqual(stats["worktrees_removed"], 0)
+
+
 class RealWorktreeShape(unittest.TestCase):
     """`_worktree_is_stale`'s parsing is exercised against a real
     `git worktree add` layout, not just hand-built fixtures — the same
@@ -377,6 +501,233 @@ class RealWorktreeShape(unittest.TestCase):
 
         self.assertFalse(os.path.lexists(parent))
         self.assertGreaterEqual(stats["worktrees_removed"], 1)
+
+
+class RealWorktreeLiveness(unittest.TestCase):
+    """The gap this follow-up closes: an orphaned worktree whose `.git`
+    marker AND recorded `gitdir` are both still fully intact — exactly
+    what a crash (kill the process, not the git metadata) leaves behind,
+    and exactly the shape `_worktree_is_stale` correctly calls NOT stale.
+    Built against a real `git worktree add`/`lock`, like
+    `RealWorktreeShape` above, so the porcelain parsing is exercised
+    against git's actual output rather than hand-written fixtures.
+    """
+
+    def setUp(self) -> None:
+        self.repo = _init_repo()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.strays: list[str] = []
+
+    def tearDown(self) -> None:
+        for path in self.strays:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _listed_paths(self) -> set[str]:
+        out = subprocess.run(
+            ["git", "-C", self.repo, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return set(R._porcelain_worktrees(out))
+
+    def test_an_intact_orphaned_worktree_past_the_ttl_is_reaped(self):
+        """`create_worktree` now locks its own worktree by default (issue
+        #79 follow-up, below) — unlocked here to isolate the case this
+        test is actually about: an intact-but-UNLOCKED orphan (e.g. the
+        best-effort lock call itself failed) is still reaped once past the
+        TTL. The locked case is `RealWorktreeLockedByDefault` below."""
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
+        self.assertFalse(R._worktree_is_stale(parent), "test assumption: NOT stale")
+        self.assertIn(wt, self._listed_paths())
+        _set_mtime(parent, time.time() - 25 * _HOUR)
+
+        stats = R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertFalse(os.path.lexists(parent))
+        self.assertGreaterEqual(stats["worktrees_removed"], 1)
+        self.assertNotIn(wt, self._listed_paths())
+
+    def test_a_git_worktree_lock_ed_orphan_is_kept(self):
+        """Locked with a custom reason here (rather than relying on
+        `create_worktree`'s own default lock) to cover `locked` parsing
+        for an arbitrary reason string, independent of what this codebase
+        happens to write into it."""
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
+        subprocess.run(
+            ["git", "-C", self.repo, "worktree", "lock", wt, "--reason", "in use"],
+            check=True,
+        )
+        _set_mtime(parent, time.time() - 25 * _HOUR)
+
+        R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertIn(wt, self._listed_paths())
+
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
+        teardown_worktree(self.repo, wt)
+
+    def test_an_intact_orphan_younger_than_the_ttl_is_kept(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        _set_mtime(parent, time.time() - 1 * _HOUR)
+
+        R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertIn(wt, self._listed_paths())
+
+        teardown_worktree(self.repo, wt)
+
+
+class RealWorktreeLockedByDefault(unittest.TestCase):
+    """`create_worktree` itself now locks the worktree it returns for the
+    life of a run, and `teardown_worktree` unlocks it before removal (issue
+    #79 follow-up to close the gap `RealWorktreeLiveness` above flags in
+    its own module docstring: a run still alive right at the TTL boundary
+    used to have no protection beyond the TTL itself). No test-applied
+    `git worktree lock` anywhere below — this exercises the production
+    path exactly as `loop.py` calls it."""
+
+    def setUp(self) -> None:
+        self.repo = _init_repo()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.strays: list[str] = []
+
+    def tearDown(self) -> None:
+        for path in self.strays:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _listed(self) -> dict[str, str | None]:
+        out = subprocess.run(
+            ["git", "-C", self.repo, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return R._porcelain_worktrees(out)
+
+    def test_a_freshly_created_worktree_is_locked_while_the_run_is_open(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        self.assertTrue(self._listed().get(wt), "not locked by create_worktree")
+        teardown_worktree(self.repo, wt)
+
+    def test_it_is_never_reaped_by_sweep_no_matter_how_old(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        self.assertTrue(self._listed().get(wt), "test assumption: locked")
+        _set_mtime(parent, time.time() - 1000 * _HOUR)  # far past the TTL
+
+        R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertTrue(self._listed().get(wt), "still locked and registered")
+
+        teardown_worktree(self.repo, wt)
+
+    def test_teardown_removes_it_and_it_disappears_from_git_worktree_list(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+
+        problems = teardown_worktree(self.repo, wt)
+
+        self.assertEqual(problems, [])
+        self.assertFalse(os.path.lexists(parent))
+        self.assertNotIn(wt, self._listed())
+
+
+class RealWorktreeLockedWithADeadPid(unittest.TestCase):
+    """Closes the gap a bare lock check would leave open: a run that
+    crashes AFTER `create_worktree` applies its lock stays `locked`
+    forever with nothing left alive to unlock it, which would otherwise
+    make every crash orphan unreapable — defeating the whole point of
+    this follow-up. `_git_confirms_removable` only trusts a `locked`
+    reason for a liveness decision when it is in exactly the sandbox's
+    own format; here that reason names a pid confirmed dead, against real
+    git, real `os.kill`, and the real TTL/sweep path together."""
+
+    _DEAD_PID = 2**31 - 1  # INT32_MAX; confirmed dead below, not assumed
+
+    def setUp(self) -> None:
+        self.repo = _init_repo()
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.strays: list[str] = []
+        # Confirms the fixture's own premise before either test relies on
+        # it — if this platform ever recycled such a pid, these tests
+        # would need a different one, not a silent false pass.
+        with self.assertRaises(ProcessLookupError):
+            os.kill(self._DEAD_PID, 0)
+
+    def tearDown(self) -> None:
+        for path in self.strays:
+            shutil.rmtree(path, ignore_errors=True)
+
+    def _relock_as_dead(self, wt: str) -> None:
+        """Replace `create_worktree`'s own (live) lock with one in the
+        same format but naming a pid that is confirmed dead — simulating
+        a crash that happened after the real lock was applied."""
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                self.repo,
+                "worktree",
+                "lock",
+                wt,
+                "--reason",
+                f"coding-agent run pid={self._DEAD_PID} at={int(time.time())}",
+            ],
+            check=True,
+        )
+
+    def _listed(self) -> dict[str, str | None]:
+        out = subprocess.run(
+            ["git", "-C", self.repo, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return R._porcelain_worktrees(out)
+
+    def test_locked_with_a_dead_pid_and_past_the_ttl_is_reaped(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        self._relock_as_dead(wt)
+        _set_mtime(parent, time.time() - 25 * _HOUR)
+
+        stats = R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertFalse(os.path.lexists(parent))
+        self.assertGreaterEqual(stats["worktrees_removed"], 1)
+        self.assertNotIn(wt, self._listed())
+
+    def test_locked_with_a_dead_pid_but_younger_than_the_ttl_is_kept(self):
+        wt = create_worktree(self.repo, "HEAD")
+        self.strays.append(wt)
+        parent = os.path.dirname(wt)
+        self._relock_as_dead(wt)
+        _set_mtime(parent, time.time() - 1 * _HOUR)
+
+        R.sweep(os.path.dirname(parent), now=time.time())
+
+        self.assertTrue(os.path.lexists(parent))
+        self.assertIn(wt, self._listed())
+
+        subprocess.run(["git", "-C", self.repo, "worktree", "unlock", wt], check=True)
+        teardown_worktree(self.repo, wt)
 
 
 # ---------------------------------------------------------------------------

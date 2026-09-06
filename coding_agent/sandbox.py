@@ -11,8 +11,19 @@ Rules enforced here:
   git" design was defeated as a TOCTOU. There is no safe way to point git
   at this directory, so nothing here does.
 
+- `create_worktree` `git worktree lock`s the worktree it just made, and
+  teardown's first step unlocks it before attempting removal (issue #79
+  follow-up: `coding_agent.reap.sweep()`'s TTL-based sweep of crash-orphaned
+  `coding-agent-wt-*` parents treats a `locked` worktree as still in use no
+  matter how old it is, so a live run's worktree can never be reaped out
+  from under it). Both the lock and the unlock are best-effort and never
+  raise — a lock that fails to apply just means the run relies on the TTL
+  alone, exactly as it did before this existed.
+
 - Teardown is layered and does NOT depend on `git worktree remove`
-  succeeding: it is `docker rm -f` (the caller's ordering), then a
+  succeeding: it is `docker rm -f` (the caller's ordering), a best-effort
+  `git -C <repo> worktree unlock` (so the removal below is never blocked by
+  our own lock and the registry does not keep a stale lock bit), then a
   best-effort `git -C <repo> worktree remove --force`, then an
   UNCONDITIONAL `rm -rf` of the LITERAL path recorded at creation, then
   `git -C <repo> worktree prune`, then verification. The literal path is
@@ -34,6 +45,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -226,6 +238,23 @@ def create_worktree(repo: str, base_ref: str) -> str:
             f"coding_agent: refusing a worktree path that is not a canonical "
             f"real directory (a symlinked root walks as EMPTY): {path}"
         )
+
+    # Issue #79 follow-up: lock it for the life of this run so
+    # `coding_agent.reap.sweep()`'s TTL-based liveness check — which treats
+    # a `locked` worktree as still in use regardless of age — can never
+    # reap this one out from under an in-progress run. Best-effort: a
+    # failure here (git missing, a wedged daemon, a timeout) is not fatal
+    # to the run itself, it just means this worktree relies on the TTL
+    # alone, same as before this lock existed. `teardown_worktree` unlocks
+    # it again before removal.
+    _git_quiet(
+        repo,
+        "worktree",
+        "lock",
+        path,
+        "--reason",
+        f"coding-agent run pid={os.getpid()} at={time.time():.0f}",
+    )
     return path
 
 
@@ -547,15 +576,22 @@ def teardown_worktree(repo: str, worktree: str) -> list[str]:
         # caller bug. Never reachable from create_worktree's own output.
         return [f"refusing to remove an implausible worktree path: {worktree}"]
 
-    # 1. best-effort; FAILS after .git tampering (validation error 10) —
+    # 1. best-effort unlock of the lock `create_worktree` applied for the
+    #    life of the run (issue #79 follow-up). Load-bearing for step 2, not
+    #    cosmetic: a single `--force` does NOT override a lock (git demands
+    #    `-f -f` or an unlock first) — verified directly against this git —
+    #    so without this step 2 would fail on every run, locked or not, and
+    #    cleanup would depend entirely on the unconditional steps below.
+    _git_quiet(repo, "worktree", "unlock", worktree)
+    # 2. best-effort; FAILS after .git tampering (validation error 10) —
     #    expected, and the reason nothing below is conditional on it. Runs
     #    against the REAL repo so no git ever touches the worktree (§6.5).
     _git_quiet(repo, "worktree", "remove", "--force", worktree)
-    # 2. unconditional: the LITERAL recorded path.
+    # 3. unconditional: the LITERAL recorded path.
     _remove_tree(worktree)
-    # 3. drop the registration.
+    # 4. drop the registration.
     _git_quiet(repo, "worktree", "prune")
-    # 4. verify.
+    # 5. verify.
     if os.path.lexists(worktree):
         problems.append(f"worktree path still exists: {worktree}")
     listing = _git_quiet(repo, "worktree", "list", "--porcelain")
@@ -566,7 +602,7 @@ def teardown_worktree(repo: str, worktree: str) -> list[str]:
         )
     elif worktree in listing.stdout:
         problems.append(f"worktree still registered in {repo}")
-    # 5. the private parent this module created. Pure string work on the
+    # 6. the private parent this module created. Pure string work on the
     #    recorded path, name-guarded, and `rmdir` refuses a non-empty
     #    directory — so it can only ever remove our own empty leftover.
     parent = os.path.dirname(worktree)

@@ -98,9 +98,22 @@ class MangledGitCleanup(unittest.TestCase):
         """Without this the class above proves nothing: if `worktree remove`
         happened to succeed here, the layered cleanup would never be exercised
         and a git-dependent implementation would pass. Pins the demonstrated
-        failure (git 2.55.0: 'validation failed ... error code 10')."""
+        failure (git 2.55.0: 'validation failed ... error code 10').
+
+        `create_worktree` now `git worktree lock`s the worktree it returns
+        (issue #79 follow-up), which git itself refuses to `remove --force`
+        for an unrelated reason (a locked working tree). Unlocked here first
+        — exactly what `teardown_worktree`'s own first step does before it
+        ever attempts a removal — so this MECHANISM check isolates the
+        tampering failure it exists to pin, not the lock."""
         wt = create_worktree(str(self.repo), "HEAD")
         self.strays.append(wt)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "worktree", "unlock", wt],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         self._mangle(wt)
         proc = subprocess.run(
             ["git", "-C", str(self.repo), "worktree", "remove", "--force", wt],
@@ -319,6 +332,71 @@ class NoHostGitEverRunsInTheWorktree(unittest.TestCase):
             assert isinstance(env, dict)
             for var in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
                 self.assertNotIn(var, env)
+
+
+class WorktreeLockedForTheLifeOfARun(unittest.TestCase):
+    """Issue #79 follow-up: `coding_agent.reap.sweep()`'s TTL-based sweep of
+    crash-orphaned `coding-agent-wt-*` parents treats a `git worktree
+    lock`ed worktree as still in use no matter how old it is. For that to
+    actually protect a live run, `create_worktree` has to apply the lock
+    and `teardown_worktree` has to remove it — this pins both halves
+    against real git."""
+
+    def setUp(self) -> None:
+        self.repo = _init_repo()
+        self.strays: list[str] = []
+
+    def tearDown(self) -> None:
+        for path in self.strays:
+            shutil.rmtree(path, ignore_errors=True)
+        shutil.rmtree(self.repo, ignore_errors=True)
+
+    def test_create_worktree_locks_the_worktree_it_returns(self) -> None:
+        wt = create_worktree(str(self.repo), "HEAD")
+        self.strays.append(wt)
+        listing = _registered(self.repo)
+        self.assertIn(wt, listing)
+        self.assertIn("locked", listing)
+        self.assertIn("coding-agent run", listing)
+        teardown_worktree(str(self.repo), wt)
+
+    def test_teardown_unlocks_before_it_ever_attempts_removal(self) -> None:
+        """Order matters: unlocking after `remove --force` has already
+        failed on the lock would be pointless. Recorded directly rather
+        than inferred from the end state."""
+        wt = create_worktree(str(self.repo), "HEAD")
+        self.strays.append(wt)
+
+        real_run = subprocess.run
+        seen: list[list[str]] = []
+
+        def recorder(argv: list[str], **kwargs: object) -> object:
+            seen.append(list(argv))
+            return real_run(argv, **kwargs)  # type: ignore[arg-type]
+
+        with unittest.mock.patch("subprocess.run", side_effect=recorder):
+            teardown_worktree(str(self.repo), wt)
+
+        worktree_calls = [argv for argv in seen if "worktree" in argv]
+        subcommands = [argv[argv.index("worktree") + 1] for argv in worktree_calls]
+        self.assertIn("unlock", subcommands)
+        self.assertIn("remove", subcommands)
+        self.assertLess(
+            subcommands.index("unlock"),
+            subcommands.index("remove"),
+            f"unlock must precede remove, got: {subcommands}",
+        )
+
+    def test_teardown_removes_a_locked_worktree_cleanly(self) -> None:
+        wt = create_worktree(str(self.repo), "HEAD")
+        self.strays.append(wt)
+        self.assertIn("locked", _registered(self.repo))
+
+        problems = teardown_worktree(str(self.repo), wt)
+
+        self.assertEqual(problems, [])
+        self.assertFalse(os.path.exists(wt))
+        self.assertNotIn(wt, _registered(self.repo))
 
 
 class WorktreePathIsNeverASymlink(unittest.TestCase):
